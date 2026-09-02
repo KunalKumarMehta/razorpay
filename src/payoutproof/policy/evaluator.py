@@ -3,7 +3,14 @@
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 from payoutproof.core.models import RiskCaseState, PolicyEvaluationResult
-from payoutproof.core.enums import PolicyOutcome, ReasonCode, TruthState, IntentStatus, DestinationStatus
+from payoutproof.core.enums import (
+    PolicyOutcome,
+    ReasonCode,
+    TruthState,
+    IntentStatus,
+    DestinationStatus,
+    FindingName,
+)
 
 POLICY_VERSION = "PP-POLICY-V1"
 GRANT_TTL_SECONDS = 300  # 5 minutes
@@ -17,10 +24,16 @@ class PolicyGate:
     """
 
     @classmethod
-    def evaluate(cls, state: RiskCaseState, policy_version: str = POLICY_VERSION) -> PolicyEvaluationResult:
+    def evaluate(
+        cls,
+        state: RiskCaseState,
+        policy_version: str = POLICY_VERSION,
+        evaluation_time: Optional[datetime] = None,
+    ) -> PolicyEvaluationResult:
         """Evaluate case snapshot and return deterministic PolicyEvaluationResult."""
-        now_iso = datetime.now(timezone.utc).isoformat()
-        expires_iso = (datetime.now(timezone.utc) + timedelta(seconds=GRANT_TTL_SECONDS)).isoformat()
+        eval_dt = evaluation_time or datetime.now(timezone.utc)
+        now_iso = eval_dt.isoformat()
+        expires_iso = (eval_dt + timedelta(seconds=GRANT_TTL_SECONDS)).isoformat()
 
         # 1. Check for integrity failures / structural corruption (BLOCKED)
         if state.request_bundle_status == "TAMPERED":
@@ -84,11 +97,13 @@ class PolicyGate:
 
         # 5. Check step-up evidence: independent callback & destination approval
         has_callback = any(
-            f.name in ("Independent callback", "independent_callback") and f.truth_state == TruthState.SUPPORTED
+            f.name in (FindingName.INDEPENDENT_CALLBACK.value, "Independent callback", "independent_callback")
+            and f.truth_state == TruthState.SUPPORTED
             for f in state.findings
         )
         has_destination_approval = any(
-            f.name in ("Destination approval", "destination_approval") and f.truth_state == TruthState.SUPPORTED
+            f.name in (FindingName.DESTINATION_APPROVAL.value, "Destination approval", "destination_approval")
+            and f.truth_state == TruthState.SUPPORTED
             for f in state.findings
         ) or state.intent.destination_status == DestinationStatus.APPROVED_FOR_COUNTERPARTY
 

@@ -1,12 +1,12 @@
 """Execution runner for evaluation cases."""
 
 from payoutproof.core.models import RiskCaseState, PaymentIntent, Finding, CaseInvestigation
-from payoutproof.core.enums import PolicyOutcome, TruthState, IntentStatus, DestinationStatus
+from payoutproof.core.enums import PolicyOutcome, TruthState, IntentStatus, DestinationStatus, FindingName
 from payoutproof.simulator.generator import EvaluationCase
 from payoutproof.oracle.oracle import PolicyOracle
 from payoutproof.scorer.scorer import EvaluationResult
 from payoutproof.policy.evaluator import PolicyGate
-from payoutproof.core.crypto import compute_intent_hash
+from payoutproof.intent.extractor import confirm_intent, extract_intent_from_structured_data
 
 
 def execute_case_under_test(case: EvaluationCase) -> EvaluationResult:
@@ -19,35 +19,31 @@ def execute_case_under_test(case: EvaluationCase) -> EvaluationResult:
     else:
         req_status = "ADMITTED"
 
-    # 2. Build extracted intent
-    intent = PaymentIntent(
-        counterparty=case.counterparty,
-        destination=case.destination,
-        destination_status=case.destination_status,
-        amount=case.amount,
-        currency=case.currency,
-        purpose=case.purpose,
-        instruction_reference=case.instruction_ref,
-        status=IntentStatus.CONFIRMED if not case.is_unusable_audio else IntentStatus.EXTRACTED,
-        intent_hash=compute_intent_hash(PaymentIntent(
-            counterparty=case.counterparty,
-            destination=case.destination,
-            destination_status=case.destination_status,
-            amount=case.amount,
-            currency=case.currency,
-            purpose=case.purpose,
-            instruction_reference=case.instruction_ref,
-        )) if not case.is_unusable_audio else None,
-    )
+    # 2. Build extracted intent using canonical extractor & confirm if valid
+    raw_intent = extract_intent_from_structured_data({
+        "counterparty": case.counterparty,
+        "destination": case.destination,
+        "destination_status": case.destination_status,
+        "amount": case.amount,
+        "currency": case.currency,
+        "purpose": case.purpose,
+        "instruction_reference": case.instruction_ref,
+    })
+    raw_intent = raw_intent.model_copy(update={"destination_status": case.destination_status})
+
+    if not case.is_unusable_audio:
+        intent = confirm_intent(raw_intent)
+    else:
+        intent = raw_intent
 
     # 3. Build findings
     findings = []
     if case.has_contradiction:
-        findings.append(Finding(name="Destination consistency", truth_state=TruthState.CONTRADICTED, detail="Invoice mismatch"))
+        findings.append(Finding(name=FindingName.DESTINATION_CONSISTENCY.value, truth_state=TruthState.CONTRADICTED, detail="Invoice mismatch"))
     if case.has_callback:
-        findings.append(Finding(name="Independent callback", truth_state=TruthState.SUPPORTED, detail="Callback confirmed"))
+        findings.append(Finding(name=FindingName.INDEPENDENT_CALLBACK.value, truth_state=TruthState.SUPPORTED, detail="Callback confirmed"))
     if case.has_destination_approval or case.destination_status == DestinationStatus.APPROVED_FOR_COUNTERPARTY:
-        findings.append(Finding(name="Destination approval", truth_state=TruthState.SUPPORTED, detail="Approved"))
+        findings.append(Finding(name=FindingName.DESTINATION_APPROVAL.value, truth_state=TruthState.SUPPORTED, detail="Approved"))
 
     model_status = "FAILED_UNUSABLE_AUDIO" if case.is_unusable_audio else "SUCCEEDED"
 

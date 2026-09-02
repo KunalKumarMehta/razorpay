@@ -100,3 +100,13 @@ class ReasonCode(str, Enum):
     MALFORMED_INPUT = "MALFORMED_INPUT"
     PROHIBITED_INPUT = "PROHIBITED_INPUT"
     UNAUTHORIZED_ACTOR = "UNAUTHORIZED_ACTOR"
+
+
+class FindingName(str, Enum):
+    """Canonical domain names for investigation and step-up findings."""
+    INDEPENDENT_CALLBACK = "Independent callback"
+    DESTINATION_APPROVAL = "Destination approval"
+    DESTINATION_CONSISTENCY = "Destination consistency"
+    DESTINATION_RELATIONSHIP = "Destination relationship"
+    INSTRUCTION_CONSISTENCY = "Instruction consistency"
+    AASIST_SYNTHETIC_SCORE = "AASIST synthetic speech check"

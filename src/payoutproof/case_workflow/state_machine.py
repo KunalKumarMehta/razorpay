@@ -25,6 +25,7 @@ from payoutproof.core.enums import (
     ProcessingAuthorityStatus,
     AdapterDecision,
     ReasonCode,
+    FindingName,
 )
 from payoutproof.core.crypto import compute_intent_hash
 from payoutproof.admission.validator import AdmissionValidator
@@ -229,8 +230,8 @@ class StateMachine:
                 truth_state=TruthState.SUPPORTED,
             )
             updated_evidence = list(state.evidence) + [new_ev]
-            updated_findings = [f for f in state.findings if f.name != "Independent callback"] + [
-                Finding(name="Independent callback", truth_state=TruthState.SUPPORTED, detail="Known number; exact intent repeated back")
+            updated_findings = [f for f in state.findings if f.name != FindingName.INDEPENDENT_CALLBACK.value] + [
+                Finding(name=FindingName.INDEPENDENT_CALLBACK.value, truth_state=TruthState.SUPPORTED, detail="Known number; exact intent repeated back")
             ]
             msg = "Specified step-up evidence was added without changing the Payment Intent."
             s_next = state.model_copy(update={
@@ -256,8 +257,8 @@ class StateMachine:
                 truth_state=TruthState.SUPPORTED,
             )
             updated_evidence = list(state.evidence) + [new_ev]
-            updated_findings = [f for f in state.findings if f.name != "Destination approval"] + [
-                Finding(name="Destination approval", truth_state=TruthState.SUPPORTED, detail="Separately approved under finance policy; exact counterparty and destination bound")
+            updated_findings = [f for f in state.findings if f.name != FindingName.DESTINATION_APPROVAL.value] + [
+                Finding(name=FindingName.DESTINATION_APPROVAL.value, truth_state=TruthState.SUPPORTED, detail="Separately approved under finance policy; exact counterparty and destination bound")
             ]
             updated_intent = state.intent.model_copy(update={"destination_status": DestinationStatus.APPROVED_FOR_COUNTERPARTY})
             if updated_intent.status == IntentStatus.CONFIRMED:
@@ -364,7 +365,7 @@ class StateMachine:
             # Invalidate callback findings because intent has changed
             updated_findings = [
                 Finding(name=f.name, truth_state=TruthState.NOT_OBSERVED, detail="Prior callback predates the material edit and does not confirm the changed exact intent")
-                if f.name == "Independent callback" else f
+                if f.name == FindingName.INDEPENDENT_CALLBACK.value else f
                 for f in state.findings
             ]
 
