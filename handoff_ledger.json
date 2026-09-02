@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "project": "PayoutProof",
+  "version": "0.1.0",
+  "policy_version": "PP-POLICY-V1",
+  "status": "GREEN",
+  "timestamp": "2026-09-02T08:35:40Z",
+  "owner": "Integration Agent",
+  "branch": "antigravity/mvp-implementation",
+  "modules": {
+    "core_schemas": {
+      "status": "PASSED",
+      "path": "src/payoutproof/core/",
+      "contracts": [
+        "ProcessingAuthorityRecord",
+        "PaymentIntent",
+        "EvidenceItem",
+        "Finding",
+        "PolicyEvaluationResult",
+        "HandoffGrant",
+        "HandoffRecord",
+        "AuditEvent",
+        "RiskCaseState"
+      ]
+    },
+    "admission": {
+      "status": "PASSED",
+      "path": "src/payoutproof/admission/",
+      "rules": "Rejects missing or incomplete Processing Authority Records before investigation without opening a Risk Case."
+    },
+    "intent_extraction_and_confirmation": {
+      "status": "PASSED",
+      "path": "src/payoutproof/intent/",
+      "features": "INR normalization, candidate extraction, operator confirmation, material edit invalidation."
+    },
+    "deterministic_policy_gate": {
+      "status": "PASSED",
+      "path": "src/payoutproof/policy/",
+      "outcomes": ["BLOCKED", "HOLD", "STEP_UP_REQUIRED", "ELIGIBLE_FOR_HANDOFF"],
+      "evaluator": "Pure total deterministic Python evaluator over frozen snapshots."
+    },
+    "grants_and_hmac": {
+      "status": "PASSED",
+      "path": "src/payoutproof/grants/",
+      "security": "Single-use expiring HMAC-SHA256 grants with unique nonces and case/intent/snapshot hash binding."
+    },
+    "audit_hash_chain": {
+      "status": "PASSED",
+      "path": "src/payoutproof/audit/",
+      "properties": "Per-case append-only SHA-256 hash chain with automated tamper detection and cryptographic verification."
+    },
+    "fake_action_adapter": {
+      "status": "PASSED",
+      "path": "src/payoutproof/adapters/",
+      "boundary": "Creates exactly one pending item in maker-checker approval rail; enforces replay rejection and ambiguity reconciliation."
+    },
+    "persistence": {
+      "status": "PASSED",
+      "path": "src/payoutproof/storage/",
+      "engine": "SQLite WAL persistence for cases, grants, adapter attempts, and audit events."
+    },
+    "simulator_oracle_scorer": {
+      "status": "PASSED",
+      "path": "src/payoutproof/simulator/, src/payoutproof/oracle/, src/payoutproof/scorer/",
+      "corpora": {
+        "dev_cases": 45,
+        "sealed_cases": 90,
+        "safety_cases": 27,
+        "safety_repeated_runs": 81
+      }
+    },
+    "api_control_plane": {
+      "status": "PASSED",
+      "path": "src/payoutproof/api/",
+      "framework": "FastAPI with OpenAPI specification and CORS."
+    },
+    "web_presentation": {
+      "status": "PASSED",
+      "path": "web/",
+      "framework": "Vite + React + TypeScript with operator console, guided walkthroughs, and benchmark runner."
+    }
+  },
+  "acceptance_gates": {
+    "zero_tolerance_safety_gate": {
+      "gate": "0 Unsafe Handoffs across all cases and repeated runs",
+      "observed": 0,
+      "status": "PASSED"
+    },
+    "three_action_accuracy": {
+      "gate": ">= 90.0%",
+      "observed_dev": "100.0% (CI: 92.1%-100.0%)",
+      "observed_sealed": "100.0% (CI: 95.9%-100.0%)",
+      "status": "PASSED"
+    },
+    "protective_intervention_recall": {
+      "gate": ">= 95.0%",
+      "observed_dev": "100.0% (CI: 88.6%-100.0%)",
+      "observed_sealed": "100.0% (CI: 94.0%-100.0%)",
+      "status": "PASSED"
+    },
+    "intent_binding_correctness": {
+      "gate": ">= 95.0%",
+      "observed": "100.0%",
+      "status": "PASSED"
+    },
+    "operator_interaction_reduction": {
+      "gate": ">= 30.0%",
+      "observed_dev": "65.0%",
+      "observed_sealed": "65.0%",
+      "observed_safety": "77.8%",
+      "status": "PASSED"
+    },
+    "tamper_detection_gate": {
+      "gate": "Corrupted audit sequences detected and flagged as invalid",
+      "status": "PASSED"
+    },
+    "replay_prevention_gate": {
+      "gate": "Replay of consumed grant or duplicate idempotency key rejected",
+      "status": "PASSED"
+    }
+  },
+  "verified_commands": [
+    "uv run pytest -v",
+    "uv run payoutproof eval --suite dev",
+    "uv run payoutproof eval --suite sealed",
+    "uv run payoutproof eval --suite safety",
+    "npm --prefix web run build"
+  ]
+}

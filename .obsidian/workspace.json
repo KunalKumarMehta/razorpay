@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": ".scratch/trustworthy-payment-risk-venture/map.md",
+                "file": "README.md",
                 "mode": "preview",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "map"
+              "title": "README"
             }
           }
         ]
@@ -99,7 +99,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": ".scratch/trustworthy-payment-risk-venture/map.md",
+                "file": "README.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -118,7 +118,7 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": ".scratch/trustworthy-payment-risk-venture/map.md",
+                "file": "README.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
@@ -161,7 +161,7 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": ".scratch/trustworthy-payment-risk-venture/map.md",
+                "file": "README.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
@@ -189,39 +189,43 @@
       "obsidian-git:Open Git source control": false
     }
   },
-  "active": "5367de7c6451ad3b",
+  "active": "7adaca9c1b325e89",
   "lastOpenFiles": [
-    ".scratch/trustworthy-payment-risk-venture/issues/14-prototype-submission-narrative.md",
-    ".scratch/trustworthy-payment-risk-venture/map.md",
-    "CONTEXT.md",
-    ".scratch/trustworthy-payment-risk-venture/prototypes/payoutproof-pitch-rehearsal-throwaway.html",
-    ".scratch/trustworthy-payment-risk-venture/prototypes/payoutproof-operator-journey-throwaway.html",
-    ".scratch/trustworthy-payment-risk-venture/issues/13-set-mvp-sequence-and-acceptance-gates.md",
-    ".scratch/trustworthy-payment-risk-venture/issues/12-choose-business-model-and-expansion.md",
-    ".scratch/trustworthy-payment-risk-venture/issues/11-choose-architecture-and-resource-stack.md",
-    ".gitignore",
-    ".scratch/trustworthy-payment-risk-venture/issues/10-prototype-operator-and-demo-journey.md",
-    ".scratch/trustworthy-payment-risk-venture/prototypes",
-    ".obsidian/plugins/obsidian-html-plugin/main.js",
-    ".obsidian/plugins/obsidian-html-plugin/manifest.json",
-    ".obsidian/plugins/obsidian-html-plugin",
-    ".scratch/trustworthy-payment-risk-venture/issues/09-define-trust-data-and-action-boundaries.md",
-    ".scratch/trustworthy-payment-risk-venture/issues/08-define-value-proof-and-evaluation-contract.md",
-    ".scratch/trustworthy-payment-risk-venture/issues/07-choose-wedge-buyer-and-job.md",
-    ".scratch/trustworthy-payment-risk-venture/issues/06-select-venture-and-runners-up.md",
-    ".scratch/trustworthy-payment-risk-venture/issues/05-ingest-gemini-research-evidence.md",
-    ".scratch/trustworthy-payment-risk-venture/issues/04-map-competitors-and-defensible-whitespace.md",
-    ".scratch/trustworthy-payment-risk-venture/issues/03-inventory-technical-feasibility-and-resources.md",
-    ".scratch/trustworthy-payment-risk-venture/issues/02-validate-market-and-buyer-pain.md",
-    ".scratch/trustworthy-payment-risk-venture/issues/01-verify-razorpay-submission-contract.md",
-    ".scratch/trustworthy-payment-risk-venture/research/06-venture-selection-scorecard.md",
-    ".scratch/trustworthy-payment-risk-venture/research/01-razorpay-submission-contract.md",
-    ".scratch/trustworthy-payment-risk-venture/research/02-market-and-buyer-pain.md",
-    ".scratch/trustworthy-payment-risk-venture/research/04-competitors-and-defensible-whitespace.md",
-    ".scratch/trustworthy-payment-risk-venture/research/05-gemini-evidence-status.md",
-    ".obsidian/themes/Claude Warm/theme.css",
-    ".scratch/trustworthy-payment-risk-venture/research/03-technical-feasibility-and-resources.md",
-    ".obsidian/themes/Claude Warm/manifest.json",
-    ".obsidian/plugins/unhide/styles.css"
+    "handoff_ledger.json",
+    ".obsidian/plugins/code-emitter/styles.css",
+    ".obsidian/plugins/code-emitter/main.js",
+    "web/dist/assets/index-CMiFkydn.js",
+    "web/dist/assets/index-C6sZygo7.css",
+    "web/dist/index.html",
+    "web/dist/assets",
+    "web/dist",
+    ".obsidian/plugins/code-emitter/manifest.json",
+    ".obsidian/plugins/code-emitter",
+    "web/src/main.tsx",
+    "web/node_modules/@esbuild/darwin-arm64/README.md",
+    "web/node_modules/typescript/SECURITY.md",
+    "web/node_modules/typescript/README.md",
+    "web/node_modules/csstype/README.md",
+    "web/node_modules/electron-to-chromium/README.md",
+    "web/node_modules/react-refresh/README.md",
+    "web/node_modules/@vitejs/plugin-react/README.md",
+    "web/node_modules/baseline-browser-mapping/README.md",
+    "web/node_modules/debug/README.md",
+    "web/node_modules/browserslist/README.md",
+    "web/node_modules/node-releases/README.md",
+    "web/node_modules/gensync/README.md",
+    "web/node_modules/@jridgewell/resolve-uri/README.md",
+    "web/node_modules/semver/README.md",
+    "web/node_modules/clsx/readme.md",
+    "web/node_modules/jsesc/README.md",
+    "web/node_modules/update-browserslist-db/README.md",
+    "web/node_modules/loose-envify/README.md",
+    "web/node_modules/escalade/readme.md",
+    "web/node_modules/js-tokens/README.md",
+    "web/node_modules/yallist/README.md",
+    "web/node_modules/@babel/parser/README.md",
+    "web/node_modules/picocolors/README.md",
+    "web/node_modules/@babel/core/README.md",
+    "web/node_modules/@types/prop-types/README.md"
   ]
 }
