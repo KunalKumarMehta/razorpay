@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PayoutProof operator journey — throwaway logic prototype</title>
+  <style>
+    :root { --ink:#17211b; --muted:#637068; --paper:#f4f1e8; --panel:#fffdf7; --line:#d9d6ca; --accent:#176b52; --accent-soft:#dcefe7; --warn:#8a5014; --danger:#9a3434; --shadow:0 8px 24px rgba(23,33,27,.08); }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:var(--paper); font:15px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { width:min(1180px,calc(100% - 32px)); margin:28px auto 64px; }
+    .eyebrow { color:var(--accent); font-size:12px; font-weight:800; letter-spacing:.12em; text-transform:uppercase; }
+    h1 { margin:7px 0 8px; font-size:clamp(30px,5vw,50px); line-height:1; letter-spacing:-.04em; }
+    h2 { margin:0 0 14px; font-size:20px; }
+    h3 { margin:0 0 9px; font-size:14px; }
+    p { margin:0; }
+    .question { max-width:900px; margin-top:14px; padding:14px 16px; border-left:4px solid var(--accent); background:rgba(255,255,255,.55); }
+    .question strong { display:block; margin-bottom:3px; }
+    .grid { display:grid; grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr); gap:18px; margin-top:22px; }
+    .stack { display:grid; gap:18px; align-content:start; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; box-shadow:var(--shadow); padding:18px; }
+    .statusline { display:flex; gap:9px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
+    .pill { display:inline-flex; align-items:center; min-height:27px; padding:4px 9px; border-radius:999px; background:#e8e7df; font-size:12px; font-weight:800; letter-spacing:.02em; }
+    .pill.good { color:#11543f; background:var(--accent-soft); }
+    .pill.warn { color:#76440f; background:#f8e6c8; }
+    .pill.bad { color:#852e2e; background:#f6dede; }
+    .change { margin:0 0 15px; padding:11px 13px; border-radius:9px; background:#eff6f2; color:#244437; }
+    .facts { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1px; background:var(--line); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+    .fact { min-height:68px; padding:11px 12px; background:var(--panel); }
+    .label { display:block; margin-bottom:5px; color:var(--muted); font-size:11px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; }
+    .value { overflow-wrap:anywhere; font-weight:650; }
+    .empty { color:#8b938e; font-weight:500; }
+    .subgrid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:12px; }
+    .subpanel { padding:12px; border:1px solid var(--line); border-radius:10px; }
+    ul { margin:6px 0 0; padding-left:19px; }
+    li + li { margin-top:4px; }
+    button { appearance:none; border:1px solid #bfc5bf; border-radius:9px; padding:9px 11px; color:var(--ink); background:#fff; font:inherit; font-weight:700; cursor:pointer; }
+    button:hover { border-color:var(--accent); color:var(--accent); }
+    button.primary { border-color:var(--accent); color:#fff; background:var(--accent); }
+    button.primary:hover { color:#fff; background:#115a44; }
+    .actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+    .hint { margin:0 0 12px; color:var(--muted); font-size:13px; }
+    .tabs { display:flex; gap:7px; overflow:auto; padding-bottom:8px; }
+    .tab { flex:0 0 auto; padding:8px 10px; font-size:13px; }
+    .tab[aria-selected="true"] { border-color:var(--accent); color:#fff; background:var(--accent); }
+    .walkthrough { margin-top:12px; }
+    .steps { display:grid; gap:7px; margin-top:12px; }
+    .step { display:flex; gap:10px; align-items:center; text-align:left; }
+    .step.done { border-color:#b9d4c8; color:#496158; background:#eef7f2; }
+    .step.next { border-color:var(--accent); box-shadow:0 0 0 2px rgba(23,107,82,.12); }
+    .step.waiting { color:#8a918c; background:#faf9f4; }
+    .stepnum { display:inline-grid; place-items:center; flex:0 0 22px; width:22px; height:22px; border-radius:50%; background:#ecece5; font-size:11px; }
+    .audit { max-height:430px; overflow:auto; }
+    .event { display:grid; grid-template-columns:30px 1fr; gap:9px; padding:9px 0; border-top:1px solid var(--line); }
+    .event:first-child { border-top:0; }
+    .seq { display:grid; place-items:center; width:26px; height:26px; border-radius:50%; background:#ecece5; color:var(--muted); font-size:11px; font-weight:800; }
+    .event small { display:block; margin-top:2px; color:var(--muted); }
+    .prototype-note { margin-top:18px; color:var(--muted); font-size:12px; text-align:center; }
+    @media (max-width:850px) { .grid { grid-template-columns:1fr; } }
+    @media (max-width:560px) { main { width:min(100% - 20px,1180px); margin-top:18px; } .facts,.subgrid,.actions { grid-template-columns:1fr; } .card { padding:14px; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">Throwaway logic prototype · no persistence · synthetic demo</div>
+  <h1>PayoutProof operator journey</h1>
+  <p>Drive one urgent payout instruction from intake to a policy-gated, human-initiated handoff—and deliberately break it.</p>
+  <div class="question">
+    <strong>Question this prototype answers</strong>
+    Does the operator journey keep investigation, deterministic policy, and human handoff visibly separate while remaining understandable in five minutes—especially when evidence is missing, contradictory, invalidated, failed, or replayed?
+  </div>
+  <div class="question">
+    <strong>Five-minute pitch cut</strong>
+    Intake and extraction auto-advance. The Payment Operator clicks only to confirm the exact Payment Intent, provide the specified callback and destination-approval evidence, and freshly initiate handoff. This detailed prototype keeps every transition clickable so the underlying contract can be challenged.
+  </div>
+
+  <div class="grid">
+    <div class="stack">
+      <section class="card" aria-labelledby="state-title">
+        <h2 id="state-title">Current journey state</h2>
+        <div id="state"></div>
+      </section>
+
+      <section class="card" aria-labelledby="walk-title">
+        <h2 id="walk-title">Guided walkthroughs</h2>
+        <p class="hint">Choose a tab, start from its known state, then press the highlighted steps in order.</p>
+        <div id="tabs" class="tabs" role="tablist"></div>
+        <div id="walkthrough" class="walkthrough"></div>
+      </section>
+    </div>
+
+    <div class="stack">
+      <section class="card" aria-labelledby="actions-title">
+        <h2 id="actions-title">Free play</h2>
+        <p class="hint">Actions stay available. If an action is unsafe or out of order, the case records why it was refused.</p>
+        <div id="actions" class="actions"></div>
+      </section>
+
+      <section class="card" aria-labelledby="audit-title">
+        <h2 id="audit-title">Tamper-evident audit story</h2>
+        <p class="hint">Prototype sequence and hash links stand in for an append-only audit chain.</p>
+        <div id="audit" class="audit"></div>
+      </section>
+    </div>
+  </div>
+  <p class="prototype-note">Synthetic scenario. “Eligible for Handoff” is not payout approval, identity proof, or a fraud verdict.</p>
+</main>
+
+<script>
+/*
+  PORTABLE PURE MODULE
+  No DOM, clock, storage, network, or random dependency. Lift this module out to test the model elsewhere.
+*/
+const PayoutProofJourney = (() => {
+  const POLICY_VERSION = "PP-DEMO-1";
+  const blankIntent = () => ({
+    counterparty: null, destination: null, destinationStatus: null, amount: null,
+    currency: null, purpose: null, instructionReference: null, provenance: [],
+    status: "NOT_EXTRACTED", hash: null
+  });
+  const initialState = () => ({
+    caseId: null, caseVersion: 0, phase: "EVIDENCE_ADMISSION",
+    processingAuthority: "NOT_CHECKED", requestBundle: "NOT_ADMITTED",
+    intent: blankIntent(), evidence: [], findings: [],
+    investigation: { modelStatus: "NOT_RUN", attempt: 0 },
+    policy: { outcome: "NOT_EVALUATED", reasons: [], nextSteps: ["Admit an authorized request bundle"], evaluatedIntentHash: null, policyVersion: POLICY_VERSION },
+    grant: { status: "NOT_ISSUED", id: null, boundIntentHash: null, expiresAfterStep: null, used: false },
+    handoff: { status: "NOT_STARTED", idempotencyKey: null, attempts: 0, lastAdapterDecision: null },
+    lastChange: "Urgent instruction submitted for authority checks; no Risk Case exists yet.",
+    audit: [{ seq: 1, type: "EVIDENCE_ADMISSION_STARTED", summary: "Urgent out-of-band instruction submitted", actor: "Payment Operator", chain: "GENESIS→A1" }]
+  });
+  const copy = state => JSON.parse(JSON.stringify(state));
+  const intentHash = intent => [intent.counterparty,intent.destination,intent.amount,intent.currency,intent.purpose,intent.instructionReference].join("|");
+  const event = (s, type, summary, actor = "PayoutProof") => {
+    const seq = s.audit.length + 1;
+    s.audit.push({ seq, type, summary, actor, chain: `A${seq-1}→A${seq}` });
+  };
+  const reject = (s, action, reason) => {
+    s.lastChange = `Refused “${action}”: ${reason}`;
+    event(s, "ACTION_REFUSED", s.lastChange, "Policy boundary");
+    return s;
+  };
+  const setPolicy = (s, outcome, reasons, nextSteps) => {
+    s.policy = { outcome, reasons, nextSteps, evaluatedIntentHash: s.intent.hash, policyVersion: POLICY_VERSION };
+    s.phase = outcome === "ELIGIBLE_FOR_HANDOFF" ? "READY_FOR_HUMAN_HANDOFF" : "OPERATOR_INTERVENTION";
+  };
+  const revokeGrant = s => {
+    if (s.grant.status === "ACTIVE") s.grant.status = "INVALIDATED";
+  };
+
+  function reduce(state, action) {
+    const s = copy(state);
+    switch (action.type) {
+      case "RESET": return initialState();
+      case "ADMIT_AUTHORIZED_BUNDLE":
+        if (s.requestBundle === "ADMITTED") return reject(s, "admit authorized request", "the request bundle is already admitted");
+        s.processingAuthority = "VALID"; s.requestBundle = "ADMITTED"; s.phase = "INVESTIGATION"; s.caseId = "RC-DEMO-042"; s.caseVersion = 1;
+        s.evidence.push({ item:"Urgent voice note + message", finding:"admitted", truth:"supported" });
+        s.policy.nextSteps = ["Extract the proposed Payment Intent"];
+        s.lastChange = "Processing authority validated; evidence was admitted and Risk Case RC-DEMO-042 opened.";
+        event(s,"RISK_CASE_OPENED",s.lastChange,"Payment Operator"); return s;
+      case "SUBMIT_UNAUTHORIZED_BUNDLE":
+        if (s.requestBundle === "ADMITTED") return reject(s, "submit incomplete processing authority", "admitted evidence cannot be replaced silently");
+        s.processingAuthority = "INCOMPLETE"; s.requestBundle = "REJECTED"; s.phase = "ADMISSION_REJECTED";
+        s.policy = { outcome:"NOT_EVALUATED", reasons:[], nextSteps:["Provide a complete Processing Authority Record and submit again"], evaluatedIntentHash:null, policyVersion:POLICY_VERSION };
+        s.lastChange = "Admission Rejection: evidence was not admitted, no Risk Case exists, and the Policy Gate did not run.";
+        event(s,"ADMISSION_REJECTED",s.lastChange,"Evidence admission control"); return s;
+      case "EXTRACT_INTENT":
+        if (s.requestBundle !== "ADMITTED") return reject(s,"extract Payment Intent","no authorized evidence has been admitted");
+        s.investigation = { modelStatus:"SUCCEEDED", attempt:s.investigation.attempt + 1 };
+        s.intent = { counterparty:"Kaveri Components", destination:"HDFC ••4821", destinationStatus:"UNAPPROVED", amount:"425000", currency:"INR", purpose:"Urgent tooling deposit", instructionReference:"VOICE-17 + MSG-17", provenance:["VOICE-17: transcript spans 00:04–00:12","MSG-17: destination and amount"], status:"EXTRACTED", hash:null };
+        s.findings = [{ name:"Destination relationship", truth:"not observed", detail:"No prior approval for HDFC ••4821" }, { name:"Instruction consistency", truth:"supported", detail:"Voice note and message agree on amount and destination" }];
+        s.policy = { outcome:"NOT_EVALUATED", reasons:[], nextSteps:["Payment Operator confirms every material field"], evaluatedIntentHash:null, policyVersion:POLICY_VERSION };
+        s.lastChange = "Trust Agent extracted an unconfirmed Payment Intent with field-level provenance.";
+        event(s,"INTENT_EXTRACTED",s.lastChange,"Trust Agent"); return s;
+      case "FAIL_MODEL":
+        if (s.requestBundle !== "ADMITTED") return reject(s,"simulate unusable extraction","no authorized evidence has been admitted");
+        s.investigation = { modelStatus:"FAILED_UNUSABLE_AUDIO", attempt:s.investigation.attempt + 1 };
+        setPolicy(s,"HOLD",["REQUIRED_SIGNAL_UNAVAILABLE","MODEL_FAILURE"],["Ask for a readable text instruction or clearer recording","Do not create a payout"]);
+        s.lastChange = "Investigation failed closed; missing output did not become safe evidence.";
+        event(s,"INVESTIGATION_FAILED_CLOSED",s.lastChange,"Trust Agent"); return s;
+      case "CONFIRM_INTENT":
+        if (s.intent.status !== "EXTRACTED" && s.intent.status !== "INVALIDATED") return reject(s,"confirm Payment Intent","there is no extracted intent ready for confirmation");
+        s.intent.status = "CONFIRMED"; s.intent.hash = intentHash(s.intent); s.caseVersion += 1;
+        s.policy.nextSteps = ["Run the deterministic Policy Gate"];
+        s.lastChange = "Payment Operator confirmed the exact material fields; a frozen intent hash was created.";
+        event(s,"INTENT_CONFIRMED",s.lastChange,"Payment Operator"); return s;
+      case "ADD_CALLBACK_EVIDENCE":
+        if (s.requestBundle !== "ADMITTED") return reject(s,"record independent callback","there is no admitted case to support");
+        s.evidence.push({ item:"Independent callback record", finding:"exact destination and purpose confirmed", truth:"supported" });
+        s.findings = s.findings.filter(f => f.name !== "Independent callback");
+        s.findings.push({ name:"Independent callback", truth:"supported", detail:"Known number; exact intent repeated back" });
+        s.lastChange = "Specified step-up evidence was added without changing the Payment Intent.";
+        event(s,"STEP_UP_EVIDENCE_ADDED",s.lastChange,"Payment Operator"); return s;
+      case "ADD_DESTINATION_APPROVAL":
+        if (s.requestBundle !== "ADMITTED" || s.intent.status === "NOT_EXTRACTED") return reject(s,"record destination-approval evidence","there is no admitted Payment Intent to bind it to");
+        s.evidence.push({ item:"Destination approval record", finding:"HDFC ••4821 approved for Kaveri Components", truth:"supported" });
+        s.findings = s.findings.filter(f => f.name !== "Destination approval");
+        s.findings.push({ name:"Destination approval", truth:"supported", detail:"Separately approved under finance policy; exact counterparty and destination bound" });
+        s.intent.destinationStatus = "APPROVED_FOR_COUNTERPARTY";
+        s.lastChange = "Separate policy-governed destination-approval evidence was recorded; callback alone did not create this approval.";
+        event(s,"DESTINATION_APPROVAL_EVIDENCE_ADDED",s.lastChange,"Payment Operator"); return s;
+      case "ADD_CONTRADICTION":
+        if (s.requestBundle !== "ADMITTED") return reject(s,"add contradictory invoice","there is no admitted case to compare");
+        s.evidence.push({ item:"Supplier invoice", finding:"destination HDFC ••9930", truth:"contradicted" });
+        s.findings.push({ name:"Destination consistency", truth:"contradicted", detail:"Invoice says HDFC ••9930; instruction says HDFC ••4821" });
+        revokeGrant(s);
+        setPolicy(s,"HOLD",["MATERIAL_EVIDENCE_CONTRADICTION"],["Finance Control Owner reviews the conflicting destinations","Do not hand off"]);
+        s.lastChange = "Contradiction forced a Hold; urgency cannot override the mismatch.";
+        event(s,"CONTRADICTION_RECORDED",s.lastChange,"Trust Agent"); return s;
+      case "SUBMIT_TAMPERED_SNAPSHOT":
+        if (s.intent.status !== "CONFIRMED" || !s.intent.hash) return reject(s,"submit tampered canonical snapshot","there is no confirmed canonical snapshot to integrity-check");
+        revokeGrant(s);
+        setPolicy(s,"BLOCKED",["CANONICAL_SNAPSHOT_INTEGRITY_FAILED"],["Reject this snapshot","Rebuild from admitted evidence under a fresh case version"]);
+        s.lastChange = "Policy Gate blocked an admitted canonical snapshot whose integrity check failed.";
+        event(s,"CANONICAL_SNAPSHOT_BLOCKED",s.lastChange,"Policy Gate"); return s;
+      case "EVALUATE_POLICY": {
+        if (s.intent.status !== "CONFIRMED" || !s.intent.hash) return reject(s,"run Policy Gate","the Payment Intent is not confirmed and frozen");
+        const contradiction = s.findings.some(f => f.truth === "contradicted");
+        const callback = s.findings.some(f => f.name === "Independent callback" && f.truth === "supported");
+        const destinationApproved = s.findings.some(f => f.name === "Destination approval" && f.truth === "supported");
+        if (contradiction) setPolicy(s,"HOLD",["MATERIAL_EVIDENCE_CONTRADICTION"],["Resolve the conflicting destination outside PayoutProof"]);
+        else if (!callback && !destinationApproved) setPolicy(s,"STEP_UP_REQUIRED",["UNAPPROVED_DESTINATION","INDEPENDENT_VERIFICATION_MISSING"],["Call the counterparty using a known number and confirm the exact intent","Complete the separate policy-governed destination-approval process"]);
+        else if (!callback) setPolicy(s,"STEP_UP_REQUIRED",["INDEPENDENT_VERIFICATION_MISSING"],["Call the counterparty using a known number and confirm the exact intent"]);
+        else if (!destinationApproved) setPolicy(s,"STEP_UP_REQUIRED",["UNAPPROVED_DESTINATION"],["Complete the separate policy-governed destination-approval process"]);
+        else setPolicy(s,"ELIGIBLE_FOR_HANDOFF",["REQUIRED_EVIDENCE_SATISFIED","EXACT_INTENT_FROZEN"],["Payment Operator may freshly initiate handoff into the existing approval rail"]);
+        s.lastChange = `Policy Gate returned ${s.policy.outcome.replaceAll("_"," ")} for the frozen intent.`;
+        event(s,"POLICY_EVALUATED",s.lastChange,"Policy Gate"); return s;
+      }
+      case "ISSUE_GRANT":
+        if (s.policy.outcome !== "ELIGIBLE_FOR_HANDOFF" || s.policy.evaluatedIntentHash !== s.intent.hash) return reject(s,"issue Handoff Grant","the current frozen intent is not eligible");
+        s.grant = { status:"ACTIVE", id:"HG-DEMO-7", boundIntentHash:s.intent.hash, expiresAfterStep:s.audit.length + 4, used:false };
+        s.lastChange = "A single-use Handoff Grant was bound to this case, policy result, and exact intent.";
+        event(s,"HANDOFF_GRANT_ISSUED",s.lastChange,"Policy Gate"); return s;
+      case "EDIT_AMOUNT":
+        if (s.intent.status === "NOT_EXTRACTED") return reject(s,"edit amount","there is no extracted Payment Intent");
+        s.intent.amount = s.intent.amount === "425000" ? "475000" : "425000"; s.intent.status = "INVALIDATED"; s.intent.hash = null; s.caseVersion += 1;
+        s.findings = s.findings.map(f => f.name === "Independent callback" ? { name:f.name, truth:"not observed", detail:"Prior callback predates the material edit and does not confirm the changed exact intent" } : f);
+        revokeGrant(s);
+        setPolicy(s,"HOLD",["MATERIAL_INTENT_CHANGED","PREVIOUS_EVALUATION_INVALIDATED"],["Confirm the edited Payment Intent","Run a fresh Policy Gate evaluation"]);
+        s.policy.evaluatedIntentHash = null;
+        s.lastChange = "Material edit invalidated the prior evaluation and any active Handoff Grant.";
+        event(s,"MATERIAL_INTENT_EDITED",s.lastChange,"Payment Operator"); return s;
+      case "INITIATE_HANDOFF":
+        if (s.grant.status !== "ACTIVE" || s.grant.used || s.grant.boundIntentHash !== s.intent.hash) return reject(s,"initiate human handoff","no fresh, active grant matches the exact current intent");
+        s.handoff = { status:"PENDING", idempotencyKey:"HO-RC-DEMO-042-V"+s.caseVersion, attempts:s.handoff.attempts+1, lastAdapterDecision:"FRESH_HUMAN_GESTURE_ACCEPTED" };
+        s.phase = "HANDOFF_IN_PROGRESS";
+        s.lastChange = "Fresh operator gesture started one idempotent handoff attempt; maker-checker approval remains downstream.";
+        event(s,"HANDOFF_INITIATED",s.lastChange,"Payment Operator"); return s;
+      case "HANDOFF_ACCEPTED":
+        if (s.handoff.status !== "PENDING") return reject(s,"record accepted handoff","there is no pending adapter attempt");
+        s.handoff.status = "PENDING_IN_APPROVAL_RAIL"; s.handoff.lastAdapterDecision = "PENDING_ITEM_CREATED";
+        s.grant.used = true; s.grant.status = "CONSUMED"; s.phase = "COMPLETE";
+        s.lastChange = "Exact unchanged intent became a pending item in the existing approval rail; PayoutProof stopped.";
+        event(s,"HANDOFF_CONFIRMED",s.lastChange,"Action Adapter"); return s;
+      case "HANDOFF_AMBIGUOUS":
+        if (s.handoff.status !== "PENDING") return reject(s,"simulate ambiguous handoff","there is no pending adapter attempt");
+        s.handoff.status = "RECONCILIATION_REQUIRED"; s.handoff.lastAdapterDecision = "DOWNSTREAM_STATUS_UNKNOWN_NO_RETRY";
+        s.grant.status = "SUSPENDED_FOR_RECONCILIATION"; s.grant.used = true; s.phase = "RECONCILIATION_REQUIRED";
+        s.lastChange = "Adapter status is ambiguous: historical eligibility remains, the grant cannot be reused, and reconciliation will not retry blindly.";
+        event(s,"HANDOFF_STATUS_AMBIGUOUS",s.lastChange,"Action Adapter"); return s;
+      case "REPLAY_GRANT":
+        s.handoff.attempts += 1; s.handoff.lastAdapterDecision = "REPLAY_REJECTED";
+        s.lastChange = "Replay rejected: the same grant or idempotency key cannot create another pending item.";
+        event(s,"HANDOFF_REPLAY_REJECTED",s.lastChange,"Action Adapter"); return s;
+      default: return reject(s,action.type,"unknown action");
+    }
+  }
+  return { initialState, reduce, POLICY_VERSION };
+})();
+</script>
+
+<script>
+/* Throwaway page shell: maps human-facing controls to the pure module above. */
+const actionCatalog = [
+  ["Start over","RESET"], ["Admit authorized request","ADMIT_AUTHORIZED_BUNDLE"],
+  ["Submit incomplete processing authority","SUBMIT_UNAUTHORIZED_BUNDLE"], ["Extract Payment Intent","EXTRACT_INTENT"],
+  ["Simulate unusable audio / model failure","FAIL_MODEL"], ["Confirm exact Payment Intent","CONFIRM_INTENT"],
+  ["Record independent callback","ADD_CALLBACK_EVIDENCE"], ["Record destination-approval evidence","ADD_DESTINATION_APPROVAL"],
+  ["Add contradictory invoice","ADD_CONTRADICTION"], ["Submit tampered canonical snapshot","SUBMIT_TAMPERED_SNAPSHOT"],
+  ["Run deterministic Policy Gate","EVALUATE_POLICY"], ["Issue single-use Handoff Grant","ISSUE_GRANT"],
+  ["Materially edit amount","EDIT_AMOUNT"], ["Operator initiates handoff","INITIATE_HANDOFF"],
+  ["Adapter confirms pending item","HANDOFF_ACCEPTED"], ["Simulate ambiguous adapter status","HANDOFF_AMBIGUOUS"],
+  ["Replay same Handoff Grant","REPLAY_GRANT"]
+];
+const scenarios = [
+  { name:"Happy path", description:"A legitimate urgent exception earns eligibility only after exact intent confirmation, independent callback, and separate policy-governed destination approval. Watch PayoutProof stop at a pending item—not approval or execution.", steps:["ADMIT_AUTHORIZED_BUNDLE","EXTRACT_INTENT","CONFIRM_INTENT","ADD_CALLBACK_EVIDENCE","ADD_DESTINATION_APPROVAL","EVALUATE_POLICY","ISSUE_GRANT","INITIATE_HANDOFF","HANDOFF_ACCEPTED"] },
+  { name:"Step-up", description:"Callback confirms the instruction but cannot approve an unapproved destination. The case remains Step Up Required until separate destination-approval evidence is recorded.", steps:["ADMIT_AUTHORIZED_BUNDLE","EXTRACT_INTENT","CONFIRM_INTENT","EVALUATE_POLICY","ADD_CALLBACK_EVIDENCE","EVALUATE_POLICY","ADD_DESTINATION_APPROVAL","EVALUATE_POLICY"] },
+  { name:"Contradiction / Hold", description:"A supplier invoice disagrees with the destination in the instruction. The contradiction remains explicit and forces Hold.", steps:["ADMIT_AUTHORIZED_BUNDLE","EXTRACT_INTENT","CONFIRM_INTENT","ADD_CONTRADICTION","EVALUATE_POLICY"] },
+  { name:"Blocked input", description:"Evidence was admitted, but the canonical snapshot fails an integrity check. This is a real Policy Outcome of Blocked, with stable reasons and no handoff path.", steps:["ADMIT_AUTHORIZED_BUNDLE","EXTRACT_INTENT","CONFIRM_INTENT","SUBMIT_TAMPERED_SNAPSHOT","ISSUE_GRANT"] },
+  { name:"Admission rejection", description:"The request lacks a complete Processing Authority Record. Evidence is rejected before investigation: no Risk Case opens and no Policy Outcome exists.", steps:["SUBMIT_UNAUTHORIZED_BUNDLE","EXTRACT_INTENT"] },
+  { name:"Material edit", description:"After eligibility and grant issuance, changing ₹4.25 lakh to ₹4.75 lakh invalidates both evaluation and grant. Old eligibility cannot travel with new money details.", steps:["ADMIT_AUTHORIZED_BUNDLE","EXTRACT_INTENT","CONFIRM_INTENT","ADD_CALLBACK_EVIDENCE","ADD_DESTINATION_APPROVAL","EVALUATE_POLICY","ISSUE_GRANT","EDIT_AMOUNT","INITIATE_HANDOFF"] },
+  { name:"Model failure", description:"Unusable audio or a failed extraction is still an incorrect evaluation result, but operationally it must fail closed and ask for safer evidence.", steps:["ADMIT_AUTHORIZED_BUNDLE","FAIL_MODEL","ISSUE_GRANT"] },
+  { name:"Replay / ambiguity", description:"The adapter cannot confirm whether it created the pending item. Historical eligibility remains, but the grant is suspended and consumed for reuse, the case enters reconciliation, and a blind replay is rejected.", steps:["ADMIT_AUTHORIZED_BUNDLE","EXTRACT_INTENT","CONFIRM_INTENT","ADD_CALLBACK_EVIDENCE","ADD_DESTINATION_APPROVAL","EVALUATE_POLICY","ISSUE_GRANT","INITIATE_HANDOFF","HANDOFF_AMBIGUOUS","REPLAY_GRANT"] }
+];
+const labels = Object.fromEntries(actionCatalog.map(([label,type]) => [type,label]));
+let state = PayoutProofJourney.initialState();
+let activeScenario = 0;
+let scenarioStep = 0;
+
+const esc = value => String(value).replace(/[&<>"']/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
+const display = value => value === null || value === undefined || value === "" ? '<span class="empty">Not available</span>' : esc(String(value).replaceAll("_"," "));
+const money = i => i.amount ? `₹${Number(i.amount).toLocaleString("en-IN")} ${i.currency}` : null;
+const tone = outcome => outcome === "ELIGIBLE_FOR_HANDOFF" ? "good" : outcome === "BLOCKED" || outcome === "HOLD" ? "bad" : outcome === "STEP_UP_REQUIRED" ? "warn" : "";
+const fact = (label,value) => `<div class="fact"><span class="label">${esc(label)}</span><div class="value">${display(value)}</div></div>`;
+const list = items => items.length ? `<ul>${items.map(x=>`<li>${esc(x)}</li>`).join("")}</ul>` : '<span class="empty">None</span>';
+
+function dispatch(type, fromScenario=false) {
+  state = PayoutProofJourney.reduce(state,{type});
+  if (fromScenario && type !== "RESET") scenarioStep += 1;
+  render();
+}
+function startScenario(index) { activeScenario=index; scenarioStep=0; state=PayoutProofJourney.initialState(); render(); }
+
+function renderState() {
+  const i=state.intent, p=state.policy, g=state.grant, h=state.handoff;
+  document.querySelector("#state").innerHTML = `
+    <div class="statusline"><span class="pill">${display(state.phase)}</span><span class="pill ${tone(p.outcome)}">Policy: ${display(p.outcome)}</span><span class="pill">Case v${state.caseVersion}</span></div>
+    <div class="change"><strong>What just changed:</strong> ${esc(state.lastChange)}</div>
+    <div class="facts">
+      ${fact("Risk Case",state.caseId)} ${fact("Payment Intent",i.counterparty)}
+      ${fact("Amount",money(i))} ${fact("Destination",i.destination)}
+      ${fact("Destination state",i.destinationStatus)} ${fact("Purpose",i.purpose)}
+      ${fact("Instruction",i.instructionReference)} ${fact("Intent status",i.status)}
+      ${fact("Frozen intent hash",i.hash)} ${fact("Processing authority",state.processingAuthority)}
+      ${fact("Request bundle",state.requestBundle)} ${fact("Investigation",`${state.investigation.modelStatus} · attempt ${state.investigation.attempt}`)}
+      ${fact("Policy version",p.policyVersion)} ${fact("Handoff Grant",`${g.status}${g.id ? " · "+g.id : ""}`)}
+      ${fact("Handoff",`${h.status}${h.idempotencyKey ? " · "+h.idempotencyKey : ""}`)}
+    </div>
+    <div class="subgrid">
+      <div class="subpanel"><h3>Policy reasons</h3>${list(p.reasons)}</div>
+      <div class="subpanel"><h3>Required next steps</h3>${list(p.nextSteps)}</div>
+      <div class="subpanel"><h3>Evidence (${state.evidence.length})</h3>${state.evidence.length ? `<ul>${state.evidence.map(e=>`<li><strong>${esc(e.item)}</strong> — ${esc(e.finding)} <em>(${esc(e.truth)})</em></li>`).join("")}</ul>` : '<span class="empty">No evidence admitted</span>'}</div>
+      <div class="subpanel"><h3>Findings (${state.findings.length})</h3>${state.findings.length ? `<ul>${state.findings.map(f=>`<li><strong>${esc(f.name)}</strong> — ${esc(f.truth)}: ${esc(f.detail)}</li>`).join("")}</ul>` : '<span class="empty">No findings</span>'}</div>
+      <div class="subpanel"><h3>Provenance</h3>${list(i.provenance)}</div>
+      <div class="subpanel"><h3>Adapter boundary</h3>${h.lastAdapterDecision ? display(h.lastAdapterDecision) : '<span class="empty">No handoff attempt</span>'}<br><span class="label" style="margin-top:8px">Attempts</span>${h.attempts}</div>
+    </div>`;
+}
+function renderActions() {
+  document.querySelector("#actions").innerHTML = actionCatalog.map(([label,type],idx)=>`<button class="${idx===0?'primary':''}" data-action="${type}">${esc(label)}</button>`).join("");
+  document.querySelectorAll("#actions button").forEach(b=>b.addEventListener("click",()=>dispatch(b.dataset.action)));
+}
+function renderWalkthrough() {
+  document.querySelector("#tabs").innerHTML = scenarios.map((s,i)=>`<button class="tab" role="tab" aria-selected="${i===activeScenario}" data-tab="${i}">${esc(s.name)}</button>`).join("");
+  document.querySelectorAll("[data-tab]").forEach(b=>b.addEventListener("click",()=>startScenario(Number(b.dataset.tab))));
+  const s=scenarios[activeScenario];
+  document.querySelector("#walkthrough").innerHTML = `<p>${esc(s.description)}</p><div class="steps">${s.steps.map((type,i)=>`<button class="step ${i<scenarioStep?'done':i===scenarioStep?'next':'waiting'}" data-step="${i}" data-type="${type}"><span class="stepnum">${i<scenarioStep?'✓':i+1}</span><span>${esc(labels[type])}</span></button>`).join("")}</div><button class="primary" id="restart" style="margin-top:12px">Restart this walkthrough</button>`;
+  document.querySelectorAll("[data-step]").forEach(b=>b.addEventListener("click",()=>{
+    const index=Number(b.dataset.step);
+    if(index===scenarioStep) dispatch(b.dataset.type,true);
+  }));
+  document.querySelector("#restart").addEventListener("click",()=>startScenario(activeScenario));
+}
+function renderAudit() {
+  document.querySelector("#audit").innerHTML = [...state.audit].reverse().map(e=>`<div class="event"><span class="seq">${e.seq}</span><div><strong>${display(e.type)}</strong><br>${esc(e.summary)}<small>${esc(e.actor)} · ${esc(e.chain)}</small></div></div>`).join("");
+}
+function render(){ renderState(); renderActions(); renderWalkthrough(); renderAudit(); }
+render();
+</script>
+</body>
+</html>

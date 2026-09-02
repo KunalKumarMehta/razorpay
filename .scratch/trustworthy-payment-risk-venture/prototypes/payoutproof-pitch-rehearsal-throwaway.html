@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PayoutProof five-minute pitch rehearsal — throwaway logic prototype</title>
+  <style>
+    :root {
+      --ink:#18201d; --muted:#64706a; --paper:#f5f2e9; --card:#fffefa;
+      --line:#d9d8ce; --accent:#176b52; --accent-soft:#e7f3ed;
+      --warn:#8a5b00; --warn-soft:#fff3d8; --bad:#9c3434; --bad-soft:#fbeaea;
+      --good:#21664d; --good-soft:#e7f4ee;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:var(--paper); font:15px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { width:min(1180px,calc(100% - 32px)); margin:34px auto 64px; }
+    h1,h2,h3,p { margin-top:0; }
+    h1 { margin-bottom:8px; font-size:clamp(28px,4vw,44px); letter-spacing:-.035em; }
+    h2 { font-size:18px; margin-bottom:12px; }
+    h3 { font-size:13px; letter-spacing:.04em; text-transform:uppercase; color:var(--muted); margin-bottom:8px; }
+    .lede { max-width:900px; color:#3d4944; font-size:17px; }
+    .mark { display:inline-block; padding:5px 9px; margin-bottom:14px; border:1px solid #b9c7c0; border-radius:999px; color:var(--accent); background:var(--accent-soft); font-size:12px; font-weight:750; letter-spacing:.06em; text-transform:uppercase; }
+    .grid { display:grid; grid-template-columns:minmax(0,1.18fr) minmax(350px,.82fr); gap:16px; align-items:start; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px; box-shadow:0 4px 18px rgba(40,46,42,.04); }
+    .stack { display:grid; gap:16px; }
+    .statusline,.controls,.tabs { display:flex; flex-wrap:wrap; gap:8px; }
+    .pill { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--line); border-radius:999px; padding:5px 9px; font-size:12px; font-weight:700; background:#fff; }
+    .pill.good { color:var(--good); background:var(--good-soft); border-color:#b8d7c9; }
+    .pill.warn { color:var(--warn); background:var(--warn-soft); border-color:#e4c983; }
+    .pill.bad { color:var(--bad); background:var(--bad-soft); border-color:#e1b6b6; }
+    .change { margin:12px 0; padding:10px 12px; background:#f1f0e9; border-left:3px solid var(--accent); border-radius:6px; }
+    .facts { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+    .fact { min-height:62px; padding:10px; border:1px solid var(--line); border-radius:9px; background:#fff; }
+    .fact span { display:block; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
+    .fact strong { display:block; margin-top:3px; overflow-wrap:anywhere; }
+    .script { margin:12px 0 0; padding:14px; border-radius:10px; background:#19221f; color:#f5f7f2; font-size:16px; }
+    .script small { display:block; margin-top:8px; color:#aebbb5; }
+    .timeline { display:grid; gap:7px; margin-top:12px; }
+    .beat { display:grid; grid-template-columns:54px 1fr 46px; gap:10px; align-items:center; border:1px solid var(--line); border-radius:9px; padding:9px 10px; background:#fff; }
+    .beat.active { border-color:var(--accent); box-shadow:0 0 0 2px rgba(23,107,82,.12); }
+    .beat.done { color:#4d5954; background:#f0f5f2; }
+    .beat .time,.beat .duration { font-variant-numeric:tabular-nums; font-size:12px; color:var(--muted); }
+    button { border:1px solid #c8cbc5; border-radius:8px; padding:8px 10px; background:#fff; color:var(--ink); font:inherit; font-weight:650; cursor:pointer; }
+    button:hover { border-color:var(--accent); }
+    button.primary { color:#fff; background:var(--accent); border-color:var(--accent); }
+    button.danger { color:var(--bad); border-color:#d8afaf; }
+    .section-gap { margin-top:18px; }
+    .tab[aria-selected="true"] { color:#fff; background:#26352f; border-color:#26352f; }
+    .steps { display:grid; gap:7px; margin-top:12px; }
+    .step { display:flex; align-items:center; gap:9px; text-align:left; }
+    .step.next { border-color:var(--accent); box-shadow:0 0 0 2px rgba(23,107,82,.12); }
+    .step.done { color:#51625a; background:var(--accent-soft); }
+    .step.waiting { color:#8a918d; background:#faf9f4; }
+    .stepnum { display:grid; place-items:center; flex:0 0 23px; width:23px; height:23px; border-radius:50%; background:#ecece6; font-size:11px; }
+    .claim { padding:9px 0; border-bottom:1px solid #e6e5dc; }
+    .claim:last-child { border-bottom:0; }
+    .claim strong { display:block; }
+    .claim small { color:var(--muted); }
+    .release { margin-top:12px; padding:12px; border-radius:9px; font-weight:750; }
+    .release.good { color:var(--good); background:var(--good-soft); }
+    .release.bad { color:var(--bad); background:var(--bad-soft); }
+    .note { color:var(--muted); font-size:13px; }
+    .prototype-note { margin-top:16px; padding:12px 14px; border:1px dashed #b9b8af; border-radius:10px; color:#59635e; }
+    @media (max-width:850px) { .grid { grid-template-columns:1fr; } }
+    @media (max-width:560px) { .facts { grid-template-columns:1fr; } .beat { grid-template-columns:48px 1fr; } .beat .duration { display:none; } }
+  </style>
+</head>
+<body>
+<main>
+  <span class="mark">Throwaway rehearsal · not production UI</span>
+  <h1>PayoutProof five-minute pitch rehearsal</h1>
+  <p class="lede"><strong>Question:</strong> Can one 4:45 evidence-led sequence prove the exact evidence-to-authorization workflow, safe failure, measured limits, startup wedge, and repository traceability without turning targets into results or implying fraud detection, identity proof, customer validation, payout approval, or execution?</p>
+
+  <div class="grid">
+    <div class="stack">
+      <section class="card" aria-labelledby="state-title">
+        <h2 id="state-title">Current rehearsal state</h2>
+        <div id="state"></div>
+      </section>
+      <section class="card" aria-labelledby="timeline-title">
+        <h2 id="timeline-title">Fixed 4:45 sequence</h2>
+        <p class="note">Every segment uses the same Evaluation Version. Cuts may remove waiting, never splice versions or imply one uninterrupted run.</p>
+        <div id="timeline" class="timeline"></div>
+      </section>
+      <section class="card" aria-labelledby="free-title">
+        <h2 id="free-title">Free play</h2>
+        <p class="note">Push timing, result status, and artifact agreement in any order. The release state must fail closed.</p>
+        <div class="controls" id="controls"></div>
+      </section>
+    </div>
+
+    <div class="stack">
+      <section class="card" aria-labelledby="walk-title">
+        <h2 id="walk-title">Guided walkthroughs</h2>
+        <div class="tabs" id="tabs" role="tablist"></div>
+        <div id="walkthrough"></div>
+      </section>
+      <section class="card" aria-labelledby="claims-title">
+        <h2 id="claims-title">Claims → evidence ledger</h2>
+        <div id="claims"></div>
+      </section>
+    </div>
+  </div>
+  <p class="prototype-note">All names, money details, evidence, and evaluation cases are synthetic. This storyboard rehearses narrative logic; it does not contain achieved product results. Populate results only from one immutable sealed Evaluation Version.</p>
+</main>
+
+<script>
+/* Portable pure module: pitch state + actions -> next pitch state. No DOM access. */
+const PayoutProofPitch = (() => {
+  const beats = [
+    { id:"PROBLEM", start:0, duration:28, title:"Synthetic operator problem", purpose:"₹4.25 lakh changed-account voice-note case; scattered evidence; no fraud verdict.", screen:"Label SYNTHETIC. Play one short urgent voice-note excerpt beside its message, exact ₹4.25 lakh intent, and UNAPPROVED destination.", say:"This synthetic urgent instruction asks a Payment Operator to send ₹4.25 lakh today to a changed account. The voice note and message are evidence, but the destination is unapproved. The operator must determine what is supported, what is missing, and what may safely enter the existing rail. Urgent instructions can be impersonated or altered; a voice model alone cannot authorize money." },
+    { id:"ARCHITECTURE", start:28, duration:27, title:"Three authority lanes", purpose:"Agent investigates; deterministic gate evaluates; human initiates; existing rail approves and executes.", screen:"Animate three hard-bounded lanes around one frozen Payment Intent; show the independent simulator/oracle/scorer as a thin spine below. Footer: local-first · zero required API spend.", say:"PayoutProof turns scattered evidence into an exact, auditable Payment Intent and a policy-correct safe next step. The agent may investigate and preserve provenance. Only deterministic policy may declare the frozen intent eligible. Only a human may initiate a single-use handoff. The existing maker-checker rail still approves and executes. Models cannot set policy or access payout credentials." },
+    { id:"MAIN_DEMO", start:55, duration:85, title:"Step-up earns eligibility", purpose:"Confirm exact intent, callback alone remains step-up, separate destination approval earns eligibility, one pending item.", screen:"Show Evaluation Version. Start after admission/extraction. Use exactly three visible human gestures: confirm exact intent; record separate destination approval; freshly initiate handoff. Auto-advance model/evidence waiting.", say:"PayoutProof links each extracted field to the synthetic evidence. I confirm every material field, freezing the exact intent hash. Policy returns Step Up Required: it needs an independent callback and separate destination approval. The callback confirms this instruction, but it cannot approve a new destination, so the case remains stepped up. I add the separately governed destination approval; reevaluation now marks this exact snapshot Eligible for Handoff. I freshly initiate once. The grant is consumed and the fake existing rail receives exactly one pending item—not approval and not execution." },
+    { id:"SAFE_FAILURE", start:140, duration:30, title:"Uncertainty never becomes permission", purpose:"Unknown adapter result enters reconciliation; grant cannot be reused; replay is rejected.", screen:"Fork the same Evaluation Version at valid initiation. Return STATUS UNKNOWN, show historical ELIGIBLE result plus RECONCILIATION REQUIRED, then press retry once and show REJECTED / pending items ≤1.", say:"Now the downstream adapter cannot confirm whether the handoff succeeded. Uncertainty never becomes permission. PayoutProof preserves the historical Eligible for Handoff result, consumes the grant, enters Reconciliation Required, and will not retry blindly. One replay attempt is deterministically rejected; it cannot create a second pending item." },
+    { id:"RESULTS", start:170, duration:45, title:"Manifest-driven measured results", purpose:"Safety counts, held-out workflow, simulated interactions, diagnostics, and explicit limitations.", screen:"Show PASSED, MISSED, or NOT RUN from the immutable manifest—never a target as a result. Present integer counts/denominators before percentages. Keep component diagnostics separate.", say:"Read only from the sealed manifest: Evaluation Version and status; Unsafe Handoffs over 81 repeated Critical Safety executions; intervention precision and recall, exact-action correctness, Intent Binding Correct, abstention, and per-language minima over 90 held-out cases; then paired simulated interaction change only if correctness held. Latency and component metrics are diagnostics, never product accuracy. State the limits: synthetic designed corpus, unknown prevalence and domain shift, and no customer, live-money, identity, ownership, fraud, or ROI validation." },
+    { id:"REPOSITORY", start:215, duration:20, title:"Claims → Evidence", purpose:"Release manifest, one scoring/audit verification result, repo URL and QR.", screen:"Show the README Claims → Evidence table, immutable release manifest, and one completed scoring/audit verification command. Hold repo URL/QR. Missing proof reads NOT AVAILABLE.", say:"The public repo maps every claim to a versioned artifact: architecture, schemas, independent simulator, oracle and scorer, raw outputs, safety and replay evidence, failures, licenses, and limitations. One command reruns scoring; another verifies the audit chain and release hashes. Clean-clone reproducibility appears only if its check passed." },
+    { id:"STARTUP", start:235, duration:30, title:"Control-layer startup wedge", purpose:"Buyer, first workflow, three Design Partners, gated adjacent expansion; pricing stays out of the video.", screen:"Four facts only: Finance Control Owner; urgent payout exceptions; three bounded Design Partners; beneficiary-change expansion after 2/3 pass and commit. No pricing/TAM chart.", say:"The buyer is the Finance Control Owner at an Indian growth or mid-market business; the wedge is urgent payout exceptions. Three bounded Design Partners next test zero Unsafe Handoffs and at least 30% fewer operator interactions without correctness loss. Beneficiary-change controls follow only if two of three pass and commit. Models are replaceable; customer-specific control contracts, reviewer history, reproducible safety evidence, and rail integrations compound." },
+    { id:"ASK", start:265, duration:20, title:"Evaluate the proof; unlock learning", purpose:"AI Risk Manager ask, panel stress-test, aspirational introductions, final QR and authority disclaimer.", screen:"Hold final frame: PayoutProof · AI Risk Manager; proof thesis; repo QR/URL; Evaluation Version + PASSED/MISSED/NOT RUN; NO AUTONOMOUS PAYOUT APPROVAL OR EXECUTION.", say:"Evaluate PayoutProof for AI Risk Manager on this disclosed workflow contract, sealed results, safe failure, and reproducible repo—not as a fraud oracle. If shortlisted, I want the panel to stress-test the control model and, if possible, introductions to Finance Control Owners for three bounded Design Partner validations." }
+  ];
+  const initial = () => ({
+    beatIndex:0,
+    elapsed:0,
+    resultStatus:"NOT_RUN",
+    evaluationVersion:"EVAL-NOT-SEALED",
+    artifactVersions:{ video:"EVAL-NOT-SEALED", repo:"EVAL-NOT-SEALED", form:"EVAL-NOT-SEALED" },
+    evidence:{ releaseManifest:false, scoredOutputs:false, cleanClone:false, auditVerified:false },
+    unsafeRouteDisabled:false,
+    overrunSeconds:0,
+    lastChange:"Rehearsal reset. Targets are not results; release is blocked until evidence and artifacts agree."
+  });
+  const copy = value => JSON.parse(JSON.stringify(value));
+  const setAllVersions = (s,value) => { s.evaluationVersion=value; s.artifactVersions={ video:value, repo:value, form:value }; };
+  function reduce(state,action) {
+    const s=copy(state);
+    switch(action.type) {
+      case "RESET": return initial();
+      case "NEXT_BEAT": {
+        if(s.beatIndex<beats.length-1) {
+          s.beatIndex+=1;
+          s.elapsed=beats[s.beatIndex].start+s.overrunSeconds;
+          s.lastChange=`Advanced to “${beats[s.beatIndex].title}.”`;
+        } else {
+          s.elapsed=285+s.overrunSeconds;
+          s.lastChange="Completed the 4:45 rehearsal sequence.";
+        }
+        return s;
+      }
+      case "PREVIOUS_BEAT":
+        s.beatIndex=Math.max(0,s.beatIndex-1); s.elapsed=beats[s.beatIndex].start+s.overrunSeconds;
+        s.lastChange=`Rewound to “${beats[s.beatIndex].title}.”`; return s;
+      case "OVERRUN":
+        s.overrunSeconds+=10; s.elapsed=(s.elapsed>=285?285:beats[s.beatIndex].start)+s.overrunSeconds;
+        s.lastChange="Added a 10-second segment overrun. The 15-second safety buffer shrank."; return s;
+      case "TRIM":
+        s.overrunSeconds=0; s.elapsed=s.elapsed>=285?285:beats[s.beatIndex].start;
+        s.lastChange="Restored the fixed rehearsal timing; no evidentiary beat was cut."; return s;
+      case "RESULT_NOT_RUN":
+        s.resultStatus="NOT_RUN"; setAllVersions(s,"EVAL-NOT-SEALED");
+        s.evidence={ releaseManifest:false, scoredOutputs:false, cleanClone:false, auditVerified:false };
+        s.unsafeRouteDisabled=false;
+        s.lastChange="Results are NOT RUN. The script now describes the evaluation contract and targets, not achievements."; return s;
+      case "RESULT_PASS":
+        s.resultStatus="PASSED"; setAllVersions(s,"EVAL-2026-09-04-A");
+        s.evidence={ releaseManifest:true, scoredOutputs:true, cleanClone:true, auditVerified:true };
+        s.unsafeRouteDisabled=false;
+        s.lastChange="Loaded a hypothetical PASSED sealed manifest for rehearsal. Recording must replace placeholders with actual counts and metrics."; return s;
+      case "RESULT_MISS":
+        s.resultStatus="MISSED"; setAllVersions(s,"EVAL-2026-09-04-A");
+        s.evidence={ releaseManifest:true, scoredOutputs:true, cleanClone:true, auditVerified:true };
+        s.unsafeRouteDisabled=true;
+        s.lastChange="Loaded a hypothetical hard-gate MISS. Script says the contract was not satisfied and the unsafe route was disabled."; return s;
+      case "BREAK_VERSION":
+        s.artifactVersions.video="EVAL-STALE-VIDEO";
+        s.lastChange="Introduced Evaluation Version drift: the video no longer matches the repo, form, or release manifest."; return s;
+      case "RECONCILE":
+        s.artifactVersions={ video:s.evaluationVersion, repo:s.evaluationVersion, form:s.evaluationVersion };
+        s.lastChange="Reconciled form, video, and repository to the same Evaluation Version."; return s;
+      case "FAIL_CLEAN_CLONE":
+        s.evidence.cleanClone=false;
+        s.lastChange="Clean-clone verification failed. Reproducibility wording is removed and submission remains blocked."; return s;
+      default: return s;
+    }
+  }
+  function derive(s) {
+    const versions=Object.values(s.artifactVersions);
+    const versionsAgree=versions.every(v=>v===s.evaluationVersion);
+    const evidenceReady=Object.values(s.evidence).every(Boolean);
+    const withinVideo=s.elapsed<=285;
+    const pitchComplete=s.elapsed>=285;
+    const statusHonest=s.resultStatus!=="MISSED" || s.unsafeRouteDisabled;
+    const releaseReady=versionsAgree && evidenceReady && withinVideo && pitchComplete && statusHonest && s.resultStatus!=="NOT_RUN";
+    const claimMode=s.resultStatus==="PASSED" ? "Measured claims from sealed manifest" : s.resultStatus==="MISSED" ? "Working prototype; contract not satisfied" : "Evaluation contract and targets only";
+    return { versionsAgree,evidenceReady,withinVideo,pitchComplete,statusHonest,releaseReady,claimMode,remaining:Math.max(0,285-s.elapsed),hardLimitRemaining:Math.max(0,300-s.elapsed) };
+  }
+  return { beats,initial,reduce,derive };
+})();
+
+const labels = {
+  RESET:"Reset rehearsal", NEXT_BEAT:"Advance one beat", PREVIOUS_BEAT:"Rewind one beat", OVERRUN:"Add 10-second overrun", TRIM:"Restore fixed timing",
+  RESULT_NOT_RUN:"Set results: NOT RUN", RESULT_PASS:"Load hypothetical PASS manifest", RESULT_MISS:"Load hypothetical HARD-GATE MISS",
+  BREAK_VERSION:"Introduce version drift", RECONCILE:"Reconcile all artifacts", FAIL_CLEAN_CLONE:"Fail clean-clone check"
+};
+const scenarios = [
+  { name:"Sealed pass", description:"Rehearse the complete evidence-led story after one sealed Evaluation Version passes. Placeholders still must be replaced by manifest values.", steps:["RESULT_PASS","NEXT_BEAT","NEXT_BEAT","NEXT_BEAT","NEXT_BEAT","NEXT_BEAT","NEXT_BEAT","NEXT_BEAT","NEXT_BEAT"] },
+  { name:"Hard-gate miss", description:"A working prototype misses a zero-tolerance gate. Watch the wording narrow and the unsafe route disable without hiding the miss.", steps:["RESULT_MISS","NEXT_BEAT","NEXT_BEAT","NEXT_BEAT","NEXT_BEAT"] },
+  { name:"Results not run", description:"The sealed run does not exist yet. The pitch may describe the contract and targets but cannot display achieved metrics.", steps:["RESULT_NOT_RUN","NEXT_BEAT","NEXT_BEAT","NEXT_BEAT","NEXT_BEAT"] },
+  { name:"Claim drift", description:"The video references a stale Evaluation Version. Release blocks until the form, video, repository, and manifest agree again.", steps:["RESULT_PASS","BREAK_VERSION","NEXT_BEAT","RECONCILE"] },
+  { name:"Timing pressure", description:"Improvised overruns consume the 15-second margin. Restore timing without dropping safety, results, limitations, or the ask.", steps:["RESULT_PASS","OVERRUN","OVERRUN","TRIM"] }
+];
+
+let state=PayoutProofPitch.initial();
+let activeScenario=0;
+let scenarioStep=0;
+const esc=value=>String(value).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const mmss=seconds=>`${String(Math.floor(seconds/60)).padStart(1,"0")}:${String(seconds%60).padStart(2,"0")}`;
+const tone=value=>value===true||value==="PASSED"?"good":value===false||value==="MISSED"?"bad":"warn";
+function dispatch(type,fromScenario=false) {
+  state=PayoutProofPitch.reduce(state,{type});
+  if(fromScenario && type!=="RESET") scenarioStep+=1;
+  render();
+}
+function startScenario(index) { activeScenario=index; scenarioStep=0; state=PayoutProofPitch.initial(); render(); }
+function fact(label,value) { return `<div class="fact"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`; }
+function render() {
+  const d=PayoutProofPitch.derive(state), beat=PayoutProofPitch.beats[state.beatIndex];
+  const releaseText=d.releaseReady ? "RELEASE READY — evidence exists, versions agree, timing fits" : "RELEASE BLOCKED — resolve every failed condition before submission";
+  const script = state.resultStatus==="PASSED"
+    ? "On one disclosed sealed synthetic Evaluation Version, report only the manifest’s integer counts, denominators, per-language minima, and measured metrics."
+    : state.resultStatus==="MISSED"
+      ? "This is a working prototype, but it did not satisfy the evaluation contract. The miss remains visible and the unsafe route is disabled."
+      : "The sealed evaluation has not run. These are predeclared targets, not achieved results.";
+  document.querySelector("#state").innerHTML=`
+    <div class="statusline"><span class="pill">Beat ${state.beatIndex+1}/8</span><span class="pill ${tone(state.resultStatus)}">Results: ${esc(state.resultStatus)}</span><span class="pill ${d.withinVideo?'good':'bad'}">Elapsed ${mmss(state.elapsed)} / 4:45</span><span class="pill">Hard limit margin ${mmss(d.hardLimitRemaining)}</span></div>
+    <div class="change"><strong>What just changed:</strong> ${esc(state.lastChange)}</div>
+    <div class="facts">
+      ${fact("Current beat",beat.title)} ${fact("Purpose",beat.purpose)}
+      ${fact("On screen",beat.screen)} ${fact("Spoken track",beat.say)}
+      ${fact("Claim mode",d.claimMode)} ${fact("Evaluation Version",state.evaluationVersion)}
+      ${fact("Versions agree",d.versionsAgree?"YES":"NO — submission blocker")} ${fact("Evidence ready",d.evidenceReady?"YES":"NO — submission blocker")}
+      ${fact("Unsafe route after miss",state.resultStatus==="MISSED"?(state.unsafeRouteDisabled?"DISABLED":"ENABLED — invalid"):"Not applicable")} ${fact("4:45 buffer remaining",mmss(d.remaining))}
+    </div>
+    <div class="script"><strong>Result-status substitution:</strong> ${esc(script)}<small>The full spoken track above is a timing draft, not permission to report placeholder metrics.</small></div>
+    <div class="release ${d.releaseReady?'good':'bad'}">${releaseText}</div>`;
+
+  document.querySelector("#timeline").innerHTML=PayoutProofPitch.beats.map((b,i)=>`<div class="beat ${i<state.beatIndex?'done':i===state.beatIndex?'active':''}"><span class="time">${mmss(b.start)}</span><div><strong>${esc(b.title)}</strong><br><small>${esc(b.purpose)}</small></div><span class="duration">${b.duration}s</span></div>`).join("");
+
+  const actions=["PREVIOUS_BEAT","NEXT_BEAT","OVERRUN","TRIM","RESULT_NOT_RUN","RESULT_PASS","RESULT_MISS","BREAK_VERSION","RECONCILE","FAIL_CLEAN_CLONE","RESET"];
+  document.querySelector("#controls").innerHTML=actions.map(type=>`<button class="${type==="NEXT_BEAT"?'primary':type==="BREAK_VERSION"||type==="FAIL_CLEAN_CLONE"?'danger':''}" data-action="${type}">${esc(labels[type])}</button>`).join("");
+  document.querySelectorAll("[data-action]").forEach(b=>b.addEventListener("click",()=>dispatch(b.dataset.action)));
+
+  document.querySelector("#tabs").innerHTML=scenarios.map((s,i)=>`<button class="tab" aria-selected="${i===activeScenario}" data-tab="${i}">${esc(s.name)}</button>`).join("");
+  document.querySelectorAll("[data-tab]").forEach(b=>b.addEventListener("click",()=>startScenario(Number(b.dataset.tab))));
+  const scenario=scenarios[activeScenario];
+  document.querySelector("#walkthrough").innerHTML=`<p class="section-gap">${esc(scenario.description)}</p><div class="steps">${scenario.steps.map((type,i)=>`<button class="step ${i<scenarioStep?'done':i===scenarioStep?'next':'waiting'}" data-step="${i}" data-type="${type}"><span class="stepnum">${i<scenarioStep?'✓':i+1}</span><span>${esc(labels[type])}</span></button>`).join("")}</div><button id="restart" class="primary section-gap">Restart this walkthrough</button>`;
+  document.querySelectorAll("[data-step]").forEach(b=>b.addEventListener("click",()=>{ if(Number(b.dataset.step)===scenarioStep) dispatch(b.dataset.type,true); }));
+  document.querySelector("#restart").addEventListener("click",()=>startScenario(activeScenario));
+
+  const claims=[
+    ["Workflow proof", "Exact intent + policy-correct safe next step", "sealed scored workflow outputs"],
+    ["Safety proof", "Unsafe Handoffs as integer count / 81 repeated executions", "Critical Safety raw outputs + scorer"],
+    ["Value proof", "Paired operator-interaction change, simulated", "predeclared baseline + paired results"],
+    ["Reliability proof", "Ambiguity consumes grant and rejects replay", "fake-adapter/replay tests + audit events"],
+    ["Reproducibility", state.evidence.cleanClone?"Clean-clone check passed":"NOT AVAILABLE / FAILED", "release manifest + verification commands"],
+    ["Commercial status", "Buyer, demand and ROI remain hypotheses; pricing ranges stay in the repo, not the video", "Design Partner validation plan + business-thesis note"]
+  ];
+  document.querySelector("#claims").innerHTML=claims.map(([name,claim,evidence])=>`<div class="claim"><strong>${esc(name)}</strong>${esc(claim)}<small>Evidence: ${esc(evidence)}</small></div>`).join("")+`<div class="section-gap note"><strong>Artifact versions</strong><br>Video: ${esc(state.artifactVersions.video)}<br>Repo: ${esc(state.artifactVersions.repo)}<br>Form: ${esc(state.artifactVersions.form)}</div>`;
+}
+render();
+</script>
+</body>
+</html>
