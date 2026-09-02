@@ -6,7 +6,7 @@
   "status": "GREEN",
   "timestamp": "2026-09-02T08:35:40Z",
   "owner": "Integration Agent",
-  "branch": "antigravity/mvp-implementation",
+  "branch": "main",
   "modules": {
     "core_schemas": {
       "status": "PASSED",
