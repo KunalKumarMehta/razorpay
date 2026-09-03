@@ -199,6 +199,7 @@ class RiskCaseState(BaseModel):
     case_id: Optional[str] = None
     case_version: int = 0
     tenant_id: str = "tenant_default"
+    organization_id: Optional[str] = None
     phase: CasePhase = CasePhase.EVIDENCE_ADMISSION
     processing_authority: ProcessingAuthorityStatus = ProcessingAuthorityStatus.NOT_CHECKED
     authority_record: Optional[ProcessingAuthorityRecord] = None

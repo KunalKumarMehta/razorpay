@@ -49,12 +49,14 @@ class StateMachine:
         case_id: Optional[str] = None,
         tenant_id: str = "tenant_default",
         clock: Optional[ClockProvider] = None,
+        organization_id: Optional[str] = None,
     ) -> RiskCaseState:
         """Create initial state before admission."""
         resolved_clock = clock if clock is not None else SystemClock()
         s = RiskCaseState(
             case_id=case_id,
             tenant_id=tenant_id,
+            organization_id=organization_id,
             case_version=0,
             phase=CasePhase.EVIDENCE_ADMISSION,
             processing_authority=ProcessingAuthorityStatus.NOT_CHECKED,
@@ -276,8 +278,10 @@ class StateMachine:
             )
 
             msg = f"Processing authority validated; evidence was admitted and Risk Case {case_id} opened."
+            org_id = payload.get("organization_id") if "organization_id" in payload else state.organization_id
             s_next = state.model_copy(update={
                 "case_id": case_id,
+                "organization_id": org_id,
                 "case_version": 1,
                 "phase": CasePhase.INVESTIGATION,
                 "processing_authority": ProcessingAuthorityStatus.VALID,
@@ -293,6 +297,7 @@ class StateMachine:
                 "Payment Operator",
                 {
                     "case_id": case_id,
+                    "organization_id": org_id,
                     "content_hash": content_hash,
                     "data_class": auth_record.data_class,
                     "purpose": auth_record.purpose,

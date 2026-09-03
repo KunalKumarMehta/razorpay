@@ -1375,7 +1375,7 @@ class Database:
         """List all cases with summary metadata, verifying integrity per row."""
         with self.get_connection() as conn:
             rows = conn.execute("""
-                SELECT case_id, tenant_id, case_version, phase, updated_at
+                SELECT case_id, tenant_id, case_version, phase, updated_at, state_json
                 FROM risk_cases
                 ORDER BY updated_at DESC
             """).fetchall()
@@ -1392,9 +1392,17 @@ class Database:
                 else:
                     trust_status = "CORRUPTED"
 
+                org_id = None
+                try:
+                    data = json.loads(r["state_json"])
+                    org_id = data.get("organization_id")
+                except Exception:
+                    pass
+
                 results.append({
                     "case_id": c_id,
                     "tenant_id": r["tenant_id"],
+                    "organization_id": org_id,
                     "case_version": r["case_version"],
                     "phase": r["phase"],
                     "updated_at": r["updated_at"],

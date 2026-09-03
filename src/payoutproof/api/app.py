@@ -78,6 +78,7 @@ class ActionRequest(BaseModel):
 class CreateCaseRequest(BaseModel):
     case_id: Optional[str] = None
     tenant_id: str = "tenant_default"
+    organization_id: Optional[str] = None
 
 
 def _resolve_db(request: Request) -> Database:
@@ -169,7 +170,11 @@ def create_case(req: CreateCaseRequest, request: Request) -> RiskCaseState:
             existing = active_db.load_case_tx(conn, case_id)
             if existing is not None:
                 raise HTTPException(status_code=409, detail=f"Case '{case_id}' already exists")
-            state = StateMachine.initial_state(case_id=case_id, tenant_id=req.tenant_id)
+            state = StateMachine.initial_state(
+                case_id=case_id,
+                tenant_id=req.tenant_id,
+                organization_id=req.organization_id,
+            )
             active_db.save_case_tx(conn, state)
             conn.commit()
             return state

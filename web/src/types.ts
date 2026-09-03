@@ -144,6 +144,7 @@ export interface RiskCaseState {
   case_id: string | null;
   case_version: number;
   tenant_id: string;
+  organization_id?: string | null;
   phase: CasePhase;
   processing_authority: string;
   authority_record?: ProcessingAuthorityRecord | null;

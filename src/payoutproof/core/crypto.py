@@ -113,6 +113,11 @@ def compute_snapshot_hash(state: RiskCaseState) -> str:
             "language_stratum": state.investigation.language_stratum,
         },
     }
+    # Tenancy expansion seam: include organization_id only when present to preserve
+    # byte-identical hashes and active grants for legacy un-scoped records.
+    if state.organization_id is not None:
+        canonical_dict["organization_id"] = state.organization_id
+
     canonical_json = json.dumps(canonical_dict, sort_keys=True, separators=(",", ":"))
     return sha256_hex(canonical_json)
 
