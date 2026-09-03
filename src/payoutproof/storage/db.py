@@ -32,6 +32,12 @@ from payoutproof.core.enums import (
     MembershipStatus,
 )
 from payoutproof.grants.issuer import GrantVerifier
+from payoutproof.core.limits import (
+    CUMULATIVE_WINDOW_KEY,
+    DEFAULT_TENANT_LIMITS,
+    TenantOperatingLimits,
+    effective_limits,
+)
 from payoutproof.core.crypto import (
     compute_snapshot_hash,
     compute_audit_hash,
@@ -41,8 +47,12 @@ from payoutproof.core.crypto import (
 )
 from payoutproof.audit.chain import GENESIS_HASH
 
-# Authoritative persistence schema identifier for SQLite tables
-SCHEMA_VERSION = "PP-SCHEMA-V1"
+# Authoritative persistence schema identifier for SQLite tables.
+# Bumped V1 -> V2 with Issue #10's additive tenant operating-limits tables
+# (tenant_quota_counters, tenant_operating_limits, tenant_settings_audit_events);
+# mirrored at payoutproof.core.release.SCHEMA_VERSION and pinned by an
+# equality-asserting test (tests/test_release_metadata.py).
+SCHEMA_VERSION = "PP-SCHEMA-V2"
 
 # Sentinel for explicitly querying un-scoped (organization_id IS NULL) rows.
 UNSCOPED = object()
@@ -523,9 +533,85 @@ class Database:
                     updated_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_membership_audit_checkpoints_organization ON membership_audit_checkpoints(organization_id);
+
+                -- Tenant operating limits (Issue #10). "tenant" is the issue's
+                -- vocabulary for the enforcement scope of an organization: every
+                -- row keys on organization_id, the session-owned scope used by
+                -- every existing seam. quota_kind is 'requests' (per-org hourly
+                -- window), 'requests_global' (the '__PLATFORM__' backstop
+                -- bucket), or 'evidence_bytes' (monotonic cumulative, keyed
+                -- 'CUMULATIVE'). window_key is a fixed UTC window derivation or
+                -- the 'CUMULATIVE' sentinel; sentinel keys are non-null strings
+                -- so the composite PRIMARY KEY stays valid under Postgres.
+                CREATE TABLE IF NOT EXISTS tenant_quota_counters (
+                    organization_id TEXT NOT NULL,
+                    quota_kind TEXT NOT NULL,
+                    window_key TEXT NOT NULL,
+                    counter INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (organization_id, quota_kind, window_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_tenant_quota_org ON tenant_quota_counters(organization_id);
+
+                CREATE TABLE IF NOT EXISTS tenant_operating_limits (
+                    organization_id TEXT PRIMARY KEY,
+                    limits_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    updated_by TEXT NOT NULL
+                );
+
+                -- Org-scoped settings audit: append-only, org-bound, riding the
+                -- same BEGIN IMMEDIATE transaction as the settings upsert (or
+                -- committed alone for a REJECTED write). Deliberately NOT
+                -- audit_events: that table is case-owned with a NOT NULL
+                -- case_id and UNIQUE(case_id, seq) chain semantics that are
+                -- wrong for org-scoped settings events.
+                CREATE TABLE IF NOT EXISTS tenant_settings_audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    organization_id TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    changes_json TEXT NOT NULL,
+                    reason_code TEXT,
+                    recorded_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_tenant_settings_audit_org ON tenant_settings_audit_events(organization_id);
             """)
             conn.commit()
             self._migrate_db(conn)
+            conn.commit()
+            # Issue #10 additive tables are created idempotently above and
+            # re-asserted here so a pre-#10 database file upgraded in place
+            # (where _migrate_db runs against legacy tables) also gains them.
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS tenant_quota_counters (
+                    organization_id TEXT NOT NULL,
+                    quota_kind TEXT NOT NULL,
+                    window_key TEXT NOT NULL,
+                    counter INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (organization_id, quota_kind, window_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_tenant_quota_org ON tenant_quota_counters(organization_id);
+
+                CREATE TABLE IF NOT EXISTS tenant_operating_limits (
+                    organization_id TEXT PRIMARY KEY,
+                    limits_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    updated_by TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS tenant_settings_audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    organization_id TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    changes_json TEXT NOT NULL,
+                    reason_code TEXT,
+                    recorded_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_tenant_settings_audit_org ON tenant_settings_audit_events(organization_id);
+            """)
             conn.commit()
 
     def _migrate_db(self, conn: sqlite3.Connection):
@@ -3393,3 +3479,375 @@ class Database:
             "broken_at_seq": None,
             "reason": None,
         }
+
+    # ==========================================================================
+    # Tenant operating limits: quotas, settings, and settings audit (Issue #10)
+    #
+    # "Tenant" is the issue's vocabulary for the enforcement scope of an
+    # organization: every counter, settings row, and audit row keys on
+    # organization_id — the session-owned scope used by every existing seam.
+    # Every *_tx method must be called inside the caller's BEGIN IMMEDIATE
+    # transaction so a quota decision and the mutation it guards commit (or
+    # roll back) atomically; the read-only *_tx counters (count_open_cases_tx,
+    # count_processing_backlog_tx, load_tenant_limits_tx) also accept a
+    # connection but never write, so they can be used pre-transaction for
+    # fail-fast checks and inside the transaction for race-free ones.
+    # ==========================================================================
+
+    @staticmethod
+    def _require_quota_scope(organization_id: Optional[str]) -> str:
+        """Return the stripped quota scope or raise UnscopedMembershipError.
+
+        Reuses the membership blank-scope guard deliberately: quota and
+        settings rows have exactly the same no-default-organization posture.
+        A caller-supplied scope starting with the reserved '__' prefix (the
+        '__PLATFORM__' backstop bucket and window sentinels) is rejected —
+        only this module's platform constants may address the backstop.
+        """
+        if organization_id is None or not isinstance(organization_id, str) or not organization_id.strip():
+            raise UnscopedMembershipError(
+                "Tenant operating-limit operations require an explicit non-blank organization_id; "
+                "there is no un-scoped quota mode."
+            )
+        scope = organization_id.strip()
+        if scope.startswith("__") and scope != "__PLATFORM__":
+            raise UnscopedMembershipError(
+                f"Organization scope '{scope}' uses the reserved '__' prefix; "
+                "the platform backstop bucket cannot be addressed by callers."
+            )
+        return scope
+
+    def consume_quota_tx(
+        self,
+        conn: sqlite3.Connection,
+        organization_id: str,
+        quota_kind: str,
+        window_key: str,
+        max_allowed: int,
+        now: Optional[datetime] = None,
+    ) -> Tuple[bool, int, int]:
+        """Atomically consume one unit from a windowed quota counter inside the caller's transaction.
+
+        Uses a single conditional UPDATE ... WHERE counter < max_allowed so the
+        check-and-increment is one statement under BEGIN IMMEDIATE: two racing
+        admissions cannot both consume the last slot. Returns
+        ``(allowed, new_count, remaining)``; a refused call leaves the counter
+        untouched (the failure is durable for Retry-After math but costs nothing).
+
+        ``quota_kind`` must be a non-blank string without the reserved '__'
+        prefix; ``window_key`` must be a non-blank string (the fixed UTC window
+        derivation or the 'CUMULATIVE' sentinel).
+        """
+        scope = self._require_quota_scope(organization_id)
+        kind = (quota_kind or "").strip()
+        if not kind or kind.startswith("__"):
+            raise UnscopedMembershipError(
+                f"quota_kind '{kind}' must be a non-blank string without the reserved '__' prefix"
+            )
+        win = (window_key or "").strip()
+        if not win:
+            raise UnscopedMembershipError("window_key must be a non-blank window or 'CUMULATIVE' sentinel")
+        if not isinstance(max_allowed, int) or isinstance(max_allowed, bool) or max_allowed < 1:
+            raise UnscopedMembershipError("max_allowed must be a positive integer")
+
+        moment = now if now is not None else datetime.now(timezone.utc)
+        now_iso = moment if isinstance(moment, str) else moment.isoformat()
+
+        row = conn.execute(
+            "SELECT counter FROM tenant_quota_counters WHERE organization_id = ? AND quota_kind = ? AND window_key = ?",
+            (scope, kind, win),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO tenant_quota_counters (organization_id, quota_kind, window_key, counter, updated_at)
+                VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT(organization_id, quota_kind, window_key) DO NOTHING;
+                """,
+                (scope, kind, win, now_iso),
+            )
+            return (True, 1, max_allowed - 1)
+
+        counter = int(row["counter"])
+        if counter < max_allowed:
+            cur = conn.execute(
+                """
+                UPDATE tenant_quota_counters
+                SET counter = counter + 1, updated_at = ?
+                WHERE organization_id = ? AND quota_kind = ? AND window_key = ? AND counter < ?;
+                """,
+                (now_iso, scope, kind, win, max_allowed),
+            )
+            if cur.rowcount == 1:
+                new_count = counter + 1
+                return (True, new_count, max_allowed - new_count)
+            # Lost the race inside the transaction (should not happen under
+            # BEGIN IMMEDIATE): re-read and refuse on the durable value.
+            raced = conn.execute(
+                "SELECT counter FROM tenant_quota_counters WHERE organization_id = ? AND quota_kind = ? AND window_key = ?",
+                (scope, kind, win),
+            ).fetchone()
+            raced_count = int(raced["counter"]) if raced is not None else max_allowed
+            return (False, raced_count, max(0, max_allowed - raced_count))
+        return (False, counter, max(0, max_allowed - counter))
+
+    def consume_cumulative_bytes_tx(
+        self,
+        conn: sqlite3.Connection,
+        organization_id: str,
+        delta_bytes: int,
+        max_allowed: int,
+        now: Optional[datetime] = None,
+    ) -> Tuple[bool, int, int]:
+        """Atomically add ``delta_bytes`` to the monotonic cumulative evidence-byte budget.
+
+        The cumulative counter never resets: its window_key is the fixed
+        'CUMULATIVE' sentinel, so the only way to raise the budget again is an
+        explicit platform operator decision — quota exhaustion is durable by
+        design. Returns ``(allowed, new_total, remaining)``; a refused call
+        leaves the counter unchanged. A zero/negative delta is a no-op allow
+        (nothing is added, existing total reported) because callers pass
+        computed evidence sizes, which are always >= 0 for admitted content.
+        """
+        scope = self._require_quota_scope(organization_id)
+        if not isinstance(delta_bytes, int) or isinstance(delta_bytes, bool) or delta_bytes < 0:
+            raise UnscopedMembershipError("delta_bytes must be a non-negative integer")
+        if not isinstance(max_allowed, int) or isinstance(max_allowed, bool) or max_allowed < 1:
+            raise UnscopedMembershipError("max_allowed must be a positive integer")
+
+        moment = now if now is not None else datetime.now(timezone.utc)
+        now_iso = moment if isinstance(moment, str) else moment.isoformat()
+
+        row = conn.execute(
+            "SELECT counter FROM tenant_quota_counters WHERE organization_id = ? AND quota_kind = 'evidence_bytes' AND window_key = ?",
+            (scope, CUMULATIVE_WINDOW_KEY),
+        ).fetchone()
+        current = int(row["counter"]) if row is not None else 0
+
+        if delta_bytes == 0:
+            return (True, current, max(0, max_allowed - current))
+
+        if current + delta_bytes > max_allowed:
+            return (False, current, max(0, max_allowed - current))
+
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO tenant_quota_counters (organization_id, quota_kind, window_key, counter, updated_at)
+                VALUES (?, 'evidence_bytes', ?, ?, ?)
+                ON CONFLICT(organization_id, quota_kind, window_key) DO NOTHING;
+                """,
+                (scope, CUMULATIVE_WINDOW_KEY, delta_bytes, now_iso),
+            )
+            return (True, delta_bytes, max_allowed - delta_bytes)
+
+        cur = conn.execute(
+            """
+            UPDATE tenant_quota_counters
+            SET counter = counter + ?, updated_at = ?
+            WHERE organization_id = ? AND quota_kind = 'evidence_bytes' AND window_key = ? AND counter + ? <= ?;
+            """,
+            (delta_bytes, now_iso, scope, CUMULATIVE_WINDOW_KEY, delta_bytes, max_allowed),
+        )
+        if cur.rowcount == 1:
+            new_total = current + delta_bytes
+            return (True, new_total, max_allowed - new_total)
+        raced = conn.execute(
+            "SELECT counter FROM tenant_quota_counters WHERE organization_id = ? AND quota_kind = 'evidence_bytes' AND window_key = ?",
+            (scope, CUMULATIVE_WINDOW_KEY),
+        ).fetchone()
+        raced_total = int(raced["counter"]) if raced is not None else max_allowed
+        return (False, raced_total, max(0, max_allowed - raced_total))
+
+    def load_tenant_limits_tx(
+        self,
+        conn: sqlite3.Connection,
+        organization_id: str,
+    ) -> TenantOperatingLimits:
+        """Load the effective (defensively clamped) tenant operating limits for an organization.
+
+        A missing row resolves to ``DEFAULT_TENANT_LIMITS``; a corrupt row
+        (malformed JSON, wrong types, unknown fields) also resolves to the
+        fail-closed defaults — a stored row can never widen a limit, and a
+        corrupt row cannot break enforcement.
+        """
+        scope = self._require_quota_scope(organization_id)
+        row = conn.execute(
+            "SELECT limits_json FROM tenant_operating_limits WHERE organization_id = ?",
+            (scope,),
+        ).fetchone()
+        if row is None:
+            return effective_limits(None)
+        try:
+            parsed = json.loads(row["limits_json"])
+            stored = TenantOperatingLimits.from_json_dict(parsed)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return effective_limits(None)
+        return effective_limits(stored)
+
+    def save_tenant_limits_tx(
+        self,
+        conn: sqlite3.Connection,
+        organization_id: str,
+        limits: TenantOperatingLimits,
+        actor: str,
+        reason_code: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> TenantOperatingLimits:
+        """Persist a validated tenant-limits row and append the settings audit event atomically.
+
+        ``limits`` must already be validated (``validate_settings_write``);
+        the stored row is written verbatim from it — never clamped, so the
+        tenant sees exactly what was accepted. The audit event ('ACCEPTED' or,
+        with ``reason_code``, 'REJECTED') rides the same transaction as the
+        upsert, so a committed settings change always has its audit row and
+        vice versa. Returns the effective (clamped) limits the org will run
+        under, computed the same way the read path computes them.
+        """
+        scope = self._require_quota_scope(organization_id)
+        if not isinstance(limits, TenantOperatingLimits):
+            raise UnscopedMembershipError("limits must be a TenantOperatingLimits instance")
+        actor_norm = (actor or "").strip()
+        if not actor_norm:
+            raise UnscopedMembershipError("actor is required for tenant settings writes")
+
+        moment = now if now is not None else datetime.now(timezone.utc)
+        now_iso = moment if isinstance(moment, str) else moment.isoformat()
+
+        action = "REJECTED" if reason_code else "ACCEPTED"
+        limits_payload = limits.to_json_dict()
+
+        conn.execute(
+            """
+            INSERT INTO tenant_operating_limits (organization_id, limits_json, updated_at, updated_by)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(organization_id) DO UPDATE SET
+                limits_json = excluded.limits_json,
+                updated_at = excluded.updated_at,
+                updated_by = excluded.updated_by;
+            """,
+            (scope, json.dumps(limits_payload), now_iso, actor_norm),
+        )
+        conn.execute(
+            """
+            INSERT INTO tenant_settings_audit_events (
+                organization_id, actor, action, changes_json, reason_code, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?);
+            """,
+            (
+                scope,
+                actor_norm,
+                action,
+                json.dumps(limits_payload),
+                reason_code,
+                now_iso,
+            ),
+        )
+        return effective_limits(limits)
+
+    def record_settings_rejection_tx(
+        self,
+        conn: sqlite3.Connection,
+        organization_id: str,
+        actor: str,
+        attempted_limits_json: Dict[str, Any],
+        reason_code: str,
+        now: Optional[datetime] = None,
+    ) -> None:
+        """Audit a refused settings write (malformed or above-ceiling) without persisting any of it.
+
+        The rejected body is recorded so the audit trail shows what was
+        attempted, but nothing is written to tenant_operating_limits: a refused
+        write never partially applies. The attempted mapping is stored as
+        provided (it already failed validation — it is evidence of the attempt,
+        not a source of truth).
+        """
+        scope = self._require_quota_scope(organization_id)
+        actor_norm = (actor or "").strip()
+        if not actor_norm:
+            raise UnscopedMembershipError("actor is required for tenant settings audit")
+        reason_norm = (reason_code or "").strip()
+        if not reason_norm:
+            raise UnscopedMembershipError("reason_code is required for a rejected settings write")
+
+        moment = now if now is not None else datetime.now(timezone.utc)
+        now_iso = moment if isinstance(moment, str) else moment.isoformat()
+
+        conn.execute(
+            """
+            INSERT INTO tenant_settings_audit_events (
+                organization_id, actor, action, changes_json, reason_code, recorded_at
+            ) VALUES (?, ?, 'REJECTED', ?, ?, ?);
+            """,
+            (
+                scope,
+                actor_norm,
+                json.dumps(attempted_limits_json),
+                reason_norm,
+                now_iso,
+            ),
+        )
+
+    def list_tenant_settings_audit_tx(
+        self,
+        conn: sqlite3.Connection,
+        organization_id: str,
+    ) -> List[Dict[str, Any]]:
+        """List the org-scoped settings audit events (newest last) for tests and diagnostics."""
+        scope = self._require_quota_scope(organization_id)
+        rows = conn.execute(
+            "SELECT * FROM tenant_settings_audit_events WHERE organization_id = ? ORDER BY id ASC",
+            (scope,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_open_cases_tx(self, conn: sqlite3.Connection, organization_id: str) -> int:
+        """Count the organization's open Risk Cases (every phase except terminal/rejected).
+
+        'Open' means the case still occupies tenant capacity: it is not
+        COMPLETE (terminal success), not RECONCILIATION_REQUIRED (terminal
+        failure), and not ADMISSION_REJECTED (never opened — it consumed no
+        admission slot and no evidence budget).
+        """
+        scope = self._require_quota_scope(organization_id)
+        row = conn.execute(
+            """
+            SELECT COUNT(*) FROM risk_cases
+            WHERE organization_id = ?
+              AND phase NOT IN (?, ?, ?);
+            """,
+            (
+                scope,
+                CasePhase.COMPLETE.value,
+                CasePhase.RECONCILIATION_REQUIRED.value,
+                CasePhase.ADMISSION_REJECTED.value,
+            ),
+        ).fetchone()
+        return int(row[0])
+
+    def count_processing_backlog_tx(self, conn: sqlite3.Connection, organization_id: str) -> int:
+        """Gauge admitted-but-unprocessed cases: the processing-concurrency backlog.
+
+        The gauge is derived from the durable phase, not a mutable counter:
+        a case is 'in backlog' from admission (INVESTIGATION) through
+        investigation completion (OPERATOR_INTERVENTION, READY_FOR_HUMAN_HANDOFF).
+        Terminal phases and pre-admission phases are excluded: an unadmitted
+        case has consumed no processing capacity, and a completed or reconciled
+        case has released it.
+        """
+        scope = self._require_quota_scope(organization_id)
+        row = conn.execute(
+            """
+            SELECT COUNT(*) FROM risk_cases
+            WHERE organization_id = ?
+              AND phase IN (?, ?, ?);
+            """,
+            (
+                scope,
+                CasePhase.INVESTIGATION.value,
+                CasePhase.OPERATOR_INTERVENTION.value,
+                CasePhase.READY_FOR_HUMAN_HANDOFF.value,
+            ),
+        ).fetchone()
+        return int(row[0])
+

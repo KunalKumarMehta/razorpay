@@ -29,8 +29,11 @@ POLICY_VERSION = "PP-POLICY-V1"
 
 # Authoritative persistence schema identifier for the SQLite tables created
 # by payoutproof.storage.db.Database (risk_cases, audit_events, handoff_grants,
-# adapter_attempts, pending_approval_items, case_audit_checkpoints).
-SCHEMA_VERSION = "PP-SCHEMA-V1"
+# adapter_attempts, pending_approval_items, case_audit_checkpoints). Bumped
+# V1 -> V2 with Issue #10's additive tenant operating-limits tables
+# (tenant_quota_counters, tenant_operating_limits,
+# tenant_settings_audit_events); mirrored at payoutproof.storage.db.SCHEMA_VERSION.
+SCHEMA_VERSION = "PP-SCHEMA-V2"
 
 # Audit checkpoint MAC domain-separation identifier, mirrored by
 # payoutproof.core.crypto.compute_checkpoint_mac.

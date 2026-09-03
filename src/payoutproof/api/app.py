@@ -18,6 +18,8 @@ per-route hand-rolled checks and not middleware added only in `create_app`
 
 import hmac
 import secrets
+import sqlite3
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from fastapi import Depends, FastAPI, HTTPException, Request, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +28,21 @@ from pydantic import BaseModel, Field
 from payoutproof.core.models import RiskCaseState
 from payoutproof.core.enums import PolicyOutcome, CasePhase, IntentStatus, DemoFakeAdapterMode
 from payoutproof.core.config import AppConfig, ConfigurationError
+from payoutproof.core.limits import (
+    PLATFORM_BACKSTOP_ORGANIZATION,
+    PLATFORM_GLOBAL_REQUESTS_PER_HOUR,
+    PLATFORM_MAX_EVIDENCE_ITEM_BYTES,
+    PLATFORM_MAX_RETENTION_DAYS,
+    PLATFORM_SUPPORTED_FORMATS,
+    TenantOperatingLimits,
+    content_byte_size,
+    effective_limits,
+    normalized_mime_type,
+    retry_after_seconds,
+    validate_settings_write,
+    window_key,
+    SettingsValidationError,
+)
 from payoutproof.core.release import get_release_metadata, APPLICATION_VERSION
 from payoutproof.core.providers import ClockProvider, NonceProvider
 from payoutproof.case_workflow.state_machine import StateMachine
@@ -117,6 +134,434 @@ def _resolve_clock(request: Request) -> ClockProvider:
     return clock if clock is not None else None
 
 
+# ── Tenant operating-limits enforcement (Issue #10) ─────────────────────────
+#
+# Ordering discipline (fail-safe, mirroring the Issue #7 dispatch ordering):
+#
+#   session (401, router dependency)
+#     -> payload-pure pre-checks (413/415/422) — no DB reads, no case existence
+#     -> case scope (404 zero-existence)
+#     -> role (403)
+#     -> windowed/gauged quota checks (429) — inside the write transaction
+#
+# The payload-pure checks deliberately run *before* the case-existence 404: a
+# rejected payload tells the caller nothing about any case, and an oversized
+# or unsupported payload never pays for a scope lookup. The quota checks run
+# *inside* the caller's BEGIN IMMEDIATE transaction where one exists, so a
+# refused request never mutates anything and two racing requests cannot both
+# consume the last slot.
+
+QUOTA_ERROR_CODE = "QUOTA_EXCEEDED"
+HTTP_429 = 429
+
+# Actions that submit evidence bundles for admission: they consume the
+# cumulative evidence-byte budget and occupy a processing slot, so they carry
+# the byte and backlog gates in addition to the request-rate gates.
+# ADD_CALLBACK_EVIDENCE appends evidence to an already-admitted case: it
+# consumes byte budget but no new processing slot.
+ADMISSION_ACTIONS = {"ADMIT_AUTHORIZED_BUNDLE", "SUBMIT_UNAUTHORIZED_BUNDLE"}
+EVIDENCE_ADDING_ACTIONS = ADMISSION_ACTIONS | {"ADD_CALLBACK_EVIDENCE"}
+
+
+def _quota_rejection(quota_kind: str, retry_after: Optional[int], message: str) -> HTTPException:
+    """Build the uniform quota-rejected 429 (typed fields, no internal detail).
+
+    ``retry_after`` is exposed as both the Retry-After header (seconds) and a
+    structured body field: the window reset is derived from the caller's own
+    clock data, so it leaks no internal timing.
+    """
+    headers = {"Retry-After": str(retry_after)} if retry_after is not None else None
+    return HTTPException(
+        status_code=HTTP_429,
+        detail={
+            "error_code": QUOTA_ERROR_CODE,
+            "quota_kind": quota_kind,
+            "message": message,
+            "retry_after_seconds": retry_after,
+        },
+        headers=headers,
+    )
+
+
+def _request_clock_now(request: Request) -> datetime:
+    """Current UTC moment from the injected clock, else system time."""
+    clock = getattr(request.app.state, "clock", None)
+    if clock is not None:
+        now = clock.now()
+        return now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc)
+
+
+def _effective_limits_for(conn: sqlite3.Connection, active_db: Database, organization_id: str) -> TenantOperatingLimits:
+    """Effective limits for an org, read inside the caller's transaction."""
+    return active_db.load_tenant_limits_tx(conn, organization_id)
+
+
+def _enforce_hourly_request_quota(request: Request, active_db: Database, organization_id: str) -> None:
+    """Consume one request from the org's hourly window and the global backstop bucket.
+
+    Per-organization first (the honest-client bound), then the '__PLATFORM__'
+    backstop bucket (the bound on a client multiplying fake organization
+    identities — the org scope on the session-ephemeral test path is
+    self-asserted, so only a global bucket can bound a dishonest one; real
+    authentication is the durable fix and is tracked as follow-up). Both
+    counters ride one BEGIN IMMEDIATE so the counters and the request
+    outcome commit together. A refused request commits its own increment:
+    the windowed counter is the durable record of refused attempts too, and
+    the count can never exceed the cap it refused against.
+    """
+    now = _request_clock_now(request)
+    wk = window_key(now)
+    retry = retry_after_seconds(now)
+
+    with active_db.get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE;")
+        try:
+            limits = _effective_limits_for(conn, active_db, organization_id)
+            allowed, count, _remaining = active_db.consume_quota_tx(
+                conn, organization_id, "requests", wk, limits.requests_per_hour, now=now
+            )
+            if not allowed:
+                raise _quota_rejection(
+                    "requests",
+                    retry,
+                    f"Hourly request quota exhausted for this organization "
+                    f"({count} of {limits.requests_per_hour} requests this hour); "
+                    f"retry after {retry} seconds.",
+                )
+            backstop_allowed, backstop_count, _br = active_db.consume_quota_tx(
+                conn,
+                PLATFORM_BACKSTOP_ORGANIZATION,
+                "requests_global",
+                wk,
+                PLATFORM_GLOBAL_REQUESTS_PER_HOUR,
+                now=now,
+            )
+            if not backstop_allowed:
+                raise _quota_rejection(
+                    "requests_global",
+                    retry,
+                    f"Platform-wide hourly request quota exhausted ({backstop_count} of "
+                    f"{PLATFORM_GLOBAL_REQUESTS_PER_HOUR} requests this hour); "
+                    f"retry after {retry} seconds.",
+                )
+            conn.commit()
+        except HTTPException:
+            # A refused request still records the attempted consumption
+            # durably (the windowed counter is the bound's own evidence),
+            # then propagates the 429.
+            try:
+                conn.commit()
+            except Exception:
+                conn.rollback()
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def _payload_pure_admission_checks(payload: Dict[str, Any]) -> None:
+    """Payload-pure admission pre-checks: item size (413), format (415), retention (422).
+
+    These checks depend only on the submitted payload — never on a case, a
+    session role, or any database row — so they run before case existence and
+    before the write transaction. Every bound applied here is a platform
+    ceiling: the tenant-tightened variants of the item-size, format, and
+    retention limits are enforced inside the transaction (where the org's
+    effective limits are loaded) by the admission gates; this pre-check is
+    the platform floor that needs no row.
+    """
+    ev = payload.get("evidence")
+    content = ev.get("content") if isinstance(ev, dict) else payload.get("content")
+    mime_raw = ev.get("mime_type") if isinstance(ev, dict) else payload.get("mime_type")
+
+    # Format gate (415): the platform allowlist. Normalization mirrors the
+    # admission validator so 'TEXT/PLAIN ' is judged as 'text/plain'.
+    norm = normalized_mime_type(mime_raw)
+    if norm is not None and norm not in PLATFORM_SUPPORTED_FORMATS:
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "error_code": "FORMAT_NOT_SUPPORTED",
+                "mime_type": norm,
+                "supported_formats": sorted(PLATFORM_SUPPORTED_FORMATS),
+                "message": f"Evidence format '{norm}' is not supported; supported formats: "
+                f"{sorted(PLATFORM_SUPPORTED_FORMATS)}",
+            },
+        )
+    # A blank/missing MIME type with content present is malformed input: the
+    # case-level admission validator is the authority for that shape (and
+    # everything else about the PAR), producing the existing in-case
+    # ADMISSION_REJECTED mutation. No platform 415 is minted for it.
+
+    # Item-size gate (413): computed from the actual content bytes, never a
+    # declared size. Only computable sizes are gated here; non-string/non-
+    # bytes content remains the validator's authority.
+    size = content_byte_size(content)
+    if size is not None and size > PLATFORM_MAX_EVIDENCE_ITEM_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "error_code": "EVIDENCE_TOO_LARGE",
+                "max_bytes": PLATFORM_MAX_EVIDENCE_ITEM_BYTES,
+                "actual_bytes": size,
+                "message": f"Evidence item is {size} bytes; the platform item ceiling is "
+                f"{PLATFORM_MAX_EVIDENCE_ITEM_BYTES} bytes.",
+            },
+        )
+
+    # Retention gate (422): the PAR's declared retention must not exceed the
+    # platform retention ceiling. The tenant-tightened bound is enforced
+    # inside the transaction by the admission gates.
+    authority = payload.get("processing_authority")
+    if isinstance(authority, dict):
+        declared = authority.get("retention_days")
+        if isinstance(declared, int) and not isinstance(declared, bool):
+            if declared > PLATFORM_MAX_RETENTION_DAYS:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error_code": "RETENTION_EXCEEDS_TENANT_LIMIT",
+                        "declared_days": declared,
+                        "tenant_limit_days": PLATFORM_MAX_RETENTION_DAYS,
+                        "message": f"Retention {declared} days exceeds the tenant limit "
+                        f"{PLATFORM_MAX_RETENTION_DAYS} days.",
+                    },
+                )
+
+
+def _admission_quota_gates(
+    request: Request,
+    active_db: Database,
+    conn: sqlite3.Connection,
+    organization_id: str,
+    action_type: str,
+    payload: Dict[str, Any],
+) -> None:
+    """In-transaction admission gates: open-case (429), backlog (429), cumulative bytes (429).
+
+    Runs inside the caller's BEGIN IMMEDIATE, so the quota decision and the
+    mutation it guards commit atomically and two racing admissions cannot
+    both pass. Ordering is cheapest-first: the derived gauges (pure COUNT
+    queries) before the cumulative-byte consumption (a write).
+    """
+    limits = _effective_limits_for(conn, active_db, organization_id)
+
+    # Open-case gauge: only for actions that open a new case (the admission
+    # bundle actions), not for evidence appended to an existing case.
+    if action_type in ADMISSION_ACTIONS:
+        open_cases = active_db.count_open_cases_tx(conn, organization_id)
+        if open_cases >= limits.max_open_cases:
+            raise _quota_rejection(
+                "max_open_cases",
+                None,
+                f"Open-case limit reached for this organization ({open_cases} open cases; "
+                f"limit {limits.max_open_cases}). Close or resolve cases before opening new ones.",
+            )
+
+    # Processing-backlog gauge: derived from durable phase, never a counter.
+    if action_type in ADMISSION_ACTIONS:
+        backlog = active_db.count_processing_backlog_tx(conn, organization_id)
+        if backlog >= limits.max_processing_concurrency:
+            raise _quota_rejection(
+                "processing_backlog",
+                None,
+                f"Processing backlog limit reached for this organization ({backlog} admitted-but-"
+                f"unprocessed cases; limit {limits.max_processing_concurrency}).",
+            )
+
+    # Cumulative evidence-byte budget: computed from the actual content bytes
+    # (never a declared size); a missing/blank content has no computable size
+    # and is left to the case-level validator.
+    if action_type in EVIDENCE_ADDING_ACTIONS:
+        ev = payload.get("evidence")
+        content = ev.get("content") if isinstance(ev, dict) else payload.get("content")
+        size = content_byte_size(content)
+        if size is not None:
+            allowed, total, _remaining = active_db.consume_cumulative_bytes_tx(
+                conn, organization_id, size, limits.max_org_evidence_bytes, now=_request_clock_now(request)
+            )
+            if not allowed:
+                raise _quota_rejection(
+                    "max_org_evidence_bytes",
+                    None,
+                    f"Cumulative evidence-byte budget exhausted for this organization "
+                    f"({total} of {limits.max_org_evidence_bytes} bytes used).",
+                )
+
+
+def _require_settings_admin(request: Request, config: AppConfig) -> None:
+    """Gate the tenant operating-settings surface on the dedicated admin token.
+
+    The settings surface is deliberately *not* part of the role matrix: it is
+    a platform-administration surface gated by a dedicated bearer token
+    (PAYOUTPROOF_SETTINGS_ADMIN_TOKEN), enabled by
+    PAYOUTPROOF_ENABLE_SETTINGS_ADMIN. Disabled, the routes return 404
+    (unknown surface, no capability hints). Enabled, the caller must present
+    the exact token (constant-time comparison). The admin token scopes *what*
+    may be administered; the organization scope still comes from the session.
+    """
+    if not config.enable_settings_admin:
+        raise HTTPException(status_code=404, detail="Not Found")
+    header = request.headers.get("Authorization", "")
+    expected = config.settings_admin_token or ""
+    supplied = header[7:] if header.lower().startswith("bearer ") else header.strip()
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="Settings administrator token required")
+
+
+@protected_router.get("/api/settings/limits")
+def get_tenant_limits(
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Read the effective tenant operating limits for the caller's organization.
+
+    Returns the *effective* limits (defensively clamped at read time), not
+    the raw stored row: even a tampered row can never be reported — or
+    enforced — above a platform ceiling. The response carries no secrets and
+    no other organization's data.
+    """
+    active_db = _resolve_db(request)
+    config = _resolve_config(request)
+    _require_settings_admin(request, config)
+
+    organization_id = active_organization(request, session)
+    with active_db.get_connection() as conn:
+        limits = active_db.load_tenant_limits_tx(conn, organization_id)
+    return {
+        "organization_id": organization_id,
+        "limits": limits.to_json_dict(),
+        "is_default": limits == effective_limits(None),
+    }
+
+
+class TenantLimitsRequest(BaseModel):
+    """OpenAPI shape declaration for the settings write body.
+
+    Deliberately NOT the validation layer: the route parses the raw JSON body
+    itself so unknown fields, wrong types, and above-ceiling values all reach
+    ``validate_settings_write`` and are audited as REJECTED. Pydantic's default
+    behavior would silently drop unknown fields, which would violate the
+    SETTINGS_INVALID contract. The model exists only so the OpenAPI schema
+    documents the accepted fields; the route never instantiates it.
+    """
+
+    model_config = {"extra": "allow"}
+
+    max_evidence_item_bytes: Optional[int] = None
+    allowed_evidence_formats: Optional[List[str]] = None
+    evidence_retention_days: Optional[int] = None
+    max_processing_concurrency: Optional[int] = None
+    requests_per_hour: Optional[int] = None
+    max_open_cases: Optional[int] = None
+    max_org_evidence_bytes: Optional[int] = None
+
+
+@protected_router.put("/api/settings/limits")
+async def put_tenant_limits(
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Full-replace the caller's organization operating settings.
+
+    Fail-safe ordering: settings-admin surface (404 disabled / 401 unauthenticated)
+    -> request shape (422) -> validation against the immutable platform
+    ceilings (422) -> transactional upsert with the ACCEPTED audit event.
+    Out-of-bounds values are refused, never silently clamped: a tenant must
+    know its settings were rejected. Every rejected write is audited as
+    REJECTED in its own transaction and persists none of its values; an
+    accepted write persists both the settings row and its ACCEPTED audit
+    event atomically.
+    """
+    active_db = _resolve_db(request)
+    config = _resolve_config(request)
+    _require_settings_admin(request, config)
+
+    organization_id = active_organization(request, session)
+    actor = f"settings_admin:{session.subject}" if session.subject else "settings_admin"
+
+    # Parse the raw body: unknown fields and wrong types must reach the
+    # settings validator (and the REJECTED audit), not be silently coerced
+    # or dropped by a body model.
+    import json as _json
+
+    raw_body = await request.body()
+    parse_error: Optional[str] = None
+    candidate: Any = None
+    if not raw_body:
+        parse_error = "Request body must be a JSON object"
+    else:
+        try:
+            candidate = _json.loads(raw_body)
+        except Exception:
+            parse_error = "Request body must be valid JSON"
+
+    now = _request_clock_now(request)
+
+    with active_db.get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE;")
+        try:
+            if parse_error is not None or not isinstance(candidate, dict):
+                active_db.record_settings_rejection_tx(
+                    conn,
+                    organization_id,
+                    actor,
+                    {"parse_error": parse_error or "Request body must be a JSON object"},
+                    "SETTINGS_INVALID",
+                    now=now,
+                )
+                conn.commit()
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error_code": "SETTINGS_INVALID",
+                        "reason_code": "SETTINGS_INVALID",
+                        "message": parse_error or "Request body must be a JSON object",
+                    },
+                )
+            try:
+                validated = validate_settings_write(candidate)
+            except SettingsValidationError as e:
+                active_db.record_settings_rejection_tx(
+                    conn,
+                    organization_id,
+                    actor,
+                    candidate,
+                    e.reason_code,
+                    now=now,
+                )
+                conn.commit()
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error_code": e.reason_code,
+                        "reason_code": e.reason_code,
+                        "message": e.message,
+                    },
+                )
+
+            effective = active_db.save_tenant_limits_tx(
+                conn, organization_id, validated, actor, reason_code=None, now=now
+            )
+            conn.commit()
+            return {
+                "organization_id": organization_id,
+                "limits": effective.to_json_dict(),
+                "reason_code": None,
+                "message": "Tenant operating settings updated",
+                "recorded_at": now.isoformat(),
+            }
+        except HTTPException:
+            raise
+        except Exception:
+            conn.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail="Internal error while updating tenant operating settings; no changes applied.",
+            )
+
+
 @public_router.get("/api/health")
 def get_health() -> Dict[str, Any]:
     """Liveness, readiness, capability status, and secret-free release identity.
@@ -178,19 +623,41 @@ def create_case(
     authenticated organization. The tenant defaults to the session tenant and
     any client-supplied tenant_id must match it exactly, or the request is a
     rejected tenant-escalation attempt. Clients can never choose an
-    organization: the field no longer exists on the request body.
+    organization: the field no longer exist on the request body.
+
+    Issue #10: creating a case consumes the organization's hourly request
+    quota (429 when exhausted) and is refused when the open-case limit is
+    reached (429) — both inside the same BEGIN IMMEDIATE that persists the
+    case, so a quota decision and the case it admits commit atomically.
     """
     import uuid
     active_db = _resolve_db(request)
     organization_id = active_organization(request, session)
     tenant_id = require_session_tenant(session, req.tenant_id)
     case_id = req.case_id or f"RC-{uuid.uuid4().hex[:8].upper()}"
+
+    # Hourly request quota (org window + platform backstop): consumed before
+    # the transaction so a refused request never opens a connection-held
+    # write lock; the counters themselves are their own transaction.
+    _enforce_hourly_request_quota(request, active_db, organization_id)
+
     with active_db.get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE;")
         try:
             existing = active_db.load_case_tx(conn, case_id)
             if existing is not None:
                 raise HTTPException(status_code=409, detail=f"Case '{case_id}' already exists")
+            # Open-case limit: an unadmitted case still occupies tenant
+            # capacity (it holds a case_id and, on admission, evidence budget).
+            limits = active_db.load_tenant_limits_tx(conn, organization_id)
+            open_cases = active_db.count_open_cases_tx(conn, organization_id)
+            if open_cases >= limits.max_open_cases:
+                raise _quota_rejection(
+                    "max_open_cases",
+                    None,
+                    f"Open-case limit reached for this organization ({open_cases} open cases; "
+                    f"limit {limits.max_open_cases}). Close or resolve cases before creating new ones.",
+                )
             state = StateMachine.initial_state(
                 case_id=case_id,
                 tenant_id=tenant_id,
@@ -254,10 +721,13 @@ def dispatch_action(
 
     All mutations are serialized through SQLite BEGIN IMMEDIATE transactions.
     Fail-safe ordering (Issue #7): session (401, router dependency) -> request
-    shape (400) -> case scope (404 zero-existence) -> frozen role matrix
-    (403) -> maker-checker identity constraint (403) -> demo-mode gate (400)
-    -> state machine. No rejected request ever reaches a transaction, and a
-    role denial never reveals an out-of-scope case's existence.
+    shape (400) -> payload-pure operating-limit pre-checks (413/415/422,
+    Issue #10) -> hourly request quota (429, Issue #10) -> case scope (404
+    zero-existence) -> frozen role matrix (403) -> maker-checker identity
+    constraint (403) -> demo-mode gate (400) -> in-transaction quota gates
+    (429, Issue #10) -> state machine. A role denial never reveals an
+    out-of-scope case's existence, and a throttled or oversized request
+    never pays for a case lookup.
     """
     # 0. Session-owned organization: absent header resolves to the session
     # organization; a blank header is malformed; a conflicting header is an
@@ -296,6 +766,18 @@ def dispatch_action(
     config = _resolve_config(request)
     clock = getattr(request.app.state, "clock", None)
     nonce_provider = getattr(request.app.state, "nonce_provider", None)
+
+    # 3.5 Payload-pure operating-limit pre-checks (Issue #10): item size
+    #     (413), format (415), retention (422). These depend only on the
+    #     submitted payload, so they run before case existence — a rejected
+    #     payload reveals nothing about any case and pays for no scope read.
+    if action_type in EVIDENCE_ADDING_ACTIONS:
+        _payload_pure_admission_checks(payload)
+
+    # 3.6 Hourly request quota (org window + platform backstop, Issue #10):
+    #     consumed before the case-scope lookup for the same reason — a
+    #     throttled caller learns nothing about case existence.
+    _enforce_hourly_request_quota(request, active_db, request_organization_id)
 
     # 4. Missing or out-of-scope case returns 404 for all actions (zero-existence
     #    oracle: a cross-organization case is reported exactly like a missing one).
@@ -413,6 +895,16 @@ def dispatch_action(
             # re-scope or deletion cannot slip an out-of-scope mutation through.
             if current_state.organization_id != request_organization_id:
                 raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
+
+            # 9.5 In-transaction operating-limit gates (Issue #10): open-case
+            #     gauge, processing-backlog gauge, cumulative evidence-byte
+            #     budget. Inside the same BEGIN IMMEDIATE as the mutation they
+            #     guard, so a refused admission mutates nothing and two racing
+            #     admissions cannot both consume the last slot.
+            if action_type in EVIDENCE_ADDING_ACTIONS:
+                _admission_quota_gates(
+                    request, active_db, conn, request_organization_id, action_type, payload
+                )
 
             next_state = StateMachine.reduce(
                 state=current_state,

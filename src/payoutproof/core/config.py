@@ -67,6 +67,13 @@ class AppConfig:
     session_cookie_name: str = "payoutproof_session"
     session_cookie_secure: bool = True
     cors_allowed_origins: tuple = field(default=())
+    # Issue #10: the tenant operating-settings admin surface is disabled by
+    # default; enabling it requires a dedicated settings-admin token (>= 32
+    # characters, distinct from every other secret). Off by default so the
+    # GET/PUT /api/settings/limits routes return 404 (unknown surface) rather
+    # than 503 for every deployment that has not deliberately opted in.
+    enable_settings_admin: bool = False
+    settings_admin_token: Optional[str] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not self.grant_secret or len(self.grant_secret.strip()) < 32:
@@ -110,6 +117,37 @@ class AppConfig:
                     f"Wildcard CORS origin {origin!r} is not permitted: credentialed session "
                     "cookies require an explicit allowlist, never a wildcard."
                 )
+        # Settings-admin block (Issue #10): when the tenant operating-settings
+        # admin surface is enabled, its bearer token must be present, at least
+        # 32 characters, and distinct from every other secret so a leaked Money
+        # Action or membership credential can never administer limits (and
+        # vice versa). Disabled, the token must be entirely absent — a token
+        # without its flag is configuration drift, not a half-enabled surface.
+        if self.enable_settings_admin:
+            if not self.settings_admin_token or len(self.settings_admin_token.strip()) < 32:
+                raise ConfigurationError(
+                    "settings_admin_token is required and must be at least 32 characters "
+                    "when enable_settings_admin is true."
+                )
+            if hmac.compare_digest(self.settings_admin_token, self.grant_secret):
+                raise ConfigurationError(
+                    "settings_admin_token must be distinct from grant_secret."
+                )
+            if hmac.compare_digest(self.settings_admin_token, self.audit_checkpoint_secret):
+                raise ConfigurationError(
+                    "settings_admin_token must be distinct from audit_checkpoint_secret."
+                )
+            if hmac.compare_digest(
+                self.settings_admin_token, self.membership_secret or ""
+            ):
+                raise ConfigurationError(
+                    "settings_admin_token must be distinct from membership_secret."
+                )
+        elif self.settings_admin_token is not None and self.settings_admin_token.strip():
+            raise ConfigurationError(
+                "settings_admin_token is configured but enable_settings_admin is false; "
+                "remove the token or enable the flag."
+            )
 
     def _validate_oidc_block(self) -> None:
         """The OIDC block is present or absent as a whole; partial configurations fail closed."""
@@ -160,6 +198,8 @@ class AppConfig:
             "session_cookie_name": self.session_cookie_name,
             "session_cookie_secure": self.session_cookie_secure,
             "cors_allowed_origins": list(self.cors_allowed_origins),
+            "enable_settings_admin": self.enable_settings_admin,
+            "settings_admin_token": "[REDACTED]" if self.settings_admin_token else None,
         }
 
     def __repr__(self) -> str:
@@ -178,7 +218,9 @@ class AppConfig:
             f"session_ttl_seconds={self.session_ttl_seconds!r}, "
             f"session_cookie_name={self.session_cookie_name!r}, "
             f"session_cookie_secure={self.session_cookie_secure!r}, "
-            f"cors_allowed_origins={self.cors_allowed_origins!r}"
+            f"cors_allowed_origins={self.cors_allowed_origins!r}, "
+            f"enable_settings_admin={self.enable_settings_admin!r}, "
+            f"settings_admin_token='[REDACTED]' if self.settings_admin_token else None"
             f")"
         )
 
@@ -294,6 +336,15 @@ class AppConfig:
             if origin.strip()
         ) if cors_raw else ()
 
+        # Issue #10: tenant operating-settings admin surface. Strictly opt-in:
+        # the flag defaults off, and when off the token must not be set at all
+        # (a token-without-flag is rejected in __post_init__ as drift).
+        settings_admin_raw = environ.get("PAYOUTPROOF_ENABLE_SETTINGS_ADMIN", "0").strip().lower()
+        enable_settings_admin = settings_admin_raw in ("1", "true", "yes", "enabled")
+        settings_admin_token = environ.get("PAYOUTPROOF_SETTINGS_ADMIN_TOKEN") or None
+        if settings_admin_token is not None:
+            settings_admin_token = settings_admin_token.strip() or None
+
         return cls(
             grant_secret=grant_secret,
             audit_checkpoint_secret=audit_secret,
@@ -313,6 +364,8 @@ class AppConfig:
             session_cookie_name="payoutproof_session",
             session_cookie_secure=cookie_secure,
             cors_allowed_origins=cors_origins,
+            enable_settings_admin=enable_settings_admin,
+            settings_admin_token=settings_admin_token,
         )
 
     @classmethod
@@ -332,6 +385,8 @@ class AppConfig:
         session_ttl_seconds: int = 28800,
         session_cookie_secure: bool = False,
         cors_allowed_origins: tuple = (),
+        enable_settings_admin: bool = False,
+        settings_admin_token: Optional[str] = None,
     ) -> AppConfig:
         """Compose configuration explicitly for tests.
 
@@ -360,6 +415,14 @@ class AppConfig:
         if oidc_client_secret is None:
             oidc_client_secret = "test-client-secret-32-chars-long"
 
+        # Settings-admin block: when enabled for tests, a token must be
+        # supplied explicitly (there is no default admin token, matching the
+        # no-fake-provider posture of the OIDC block).
+        if enable_settings_admin and (not settings_admin_token or not settings_admin_token.strip()):
+            raise ConfigurationError(
+                "settings_admin_token is required when enable_settings_admin is true."
+            )
+
         return cls(
             grant_secret=grant_secret,
             audit_checkpoint_secret=audit_checkpoint_secret,
@@ -376,4 +439,6 @@ class AppConfig:
             session_cookie_name="payoutproof_session",
             session_cookie_secure=session_cookie_secure,
             cors_allowed_origins=cors_allowed_origins,
+            enable_settings_admin=enable_settings_admin,
+            settings_admin_token=settings_admin_token,
         )
