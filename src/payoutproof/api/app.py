@@ -614,4 +614,8 @@ def create_app(
     app_instance.include_router(public_router)
     app_instance.include_router(auth_routes.router)
     app_instance.include_router(protected_router)
+
+    from payoutproof.membership.routes import router as membership_router
+    app_instance.include_router(membership_router)
+
     return app_instance

@@ -122,3 +122,41 @@ class AuditTrustState(str, Enum):
     """Trust states for case audit checkpoints."""
     TRUSTED = "TRUSTED"
     LEGACY_UNTRUSTED = "LEGACY_UNTRUSTED"
+
+
+class MembershipRole(str, Enum):
+    """Organization-scoped member roles.
+
+    No role confers any Money Action authority: administration is strictly
+    membership-scoped. Roles mirror CONTEXT.md where the glossary anchors
+    them (Payment Operator, Finance Control Owner); Tenant Administrator and
+    Viewer extend the vocabulary for Issue #8 and are flagged for domain
+    ratification via /domain-modeling rather than coined silently.
+    """
+    TENANT_ADMINISTRATOR = "TENANT_ADMINISTRATOR"
+    PAYMENT_OPERATOR = "PAYMENT_OPERATOR"
+    FINANCE_CONTROL_OWNER = "FINANCE_CONTROL_OWNER"
+    VIEWER = "VIEWER"
+
+
+class MembershipStatus(str, Enum):
+    """Lifecycle status of an organization member row."""
+    ACTIVE = "ACTIVE"
+    REMOVED = "REMOVED"
+
+
+class InvitationStatus(str, Enum):
+    """Lifecycle status of a single-use membership invitation."""
+    PENDING = "PENDING"
+    ACCEPTED = "ACCEPTED"
+    EXPIRED = "EXPIRED"
+    REVOKED = "REVOKED"
+
+
+class MembershipAuditEventType(str, Enum):
+    """Event types for the organization-keyed membership audit chain."""
+    MEMBER_INVITED = "MEMBER_INVITED"
+    INVITATION_REVOKED = "INVITATION_REVOKED"
+    MEMBER_ADDED = "MEMBER_ADDED"
+    MEMBER_ROLE_CHANGED = "MEMBER_ROLE_CHANGED"
+    MEMBER_REMOVED = "MEMBER_REMOVED"

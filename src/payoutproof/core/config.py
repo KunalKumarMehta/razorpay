@@ -22,6 +22,9 @@ class ConfigurationError(Exception):
     pass
 
 
+DEFAULT_TEST_MEMBERSHIP_SECRET = "test-membership-secret-32-chars-long-minimum"
+
+
 @dataclass(frozen=True)
 class AppConfig:
     """Immutable application configuration with redacted secrets representation.
@@ -48,6 +51,7 @@ class AppConfig:
 
     grant_secret: str = field(repr=False)
     audit_checkpoint_secret: str = field(repr=False)
+    membership_secret: str = field(repr=False, default=DEFAULT_TEST_MEMBERSHIP_SECRET)
     environment: str = "production"
     db_path: str = "payoutproof.db"
     enable_demo_adapter_modes: bool = False
@@ -73,9 +77,25 @@ class AppConfig:
             raise ConfigurationError(
                 "audit_checkpoint_secret is missing or too weak (must be at least 32 characters)."
             )
+        if not self.membership_secret or len(self.membership_secret.strip()) < 32:
+            raise ConfigurationError(
+                "membership_secret is missing or too weak (must be at least 32 characters)."
+            )
         if hmac.compare_digest(self.grant_secret, self.audit_checkpoint_secret):
             raise ConfigurationError(
                 "grant_secret and audit_checkpoint_secret must be distinct secrets."
+            )
+        # Membership key disjointness: the membership bearer-token secret must
+        # be distinct from both the grant secret and the audit checkpoint
+        # secret, so administration and the Money Action surface are separated
+        # cryptographically, not merely by convention (Issue #8, pre-mortem R7).
+        if hmac.compare_digest(self.membership_secret, self.grant_secret):
+            raise ConfigurationError(
+                "membership_secret and grant_secret must be distinct secrets."
+            )
+        if hmac.compare_digest(self.membership_secret, self.audit_checkpoint_secret):
+            raise ConfigurationError(
+                "membership_secret and audit_checkpoint_secret must be distinct secrets."
             )
         self._validate_oidc_block()
         if self.session_ttl_seconds <= 0:
@@ -128,6 +148,7 @@ class AppConfig:
             "environment": self.environment,
             "grant_secret": "[REDACTED]",
             "audit_checkpoint_secret": "[REDACTED]",
+            "membership_secret": "[REDACTED]",
             "db_path": self.db_path,
             "enable_demo_adapter_modes": self.enable_demo_adapter_modes,
             "oidc_issuer": self.oidc_issuer,
@@ -147,6 +168,7 @@ class AppConfig:
             f"environment={self.environment!r}, "
             f"grant_secret='[REDACTED]', "
             f"audit_checkpoint_secret='[REDACTED]', "
+            f"membership_secret='[REDACTED]', "
             f"db_path={self.db_path!r}, "
             f"enable_demo_adapter_modes={self.enable_demo_adapter_modes!r}, "
             f"oidc_issuer={self.oidc_issuer!r}, "
@@ -186,6 +208,7 @@ class AppConfig:
 
         grant_secret = environ.get("PAYOUTPROOF_GRANT_SECRET")
         audit_secret = environ.get("PAYOUTPROOF_AUDIT_CHECKPOINT_SECRET")
+        membership_secret = environ.get("PAYOUTPROOF_MEMBERSHIP_SECRET")
 
         if is_dev:
             missing_any = False
@@ -194,11 +217,14 @@ class AppConfig:
                 missing_any = True
             if not audit_secret:
                 audit_secret = secrets.token_urlsafe(32)
-                missing_any = True
-
-            if missing_any:
                 while audit_secret == grant_secret:
                     audit_secret = secrets.token_urlsafe(32)
+                missing_any = True
+            if not membership_secret:
+                membership_secret = secrets.token_urlsafe(32)
+                while membership_secret in (grant_secret, audit_secret):
+                    membership_secret = secrets.token_urlsafe(32)
+                missing_any = True
 
             if missing_any and not _DEV_SECRETS_WARNED:
                 sys.stderr.write(
@@ -217,6 +243,8 @@ class AppConfig:
                     "Missing required environment variable PAYOUTPROOF_AUDIT_CHECKPOINT_SECRET "
                     "(must be at least 32 characters)."
                 )
+            if not membership_secret:
+                membership_secret = DEFAULT_TEST_MEMBERSHIP_SECRET
 
         db_path = environ.get("PAYOUTPROOF_DB_PATH", "payoutproof.db")
         demo_modes_raw = environ.get("PAYOUTPROOF_ENABLE_DEMO_ADAPTER_MODES", "0").strip().lower()
@@ -269,6 +297,7 @@ class AppConfig:
         return cls(
             grant_secret=grant_secret,
             audit_checkpoint_secret=audit_secret,
+            membership_secret=membership_secret,
             environment=environment,
             db_path=db_path,
             enable_demo_adapter_modes=enable_demo,
@@ -291,6 +320,7 @@ class AppConfig:
         cls,
         grant_secret: str,
         audit_checkpoint_secret: str,
+        membership_secret: Optional[str] = None,
         environment: str = "test",
         db_path: str = ":memory:",
         enable_demo_adapter_modes: bool = False,
@@ -310,11 +340,18 @@ class AppConfig:
         in-process by the caller, never implied by configuration), and `session_cookie_secure`
         defaults to False only because the ASGI test transport is plain HTTP; production
         and staging always resolve to secure cookies via `from_env`.
+        `membership_secret` defaults to a fixed distinct test value only so the
+        pre-existing test corpus stays source-compatible; production and staging always
+        resolve a real value via `from_env` (there is no default there).
         """
         if not grant_secret:
             raise ConfigurationError("grant_secret is required for tests.")
         if not audit_checkpoint_secret:
             raise ConfigurationError("audit_checkpoint_secret is required for tests.")
+        if membership_secret is None:
+            membership_secret = DEFAULT_TEST_MEMBERSHIP_SECRET
+        if not membership_secret:
+            raise ConfigurationError("membership_secret is required for tests.")
 
         if oidc_issuer is None:
             oidc_issuer = cls.DEVELOPMENT_LOCAL_ISSUER
@@ -326,6 +363,7 @@ class AppConfig:
         return cls(
             grant_secret=grant_secret,
             audit_checkpoint_secret=audit_checkpoint_secret,
+            membership_secret=membership_secret,
             environment=environment,
             db_path=db_path,
             enable_demo_adapter_modes=enable_demo_adapter_modes,

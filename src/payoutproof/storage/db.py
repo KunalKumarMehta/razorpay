@@ -2,9 +2,13 @@
 
 import sqlite3
 import json
+import uuid
+import hmac
+import hashlib
+import secrets
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from payoutproof.core.models import (
     RiskCaseState,
@@ -22,6 +26,10 @@ from payoutproof.core.enums import (
     PolicyOutcome,
     ProcessingAuthorityStatus,
     AuditTrustState,
+    InvitationStatus,
+    MembershipAuditEventType,
+    MembershipRole,
+    MembershipStatus,
 )
 from payoutproof.grants.issuer import GrantVerifier
 from payoutproof.core.crypto import (
@@ -29,6 +37,7 @@ from payoutproof.core.crypto import (
     compute_audit_hash,
     compute_checkpoint_mac,
     verify_checkpoint_mac,
+    sha256_hex,
 )
 from payoutproof.audit.chain import GENESIS_HASH
 
@@ -71,6 +80,44 @@ class StaleCaseStateError(ValueError):
 
 class GrantTransitionError(ValueError):
     """Raised when a durable grant status transition violates the irreversible lifecycle lattice."""
+    pass
+
+
+class UnscopedMembershipError(ValueError):
+    """Raised when a membership operation lacks a non-blank mandatory organization scope.
+
+    Every membership store method requires an explicit organization; there is no
+    default organization, no UNSCOPED sentinel mode, and no un-scoped branch.
+    """
+    pass
+
+
+class MembershipNotFoundError(ValueError):
+    """Raised when a member or invitation is absent, expired, revoked, already used,
+    or belongs to a different organization (cross-org is indistinguishable from absent)."""
+    pass
+
+
+class MembershipConflictError(ValueError):
+    """Raised on unique-constraint conflicts, e.g. inviting an email that is already
+    an ACTIVE member of the organization."""
+    pass
+
+
+class SelfMutationError(ValueError):
+    """Raised when a principal attempts self-role-change (R1) or self-removal (R2)."""
+    pass
+
+
+class LastAdministratorError(ValueError):
+    """Raised when an operation would leave the organization with zero ACTIVE
+    Tenant Administrators (R3)."""
+    pass
+
+
+class InvitationNotFoundError(MembershipNotFoundError):
+    """Raised when a single-use invitation cannot be claimed: unknown, expired,
+    revoked, already accepted, or issued by a different organization."""
     pass
 
 
@@ -414,6 +461,68 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_operator_sessions_token ON operator_sessions(token_hash);
                 CREATE INDEX IF NOT EXISTS idx_operator_sessions_subject ON operator_sessions(subject);
                 CREATE INDEX IF NOT EXISTS idx_case_action_actors_case ON case_action_actors(case_id, action_type, recorded_at);
+
+                CREATE TABLE IF NOT EXISTS organization_members (
+                    member_id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    token_version INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(organization_id, email)
+                );
+                CREATE INDEX IF NOT EXISTS idx_org_members_organization ON organization_members(organization_id);
+
+                CREATE TABLE IF NOT EXISTS member_roles (
+                    organization_id TEXT NOT NULL,
+                    member_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    granted_by TEXT NOT NULL,
+                    granted_at TEXT NOT NULL,
+                    PRIMARY KEY (member_id, role)
+                );
+                CREATE INDEX IF NOT EXISTS idx_member_roles_organization ON member_roles(organization_id);
+
+                CREATE TABLE IF NOT EXISTS membership_invitations (
+                    invitation_id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    secret_hash TEXT NOT NULL,
+                    invited_by TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    accepted_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_invitations_organization ON membership_invitations(organization_id);
+
+                CREATE TABLE IF NOT EXISTS membership_audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    organization_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    prev_hash TEXT NOT NULL,
+                    current_hash TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    UNIQUE(organization_id, seq)
+                );
+                CREATE INDEX IF NOT EXISTS idx_membership_audit_organization ON membership_audit_events(organization_id);
+
+                CREATE TABLE IF NOT EXISTS membership_audit_checkpoints (
+                    organization_id TEXT PRIMARY KEY,
+                    event_count INTEGER NOT NULL,
+                    tip_hash TEXT NOT NULL,
+                    trust_state TEXT NOT NULL,
+                    checkpoint_mac TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_membership_audit_checkpoints_organization ON membership_audit_checkpoints(organization_id);
             """)
             conn.commit()
             self._migrate_db(conn)
@@ -2049,3 +2158,1238 @@ class Database:
             organization_id=persisted_case.organization_id,
         )
         return AdapterDecision.PENDING_ITEM_CREATED, item, None
+
+    # ==========================================================================
+    # Organization membership administration (Issue #8)
+    #
+    # Zero Autonomous Money Actions: this section administers membership only.
+    # It must never grant authority to approve, release, or initiate money
+    # actions, and it shares zero tables and zero code paths with the Money
+    # Action surface (risk_cases, handoff_grants, pending_approval_items,
+    # adapter_attempts, case_audit_checkpoints).
+    # ==========================================================================
+
+    MEMBERSHIP_AUDIT_GENESIS_SEQ = 1
+
+    @staticmethod
+    def _require_membership_scope(organization_id: Optional[str]) -> str:
+        """Return the stripped organization scope or raise UnscopedMembershipError.
+
+        Blank, None, or whitespace-only scopes are rejected: there is no
+        default organization, no UNSCOPED sentinel mode, and no un-scoped
+        membership caller mode.
+        """
+        if organization_id is None or not isinstance(organization_id, str) or not organization_id.strip():
+            raise UnscopedMembershipError(
+                "Membership operations require an explicit non-blank organization_id; "
+                "there is no un-scoped membership mode."
+            )
+        return organization_id.strip()
+
+    @staticmethod
+    def _validate_membership_roles(new_roles: List[MembershipRole]) -> List[MembershipRole]:
+        """Validate the closed role vocabulary (R4) and return the canonical sorted set."""
+        if not isinstance(new_roles, (list, tuple)):
+            raise MembershipConflictError("new_roles must be a list of MembershipRole values")
+        seen: set[str] = set()
+        normalized: List[MembershipRole] = []
+        for r in new_roles:
+            if not isinstance(r, MembershipRole):
+                raise MembershipConflictError(
+                    f"Role '{r!r}' is not a MembershipRole; roles come only from the closed enum vocabulary"
+                )
+            if r in seen:
+                raise MembershipConflictError(f"Duplicate role '{r.value}' in role set")
+            seen.add(r)
+            normalized.append(r)
+        return sorted(normalized, key=lambda role: role.value)
+
+    def _append_membership_audit_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+        event_type: MembershipAuditEventType,
+        summary: str,
+        actor: str,
+        details: Dict[str, Any],
+        timestamp: str,
+    ) -> None:
+        """Append one event and advance the org-keyed checkpoint inside the caller's transaction.
+
+        Mirrors the case-ledger checkpoint discipline: the checkpoint is read
+        inside the same BEGIN IMMEDIATE, trust_state must be TRUSTED and its
+        MAC must verify (mutations are refused otherwise), and both the event
+        insert and the checkpoint advance require rowcount == 1.
+        """
+        cp_row = conn.execute(
+            """
+            SELECT event_count, tip_hash, trust_state, checkpoint_mac
+            FROM membership_audit_checkpoints
+            WHERE organization_id = ?;
+            """,
+            (organization_id,),
+        ).fetchone()
+
+        if cp_row is None:
+            seq = 1
+            prev_hash = GENESIS_HASH
+        else:
+            if cp_row["trust_state"] != AuditTrustState.TRUSTED.value:
+                raise AuditLedgerIntegrityError(
+                    f"Membership audit for organization '{organization_id}' is in untrusted state "
+                    f"'{cp_row['trust_state']}'; mutations refused"
+                )
+            if not isinstance(cp_row["event_count"], int) or isinstance(cp_row["event_count"], bool):
+                raise AuditLedgerIntegrityError(
+                    f"Membership audit checkpoint event_count is not an integer for '{organization_id}'"
+                )
+            if not verify_checkpoint_mac(
+                secret=self.audit_checkpoint_secret,
+                case_id=organization_id,
+                event_count=cp_row["event_count"],
+                tip_hash=cp_row["tip_hash"],
+                trust_state=cp_row["trust_state"],
+                checkpoint_mac=cp_row["checkpoint_mac"],
+            ):
+                raise AuditLedgerIntegrityError(
+                    f"Membership audit checkpoint MAC verification failed for '{organization_id}'"
+                )
+            durable_count = conn.execute(
+                "SELECT COUNT(*) FROM membership_audit_events WHERE organization_id = ?;",
+                (organization_id,),
+            ).fetchone()[0]
+            if durable_count != cp_row["event_count"]:
+                raise AuditLedgerIntegrityError(
+                    f"Membership audit event count mismatch for '{organization_id}': "
+                    f"checkpoint records {cp_row['event_count']}, ledger has {durable_count}"
+                )
+            seq = cp_row["event_count"] + 1
+            prev_hash = cp_row["tip_hash"]
+
+        details_json = json.dumps(details, sort_keys=True, separators=(",", ":"))
+        current_hash = compute_audit_hash(
+            prev_hash=prev_hash,
+            seq=seq,
+            event_type=event_type.value,
+            summary=summary,
+            actor=actor,
+            timestamp=timestamp,
+            details=details,
+        )
+
+        cur = conn.execute(
+            """
+            INSERT INTO membership_audit_events (
+                organization_id, seq, event_type, summary, actor, prev_hash, current_hash, timestamp, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                organization_id,
+                seq,
+                event_type.value,
+                summary,
+                actor,
+                prev_hash,
+                current_hash,
+                timestamp,
+                details_json,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise AuditLedgerIntegrityError(
+                f"Failed to insert membership audit event at seq {seq} for '{organization_id}'"
+            )
+
+        new_mac = compute_checkpoint_mac(
+            self.audit_checkpoint_secret,
+            organization_id,
+            seq,
+            current_hash,
+            AuditTrustState.TRUSTED.value,
+        )
+        cp_cur = conn.execute(
+            """
+            INSERT INTO membership_audit_checkpoints (
+                organization_id, event_count, tip_hash, trust_state, checkpoint_mac, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(organization_id) DO UPDATE SET
+                event_count = excluded.event_count,
+                tip_hash = excluded.tip_hash,
+                trust_state = 'TRUSTED',
+                checkpoint_mac = excluded.checkpoint_mac,
+                updated_at = excluded.updated_at;
+            """,
+            (organization_id, seq, current_hash, AuditTrustState.TRUSTED.value, new_mac, timestamp),
+        )
+        if cp_cur.rowcount != 1:
+            raise AuditLedgerIntegrityError(
+                f"Failed to advance membership audit checkpoint for '{organization_id}'"
+            )
+
+    @staticmethod
+    def _count_other_active_administrators_tx(
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+        excluding_member_id: str,
+    ) -> int:
+        """Count ACTIVE Tenant Administrators other than the given member (R3 lock input)."""
+        row = conn.execute(
+            """
+            SELECT COUNT(*) FROM organization_members AS m
+            JOIN member_roles AS r
+              ON r.member_id = m.member_id AND r.organization_id = m.organization_id
+            WHERE m.organization_id = ? AND m.status = ?
+              AND r.role = ? AND m.member_id != ?;
+            """,
+            (
+                organization_id,
+                MembershipStatus.ACTIVE.value,
+                MembershipRole.TENANT_ADMINISTRATOR.value,
+                excluding_member_id,
+            ),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    @staticmethod
+    def _mint_membership_token(
+        *,
+        membership_secret: str,
+        member_id: str,
+        organization_id: str,
+        token_version: int,
+        issued_at: str,
+        expires_at: str,
+    ) -> str:
+        """Mint the stateless HMAC bearer token with explicit domain separation.
+
+        Signed with membership_secret — never grant_secret — so administration
+        and the Money Action surface are separated cryptographically, not
+        merely by convention.
+        """
+        message = (
+            f"MEMBERSHIP_TOKEN_V1|{member_id}|{organization_id}|{token_version}|{issued_at}|{expires_at}"
+        )
+        signature = hmac.new(
+            membership_secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        return f"{message}|{signature}"
+
+    def resolve_membership_principal_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+        bearer_token: str,
+        membership_secret: str,
+        now: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Verify the stateless bearer token and re-read the member row fresh from SQLite.
+
+        Returns a principal dict {member_id, organization_id, email, roles}
+        or None on ANY of: bad signature, malformed token, expired token,
+        member REMOVED, token_version mismatch, organization mismatch.
+        Callers map None to 401/404 without distinguishing which check
+        failed. There is no cache: every authorization decision re-reads the
+        authoritative member row inside this call.
+        """
+        scope = self._require_membership_scope(organization_id)
+        if not membership_secret or len(str(membership_secret).strip()) < 32:
+            raise ValueError("membership_secret is required and must be at least 32 characters")
+
+        if not bearer_token or not isinstance(bearer_token, str):
+            return None
+        parts = bearer_token.split("|")
+        if len(parts) != 7 or parts[0] != "MEMBERSHIP_TOKEN_V1":
+            return None
+        member_id, token_org, token_version_raw, issued_at, expires_at, signature = parts[1:]
+        message = (
+            f"MEMBERSHIP_TOKEN_V1|{member_id}|{token_org}|{token_version_raw}|{issued_at}|{expires_at}"
+        )
+        expected = hmac.new(
+            str(membership_secret).encode("utf-8"), message.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            return None
+
+        # Organization confinement: the token's org must equal the mandatory
+        # caller scope; a cross-org token is indistinguishable from absent.
+        if token_org != scope:
+            return None
+
+        try:
+            token_version = int(token_version_raw)
+        except ValueError:
+            return None
+        if token_version < 0:
+            return None
+
+        now_iso = now if now is not None else datetime.now(timezone.utc).isoformat()
+        try:
+            now_dt = datetime.fromisoformat(now_iso)
+            exp_dt = datetime.fromisoformat(expires_at)
+            if exp_dt.tzinfo is None:
+                exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+            if now_dt.tzinfo is None:
+                now_dt = now_dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return None
+        if exp_dt <= now_dt:
+            return None
+
+        row = conn.execute(
+            """
+            SELECT member_id, organization_id, email, status, token_version
+            FROM organization_members
+            WHERE member_id = ? AND organization_id = ?;
+            """,
+            (member_id, scope),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["status"] != MembershipStatus.ACTIVE.value:
+            return None
+        if int(row["token_version"]) != token_version:
+            return None
+
+        role_rows = conn.execute(
+            """
+            SELECT role FROM member_roles
+            WHERE member_id = ? AND organization_id = ?
+            ORDER BY role ASC;
+            """,
+            (member_id, scope),
+        ).fetchall()
+        roles = frozenset(MembershipRole(r["role"]) for r in role_rows)
+
+        return {
+            "member_id": row["member_id"],
+            "organization_id": row["organization_id"],
+            "email": row["email"],
+            "roles": roles,
+        }
+
+    def resolve_membership_principal(
+        self,
+        *,
+        organization_id: str,
+        bearer_token: str,
+        membership_secret: str,
+        now: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Connection-managed wrapper around resolve_membership_principal_tx (fresh read, no cache)."""
+        scope = self._require_membership_scope(organization_id)
+        with self.get_connection() as conn:
+            return self.resolve_membership_principal_tx(
+                conn,
+                organization_id=scope,
+                bearer_token=bearer_token,
+                membership_secret=membership_secret,
+                now=now,
+            )
+
+    def invite_member_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+        email: str,
+        role: MembershipRole,
+        invited_by: str,
+        expires_at: str,
+        invitation_id: Optional[str] = None,
+        invitation_secret: Optional[str] = None,
+    ) -> Tuple[str, str]:
+        """Create a PENDING single-use invitation inside the caller's transaction.
+
+        Returns (invitation_id, invitation_secret) — the raw secret is
+        returned exactly once and only its SHA-256 is persisted. Multiple
+        PENDING invitations for one email are permitted; single-use is
+        enforced per invitation at acceptance.
+        """
+        scope = self._require_membership_scope(organization_id)
+        if not email or not str(email).strip():
+            raise MembershipConflictError("email is required to invite a member")
+        if not isinstance(role, MembershipRole):
+            raise MembershipConflictError("role must be a MembershipRole value")
+        if not invited_by or not str(invited_by).strip():
+            raise MembershipConflictError("invited_by must be the verified administrator member_id")
+        if not expires_at or not str(expires_at).strip():
+            raise MembershipConflictError("expires_at is required (ISO-8601 UTC)")
+
+        normalized_email = str(email).strip()
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        duplicate = conn.execute(
+            """
+            SELECT member_id FROM organization_members
+            WHERE organization_id = ? AND email = ? AND status = ?;
+            """,
+            (scope, normalized_email, MembershipStatus.ACTIVE.value),
+        ).fetchone()
+        if duplicate is not None:
+            raise MembershipConflictError(
+                f"Email '{normalized_email}' is already an ACTIVE member of organization '{scope}'"
+            )
+
+        resolved_id = invitation_id or uuid.uuid4().hex
+        resolved_secret = invitation_secret or secrets.token_urlsafe(32)
+
+        cur = conn.execute(
+            """
+            INSERT INTO membership_invitations (
+                invitation_id, organization_id, email, role, status,
+                secret_hash, invited_by, expires_at, accepted_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?);
+            """,
+            (
+                resolved_id,
+                scope,
+                normalized_email,
+                role.value,
+                InvitationStatus.PENDING.value,
+                sha256_hex(resolved_secret),
+                str(invited_by).strip(),
+                str(expires_at).strip(),
+                now_iso,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise AuditLedgerIntegrityError(
+                f"Failed to insert membership invitation '{resolved_id}' for '{scope}'"
+            )
+
+        self._append_membership_audit_tx(
+            conn,
+            organization_id=scope,
+            event_type=MembershipAuditEventType.MEMBER_INVITED,
+            summary=f"Member invitation issued for {normalized_email}",
+            actor=str(invited_by).strip(),
+            details={
+                "target_email": normalized_email,
+                "assigned_role": role.value,
+                "invitation_id": resolved_id,
+                "expires_at": str(expires_at).strip(),
+            },
+            timestamp=now_iso,
+        )
+        return resolved_id, resolved_secret
+
+    def invite_member(
+        self,
+        *,
+        organization_id: str,
+        email: str,
+        role: MembershipRole,
+        invited_by: str,
+        expires_at: str,
+        invitation_id: Optional[str] = None,
+        invitation_secret: Optional[str] = None,
+    ) -> Tuple[str, str]:
+        """Invite a member within a BEGIN IMMEDIATE transaction."""
+        scope = self._require_membership_scope(organization_id)
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                result = self.invite_member_tx(
+                    conn,
+                    organization_id=scope,
+                    email=email,
+                    role=role,
+                    invited_by=invited_by,
+                    expires_at=expires_at,
+                    invitation_id=invitation_id,
+                    invitation_secret=invitation_secret,
+                )
+                conn.commit()
+                return result
+            except Exception:
+                conn.rollback()
+                raise
+
+    def accept_invitation_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+        invitation_id: str,
+        invitation_secret: str,
+        display_name: str,
+        membership_secret: str,
+        session_ttl_seconds: int = 3600,
+        now: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Claim a PENDING invitation and create (or reactivate) the member atomically.
+
+        The claim is conditional with rowcount == 1, so unknown, expired,
+        revoked, cross-org, and already-accepted invitations are all
+        indistinguishable failures. The stateless bearer token is minted
+        after the caller commits and returned exactly once — acceptance is
+        the ONLY session-issuance path.
+        """
+        scope = self._require_membership_scope(organization_id)
+        if not invitation_id or not str(invitation_id).strip():
+            raise InvitationNotFoundError("invitation_id is required")
+        if not invitation_secret or not str(invitation_secret).strip():
+            raise InvitationNotFoundError("invitation secret is required")
+        if not display_name or not str(display_name).strip():
+            raise MembershipConflictError("display_name is required")
+        if not membership_secret or len(str(membership_secret).strip()) < 32:
+            raise ValueError("membership_secret is required and must be at least 32 characters")
+        if session_ttl_seconds <= 0:
+            raise ValueError("session_ttl_seconds must be positive")
+
+        if now is None:
+            now_dt = datetime.now(timezone.utc)
+            now_iso = now_dt.isoformat()
+        else:
+            now_iso = now
+            try:
+                now_dt = datetime.fromisoformat(now_iso)
+                if now_dt.tzinfo is None:
+                    now_dt = now_dt.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                raise ValueError("now must be an ISO-8601 timestamp")
+
+        normalized_invitation_id = str(invitation_id).strip()
+        normalized_display_name = str(display_name).strip()
+
+        invitation_row = conn.execute(
+            """
+            SELECT invitation_id, email, role FROM membership_invitations
+            WHERE invitation_id = ? AND organization_id = ? AND status = ? AND secret_hash = ?;
+            """,
+            (
+                normalized_invitation_id,
+                scope,
+                InvitationStatus.PENDING.value,
+                sha256_hex(str(invitation_secret).strip()),
+            ),
+        ).fetchone()
+        if invitation_row is None:
+            raise InvitationNotFoundError(
+                f"Invitation '{normalized_invitation_id}' is unknown, expired, revoked, or already used"
+            )
+
+        claim = conn.execute(
+            """
+            UPDATE membership_invitations
+            SET status = ?, accepted_at = ?
+            WHERE invitation_id = ?
+              AND organization_id = ?
+              AND status = ?
+              AND expires_at > ?;
+            """,
+            (
+                InvitationStatus.ACCEPTED.value,
+                now_iso,
+                normalized_invitation_id,
+                scope,
+                InvitationStatus.PENDING.value,
+                now_iso,
+            ),
+        )
+        if claim.rowcount != 1:
+            raise InvitationNotFoundError(
+                f"Invitation '{normalized_invitation_id}' is unknown, expired, revoked, or already used"
+            )
+
+        invited_email = invitation_row["email"]
+        invited_role = MembershipRole(invitation_row["role"])
+
+        member_cur = conn.execute(
+            """
+            INSERT INTO organization_members (
+                member_id, organization_id, email, display_name, status, token_version, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+            ON CONFLICT(organization_id, email) DO UPDATE SET
+                status = ?,
+                display_name = excluded.display_name,
+                token_version = organization_members.token_version + 1,
+                updated_at = excluded.updated_at;
+            """,
+            (
+                uuid.uuid4().hex,
+                scope,
+                invited_email,
+                normalized_display_name,
+                MembershipStatus.ACTIVE.value,
+                now_iso,
+                now_iso,
+                MembershipStatus.ACTIVE.value,
+            ),
+        )
+        if member_cur.rowcount != 1:
+            raise AuditLedgerIntegrityError(
+                f"Failed to upsert organization_members row for '{invited_email}' in '{scope}'"
+            )
+
+        member_row = conn.execute(
+            """
+            SELECT member_id, token_version FROM organization_members
+            WHERE organization_id = ? AND email = ?;
+            """,
+            (scope, invited_email),
+        ).fetchone()
+        if member_row is None:
+            raise AuditLedgerIntegrityError(
+                f"Failed to resolve member row for '{invited_email}' in '{scope}'"
+            )
+        member_id = member_row["member_id"]
+        token_version = int(member_row["token_version"])
+
+        conn.execute(
+            """
+            INSERT INTO member_roles (organization_id, member_id, role, granted_by, granted_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(member_id, role) DO NOTHING;
+            """,
+            (scope, member_id, invited_role.value, member_id, now_iso),
+        )
+
+        self._append_membership_audit_tx(
+            conn,
+            organization_id=scope,
+            event_type=MembershipAuditEventType.MEMBER_ADDED,
+            summary=f"Member added: {invited_email}",
+            actor=member_id,
+            details={
+                "invitation_id": normalized_invitation_id,
+                "email": invited_email,
+                "initial_roles": [invited_role.value],
+            },
+            timestamp=now_iso,
+        )
+
+        expires_dt = now_dt + timedelta(seconds=session_ttl_seconds)
+        bearer_token = self._mint_membership_token(
+            membership_secret=str(membership_secret),
+            member_id=member_id,
+            organization_id=scope,
+            token_version=token_version,
+            issued_at=now_iso,
+            expires_at=expires_dt.isoformat(),
+        )
+        return {
+            "member_id": member_id,
+            "organization_id": scope,
+            "email": invited_email,
+            "roles": [invited_role],
+            "bearer_token": bearer_token,
+            "expires_at": expires_dt.isoformat(),
+        }
+
+    def accept_invitation(
+        self,
+        *,
+        organization_id: str,
+        invitation_id: str,
+        invitation_secret: str,
+        display_name: str,
+        membership_secret: str,
+        session_ttl_seconds: int = 3600,
+        now: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Accept an invitation within a BEGIN IMMEDIATE transaction."""
+        scope = self._require_membership_scope(organization_id)
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                result = self.accept_invitation_tx(
+                    conn,
+                    organization_id=scope,
+                    invitation_id=invitation_id,
+                    invitation_secret=invitation_secret,
+                    display_name=display_name,
+                    membership_secret=membership_secret,
+                    session_ttl_seconds=session_ttl_seconds,
+                    now=now,
+                )
+                conn.commit()
+                return result
+            except Exception:
+                conn.rollback()
+                raise
+
+    def revoke_invitation_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+        invitation_id: str,
+        actor_member_id: str,
+    ) -> None:
+        """Conditionally flip PENDING -> REVOKED inside the caller's transaction.
+
+        rowcount == 1 is required: an unknown, accepted, expired, revoked, or
+        cross-org invitation raises MembershipNotFoundError (R5).
+        """
+        scope = self._require_membership_scope(organization_id)
+        if not invitation_id or not str(invitation_id).strip():
+            raise MembershipNotFoundError("invitation_id is required")
+        if not actor_member_id or not str(actor_member_id).strip():
+            raise MembershipConflictError("actor_member_id must be the verified administrator member_id")
+
+        normalized_invitation_id = str(invitation_id).strip()
+        actor = str(actor_member_id).strip()
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        invitation_row = conn.execute(
+            """
+            SELECT email FROM membership_invitations
+            WHERE invitation_id = ? AND organization_id = ? AND status = ?;
+            """,
+            (normalized_invitation_id, scope, InvitationStatus.PENDING.value),
+        ).fetchone()
+        if invitation_row is None:
+            raise MembershipNotFoundError(
+                f"Invitation '{normalized_invitation_id}' not found in organization '{scope}'"
+            )
+
+        cur = conn.execute(
+            """
+            UPDATE membership_invitations
+            SET status = ?
+            WHERE invitation_id = ? AND organization_id = ? AND status = ?;
+            """,
+            (
+                InvitationStatus.REVOKED.value,
+                normalized_invitation_id,
+                scope,
+                InvitationStatus.PENDING.value,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise MembershipNotFoundError(
+                f"Invitation '{normalized_invitation_id}' not found in organization '{scope}'"
+            )
+
+        self._append_membership_audit_tx(
+            conn,
+            organization_id=scope,
+            event_type=MembershipAuditEventType.INVITATION_REVOKED,
+            summary=f"Membership invitation revoked for {invitation_row['email']}",
+            actor=actor,
+            details={
+                "invitation_id": normalized_invitation_id,
+                "target_email": invitation_row["email"],
+            },
+            timestamp=now_iso,
+        )
+
+    def revoke_invitation(
+        self,
+        *,
+        organization_id: str,
+        invitation_id: str,
+        actor_member_id: str,
+    ) -> None:
+        """Revoke an invitation within a BEGIN IMMEDIATE transaction."""
+        scope = self._require_membership_scope(organization_id)
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                self.revoke_invitation_tx(
+                    conn,
+                    organization_id=scope,
+                    invitation_id=invitation_id,
+                    actor_member_id=actor_member_id,
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def set_member_roles_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+        target_member_id: str,
+        new_roles: List[MembershipRole],
+        actor_member_id: str,
+    ) -> None:
+        """Atomically rewrite the member's role rows inside the caller's transaction.
+
+        Guards (R1, R3) are re-checked inside the write transaction:
+        self-mutation is forbidden, and dropping the last ACTIVE Tenant
+        Administrator is refused. Roles come only from the closed enum
+        vocabulary (R4).
+        """
+        scope = self._require_membership_scope(organization_id)
+        if not target_member_id or not str(target_member_id).strip():
+            raise MembershipNotFoundError("target_member_id is required")
+        if not actor_member_id or not str(actor_member_id).strip():
+            raise MembershipConflictError("actor_member_id must be the verified administrator member_id")
+
+        target_id = str(target_member_id).strip()
+        actor = str(actor_member_id).strip()
+        normalized_roles = self._validate_membership_roles(new_roles)
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        target_row = conn.execute(
+            """
+            SELECT member_id FROM organization_members
+            WHERE member_id = ? AND organization_id = ? AND status = ?;
+            """,
+            (target_id, scope, MembershipStatus.ACTIVE.value),
+        ).fetchone()
+        if target_row is None:
+            raise MembershipNotFoundError(
+                f"Member '{target_id}' not found in organization '{scope}'"
+            )
+
+        if actor == target_id:
+            raise SelfMutationError(
+                "Administrators cannot change their own roles (R1)"
+            )
+
+        old_role_rows = conn.execute(
+            """
+            SELECT role FROM member_roles
+            WHERE member_id = ? AND organization_id = ?
+            ORDER BY role ASC;
+            """,
+            (target_id, scope),
+        ).fetchall()
+        old_roles = [MembershipRole(r["role"]) for r in old_role_rows]
+
+        currently_admin = MembershipRole.TENANT_ADMINISTRATOR in old_roles
+        will_be_admin = MembershipRole.TENANT_ADMINISTRATOR in normalized_roles
+        if currently_admin and not will_be_admin:
+            remaining_admins = self._count_other_active_administrators_tx(
+                conn, organization_id=scope, excluding_member_id=target_id
+            )
+            if remaining_admins == 0:
+                raise LastAdministratorError(
+                    f"Cannot drop the last ACTIVE Tenant Administrator of '{scope}' (R3)"
+                )
+
+        conn.execute(
+            "DELETE FROM member_roles WHERE member_id = ? AND organization_id = ?;",
+            (target_id, scope),
+        )
+        for role in normalized_roles:
+            cur = conn.execute(
+                """
+                INSERT INTO member_roles (organization_id, member_id, role, granted_by, granted_at)
+                VALUES (?, ?, ?, ?, ?);
+                """,
+                (scope, target_id, role.value, actor, now_iso),
+            )
+            if cur.rowcount != 1:
+                raise AuditLedgerIntegrityError(
+                    f"Failed to insert role '{role.value}' for member '{target_id}' in '{scope}'"
+                )
+
+        touch = conn.execute(
+            """
+            UPDATE organization_members SET updated_at = ?
+            WHERE member_id = ? AND organization_id = ? AND status = ?;
+            """,
+            (now_iso, target_id, scope, MembershipStatus.ACTIVE.value),
+        )
+        if touch.rowcount != 1:
+            raise AuditLedgerIntegrityError(
+                f"Failed to update organization_members row for '{target_id}' in '{scope}'"
+            )
+
+        self._append_membership_audit_tx(
+            conn,
+            organization_id=scope,
+            event_type=MembershipAuditEventType.MEMBER_ROLE_CHANGED,
+            summary=f"Member roles changed for {target_id}",
+            actor=actor,
+            details={
+                "target_member_id": target_id,
+                "old_roles": [r.value for r in old_roles],
+                "new_roles": [r.value for r in normalized_roles],
+            },
+            timestamp=now_iso,
+        )
+
+    def set_member_roles(
+        self,
+        *,
+        organization_id: str,
+        target_member_id: str,
+        new_roles: List[MembershipRole],
+        actor_member_id: str,
+    ) -> None:
+        """Rewrite a member's role set within a BEGIN IMMEDIATE transaction."""
+        scope = self._require_membership_scope(organization_id)
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                self.set_member_roles_tx(
+                    conn,
+                    organization_id=scope,
+                    target_member_id=target_member_id,
+                    new_roles=new_roles,
+                    actor_member_id=actor_member_id,
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def remove_member_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+        target_member_id: str,
+        actor_member_id: str,
+    ) -> Dict[str, Any]:
+        """Mark a member REMOVED with immediate session revocation inside the caller's transaction.
+
+        Flipping status and bumping token_version in one transaction
+        invalidates every outstanding membership token at its next
+        validation (per-request fresh read, no cache). member_roles rows
+        are deliberately retained but inert: every authorization check
+        requires status = ACTIVE first. This method touches NOTHING else —
+        never handoff_grants, pending_approval_items, adapter_attempts,
+        risk_cases, or case_audit_checkpoints.
+        """
+        scope = self._require_membership_scope(organization_id)
+        if not target_member_id or not str(target_member_id).strip():
+            raise MembershipNotFoundError("target_member_id is required")
+        if not actor_member_id or not str(actor_member_id).strip():
+            raise MembershipConflictError("actor_member_id must be the verified administrator member_id")
+
+        target_id = str(target_member_id).strip()
+        actor = str(actor_member_id).strip()
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        target_row = conn.execute(
+            """
+            SELECT email FROM organization_members
+            WHERE member_id = ? AND organization_id = ? AND status = ?;
+            """,
+            (target_id, scope, MembershipStatus.ACTIVE.value),
+        ).fetchone()
+        if target_row is None:
+            raise MembershipNotFoundError(
+                f"Member '{target_id}' not found in organization '{scope}'"
+            )
+
+        if actor == target_id:
+            raise SelfMutationError("Administrators cannot remove themselves (R2)")
+
+        admin_row = conn.execute(
+            """
+            SELECT 1 FROM member_roles
+            WHERE member_id = ? AND organization_id = ? AND role = ?;
+            """,
+            (target_id, scope, MembershipRole.TENANT_ADMINISTRATOR.value),
+        ).fetchone()
+        if admin_row is not None:
+            remaining_admins = self._count_other_active_administrators_tx(
+                conn, organization_id=scope, excluding_member_id=target_id
+            )
+            if remaining_admins == 0:
+                raise LastAdministratorError(
+                    f"Cannot remove the last ACTIVE Tenant Administrator of '{scope}' (R3)"
+                )
+
+        cur = conn.execute(
+            """
+            UPDATE organization_members
+            SET status = ?,
+                token_version = token_version + 1,
+                updated_at = ?
+            WHERE member_id = ? AND organization_id = ? AND status = ?;
+            """,
+            (
+                MembershipStatus.REMOVED.value,
+                now_iso,
+                target_id,
+                scope,
+                MembershipStatus.ACTIVE.value,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise MembershipNotFoundError(
+                f"Member '{target_id}' not found in organization '{scope}'"
+            )
+
+        new_version_row = conn.execute(
+            "SELECT token_version FROM organization_members WHERE member_id = ? AND organization_id = ?;",
+            (target_id, scope),
+        ).fetchone()
+        new_token_version = int(new_version_row["token_version"])
+
+        conn.execute(
+            """
+            UPDATE membership_invitations
+            SET status = ?
+            WHERE organization_id = ? AND email = ? AND status = ?;
+            """,
+            (
+                InvitationStatus.REVOKED.value,
+                scope,
+                target_row["email"],
+                InvitationStatus.PENDING.value,
+            ),
+        )
+
+        self._append_membership_audit_tx(
+            conn,
+            organization_id=scope,
+            event_type=MembershipAuditEventType.MEMBER_REMOVED,
+            summary=f"Member removed: {target_row['email']}",
+            actor=actor,
+            details={
+                "target_member_id": target_id,
+                "email": target_row["email"],
+                "token_version": new_token_version,
+            },
+            timestamp=now_iso,
+        )
+        return {
+            "target_member_id": target_id,
+            "email": target_row["email"],
+            "token_version": new_token_version,
+        }
+
+    def remove_member(
+        self,
+        *,
+        organization_id: str,
+        target_member_id: str,
+        actor_member_id: str,
+    ) -> Dict[str, Any]:
+        """Remove a member within a BEGIN IMMEDIATE transaction."""
+        scope = self._require_membership_scope(organization_id)
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                result = self.remove_member_tx(
+                    conn,
+                    organization_id=scope,
+                    target_member_id=target_member_id,
+                    actor_member_id=actor_member_id,
+                )
+                conn.commit()
+                return result
+            except Exception:
+                conn.rollback()
+                raise
+
+    def list_members(self, *, organization_id: str) -> List[Dict[str, Any]]:
+        """List ACTIVE members with their role sets strictly within one organization.
+
+        There is deliberately NO organization_id=None mode and no UNSCOPED
+        sentinel: membership is always organization-scoped.
+        """
+        scope = self._require_membership_scope(organization_id)
+        with self.get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT member_id, email, display_name, status, created_at, updated_at
+                FROM organization_members
+                WHERE organization_id = ? AND status = ?
+                ORDER BY created_at ASC, member_id ASC;
+                """,
+                (scope, MembershipStatus.ACTIVE.value),
+            ).fetchall()
+            role_rows = conn.execute(
+                """
+                SELECT member_id, role FROM member_roles
+                WHERE organization_id = ?
+                ORDER BY role ASC;
+                """,
+                (scope,),
+            ).fetchall()
+            roles_by_member: Dict[str, List[str]] = {}
+            for r in role_rows:
+                roles_by_member.setdefault(r["member_id"], []).append(r["role"])
+            return [
+                {
+                    "member_id": r["member_id"],
+                    "email": r["email"],
+                    "display_name": r["display_name"],
+                    "status": r["status"],
+                    "roles": roles_by_member.get(r["member_id"], []),
+                    "created_at": r["created_at"],
+                    "updated_at": r["updated_at"],
+                }
+                for r in rows
+            ]
+
+    def verify_membership_audit(self, *, organization_id: str) -> Optional[Dict[str, Any]]:
+        """Verify the org-keyed membership audit chain and checkpoint MAC (read-only).
+
+        Returns None when the organization has no membership activity at
+        all (no checkpoint row), mirroring verify_case_audit's shape with
+        organization_id in place of case_id.
+        """
+        scope = self._require_membership_scope(organization_id)
+        with self.get_connection() as conn:
+            return self.verify_membership_audit_tx(conn, organization_id=scope)
+
+    def verify_membership_audit_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Verify the org-keyed membership audit chain within a connection (read-only)."""
+        scope = self._require_membership_scope(organization_id)
+
+        cp_row = conn.execute(
+            "SELECT * FROM membership_audit_checkpoints WHERE organization_id = ?;",
+            (scope,),
+        ).fetchone()
+        if cp_row is None:
+            rows_count = conn.execute(
+                "SELECT COUNT(*) FROM membership_audit_events WHERE organization_id = ?;",
+                (scope,),
+            ).fetchone()[0]
+            if rows_count == 0:
+                return None
+            return {
+                "organization_id": scope,
+                "is_valid": False,
+                "trust_state": "CORRUPTED",
+                "event_count": int(rows_count),
+                "broken_at_seq": None,
+                "reason": "Missing membership audit checkpoint with events present",
+            }
+
+        if not isinstance(cp_row["event_count"], int) or isinstance(cp_row["event_count"], bool):
+            return {
+                "organization_id": scope,
+                "is_valid": False,
+                "trust_state": "CORRUPTED",
+                "event_count": 0,
+                "broken_at_seq": None,
+                "reason": "Checkpoint event_count is not an integer",
+            }
+
+        if not verify_checkpoint_mac(
+            secret=self.audit_checkpoint_secret,
+            case_id=scope,
+            event_count=cp_row["event_count"],
+            tip_hash=cp_row["tip_hash"],
+            trust_state=cp_row["trust_state"],
+            checkpoint_mac=cp_row["checkpoint_mac"],
+        ):
+            return {
+                "organization_id": scope,
+                "is_valid": False,
+                "trust_state": "CORRUPTED",
+                "event_count": cp_row["event_count"],
+                "broken_at_seq": None,
+                "reason": "Membership audit checkpoint MAC verification failed",
+            }
+
+        rows = conn.execute(
+            "SELECT * FROM membership_audit_events WHERE organization_id = ? ORDER BY seq ASC;",
+            (scope,),
+        ).fetchall()
+        if len(rows) != cp_row["event_count"]:
+            return {
+                "organization_id": scope,
+                "is_valid": False,
+                "trust_state": "CORRUPTED",
+                "event_count": len(rows),
+                "broken_at_seq": None,
+                "reason": (
+                    f"Event count mismatch: checkpoint records {cp_row['event_count']} events, "
+                    f"found {len(rows)}"
+                ),
+            }
+
+        expected_tip = rows[-1]["current_hash"] if rows else GENESIS_HASH
+        if cp_row["tip_hash"] != expected_tip:
+            return {
+                "organization_id": scope,
+                "is_valid": False,
+                "trust_state": "CORRUPTED",
+                "event_count": len(rows),
+                "broken_at_seq": None,
+                "reason": "Audit tip hash mismatch with checkpoint",
+            }
+
+        seen_seqs: set[int] = set()
+        for idx, r in enumerate(rows):
+            if r["seq"] in seen_seqs:
+                return {
+                    "organization_id": scope,
+                    "is_valid": False,
+                    "trust_state": "CORRUPTED",
+                    "event_count": len(rows),
+                    "broken_at_seq": r["seq"],
+                    "reason": f"Duplicate audit sequence at seq {r['seq']}",
+                }
+            seen_seqs.add(r["seq"])
+            expected_seq = idx + 1
+            if r["seq"] != expected_seq:
+                return {
+                    "organization_id": scope,
+                    "is_valid": False,
+                    "trust_state": "CORRUPTED",
+                    "event_count": len(rows),
+                    "broken_at_seq": r["seq"],
+                    "reason": f"Sequence gap: expected seq {expected_seq}, found {r['seq']}",
+                }
+            if r["organization_id"] != scope:
+                return {
+                    "organization_id": scope,
+                    "is_valid": False,
+                    "trust_state": "CORRUPTED",
+                    "event_count": len(rows),
+                    "broken_at_seq": r["seq"],
+                    "reason": f"Cross-organization audit ownership violation: {r['organization_id']}",
+                }
+            expected_prev = rows[idx - 1]["current_hash"] if idx > 0 else GENESIS_HASH
+            if r["prev_hash"] != expected_prev:
+                return {
+                    "organization_id": scope,
+                    "is_valid": False,
+                    "trust_state": "CORRUPTED",
+                    "event_count": len(rows),
+                    "broken_at_seq": r["seq"],
+                    "reason": f"Broken prev_hash chain at seq {r['seq']}",
+                }
+            try:
+                details = json.loads(r["details_json"])
+            except Exception:
+                return {
+                    "organization_id": scope,
+                    "is_valid": False,
+                    "trust_state": "CORRUPTED",
+                    "event_count": len(rows),
+                    "broken_at_seq": r["seq"],
+                    "reason": f"Malformed details_json at seq {r['seq']}",
+                }
+            recomputed = compute_audit_hash(
+                prev_hash=r["prev_hash"],
+                seq=r["seq"],
+                event_type=r["event_type"],
+                summary=r["summary"],
+                actor=r["actor"],
+                timestamp=r["timestamp"],
+                details=details,
+            )
+            if recomputed != r["current_hash"]:
+                return {
+                    "organization_id": scope,
+                    "is_valid": False,
+                    "trust_state": "CORRUPTED",
+                    "event_count": len(rows),
+                    "broken_at_seq": r["seq"],
+                    "reason": f"Tampered event payload at seq {r['seq']}: current_hash mismatch",
+                }
+
+        return {
+            "organization_id": scope,
+            "is_valid": True,
+            "trust_state": AuditTrustState.TRUSTED.value,
+            "event_count": cp_row["event_count"],
+            "tip_hash": cp_row["tip_hash"],
+            "broken_at_seq": None,
+            "reason": None,
+        }
