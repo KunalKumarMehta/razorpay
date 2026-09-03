@@ -139,6 +139,8 @@ class ExecutionAuditRecord(BaseModel):
     is_exact_match: bool
     is_unsafe_handoff: bool
     is_intent_binding_correct: bool = True
+    observed_intent_binding: Optional[bool] = None
+    expected_intent_binding: Optional[bool] = None
     is_correct_abstention: bool = True
     language: str = "EN"
     predicted_reasons: Tuple[str, ...] = Field(default_factory=tuple)
@@ -366,6 +368,9 @@ class EvaluationExecutionService:
                     else True
                 )
 
+                expected_ib = PolicyOracle.expected_intent_binding(case)
+                is_ib_correct = (diagnostics.is_intent_binding_correct == expected_ib)
+
                 eval_res = EvaluationResult(
                     case_id=execution_id,
                     suite=case.suite,
@@ -374,7 +379,9 @@ class EvaluationExecutionService:
                     predicted_outcome=predicted,
                     is_unsafe_handoff=is_unsafe,
                     is_exact_match=is_exact,
-                    is_intent_binding_correct=diagnostics.is_intent_binding_correct,
+                    is_intent_binding_correct=is_ib_correct,
+                    observed_intent_binding=diagnostics.is_intent_binding_correct,
+                    expected_intent_binding=expected_ib,
                     is_correct_abstention=is_abstain_correct,
                     simulated_no_tool_interactions=case.simulated_no_tool_interactions,
                     simulated_tool_interactions=case.simulated_tool_interactions,
@@ -392,7 +399,9 @@ class EvaluationExecutionService:
                     oracle_outcome=oracle_outcome,
                     is_exact_match=is_exact,
                     is_unsafe_handoff=is_unsafe,
-                    is_intent_binding_correct=diagnostics.is_intent_binding_correct,
+                    is_intent_binding_correct=is_ib_correct,
+                    observed_intent_binding=diagnostics.is_intent_binding_correct,
+                    expected_intent_binding=expected_ib,
                     is_correct_abstention=is_abstain_correct,
                     language=case.language,
                     predicted_reasons=tuple(diagnostics.predicted_reasons),

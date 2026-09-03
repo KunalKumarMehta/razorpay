@@ -73,6 +73,7 @@ class EvaluationCase(BaseModel):
     replay_grant_after_storage_restart: bool = False
     gold_outcome: PolicyOutcome
     expected_reasons: List[str] = Field(default_factory=list)
+    expected_intent_binding_correct: bool = True
     simulated_no_tool_interactions: int = 7  # Baseline gestures without PayoutProof
     simulated_tool_interactions: int = 3     # Gestures with PayoutProof
 
@@ -289,6 +290,13 @@ class Simulator:
                     else DestinationStatus.UNAPPROVED
                 )
 
+                expected_binding = not (
+                    material_intent_error
+                    or is_unusable
+                    or schema_failure
+                    or mutate_amount_after_grant
+                )
+
                 cases.append(EvaluationCase(
                     case_id=cid,
                     suite="SAFETY",
@@ -316,6 +324,7 @@ class Simulator:
                     replay_grant_after_storage_restart=replay_grant_after_storage_restart,
                     gold_outcome=gold_out,
                     expected_reasons=[primary_reason],
+                    expected_intent_binding_correct=expected_binding,
                     simulated_no_tool_interactions=9,
                     simulated_tool_interactions=2,
                 ))

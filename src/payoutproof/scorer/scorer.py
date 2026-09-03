@@ -1,7 +1,7 @@
 """Independent evaluation scorer and statistical report generator."""
 
 import math
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from pydantic import BaseModel, Field
 
 from payoutproof.core.enums import PolicyOutcome
@@ -33,6 +33,8 @@ class EvaluationResult(BaseModel):
     is_unsafe_handoff: bool
     is_exact_match: bool
     is_intent_binding_correct: bool
+    observed_intent_binding: Optional[bool] = None
+    expected_intent_binding: Optional[bool] = None
     is_correct_abstention: bool
     simulated_no_tool_interactions: int
     simulated_tool_interactions: int
