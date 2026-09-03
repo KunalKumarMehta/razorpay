@@ -445,7 +445,13 @@ class StateMachine:
             )
             updated_evidence = list(state.evidence) + [new_ev]
             updated_findings = [f for f in state.findings if f.name != FindingName.DESTINATION_APPROVAL.value] + [
-                Finding(name=FindingName.DESTINATION_APPROVAL.value, truth_state=TruthState.SUPPORTED, detail="Separately approved under finance policy; exact counterparty and destination bound")
+                Finding(
+                    name=FindingName.DESTINATION_APPROVAL.value,
+                    truth_state=TruthState.SUPPORTED,
+                    detail="Separately approved under finance policy; exact counterparty and destination bound",
+                    # The approval is accepted under this organization's finance policy.
+                    organization_id=state.organization_id,
+                )
             ]
             updated_intent = state.intent.model_copy(update={"destination_status": DestinationStatus.APPROVED_FOR_COUNTERPARTY})
             if updated_intent.status == IntentStatus.CONFIRMED:
@@ -604,9 +610,16 @@ class StateMachine:
                     current_intent_hash=state.intent.intent_hash or "",
                     secret=grant_secret,
                     clock=resolved_clock,
+                    expected_organization_id=state.organization_id,
                 )
                 if not is_valid:
                     return refuse(state, "initiate human handoff", f"grant verification failed: {verify_err}")
+                if state.grant.tenant_id != state.tenant_id or state.grant.organization_id != state.organization_id:
+                    return refuse(
+                        state,
+                        "initiate human handoff",
+                        "grant tenant or organization scope does not match the authoritative case scope",
+                    )
 
             recomputed_intent_hash = compute_intent_hash(state.intent)
             recomputed_snapshot_hash = compute_snapshot_hash(state)
@@ -628,6 +641,7 @@ class StateMachine:
                 case_id=state.case_id or "UNKNOWN",
                 case_version=state.case_version,
                 grant_id=state.grant.grant_id,
+                organization_id=state.organization_id,
             )
             msg = "Fresh operator gesture started one idempotent handoff attempt; maker-checker approval remains downstream."
 

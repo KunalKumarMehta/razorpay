@@ -26,6 +26,18 @@ from payoutproof.core.providers import (
 GRANT_VALIDITY_SECONDS = 300  # 5 minutes
 
 
+class GrantVerificationError(ValueError):
+    """Raised when a Handoff Grant fails verification against authoritative case scope.
+
+    Carries a safe, stable reason string with no exception text so callers can
+    surface it directly without leaking internals.
+    """
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
 class GrantIssuer:
     """Issues single-use HMAC-signed Handoff Grants for eligible cases."""
 
@@ -83,6 +95,13 @@ class GrantIssuer:
         if state.policy.evaluated_snapshot_hash != recomputed_snapshot_hash:
             raise ValueError("Evaluated snapshot hash mismatch: case state was mutated after policy evaluation")
 
+        # Organization scope must agree between the case and its policy result so
+        # the issued grant provably carries the case's organization identity.
+        if state.policy.organization_id != state.organization_id:
+            raise ValueError(
+                "Policy evaluation result organization scope does not match the case organization scope"
+            )
+
         nonce = resolved_nonce_provider.generate_nonce(16)
         grant_id = f"HG-{state.case_id}-{nonce[:8]}"
         now = resolved_clock.now()
@@ -102,11 +121,13 @@ class GrantIssuer:
             nonce=nonce,
             issued_at=issued_at,
             expires_at=expires_at,
+            organization_id=state.organization_id,
         )
 
         return HandoffGrant(
             grant_id=grant_id,
             tenant_id=state.tenant_id,
+            organization_id=state.organization_id,
             case_id=state.case_id,
             bound_intent_hash=state.intent.intent_hash,
             bound_snapshot_hash=snapshot_hash,
@@ -132,8 +153,15 @@ class GrantVerifier:
         *,
         secret: str,
         clock: Optional[ClockProvider] = None,
+        expected_organization_id: Optional[str] = None,
     ) -> Tuple[bool, Optional[str]]:
-        """Verify validity of a Handoff Grant."""
+        """Verify validity of a Handoff Grant.
+
+        When expected_organization_id is supplied, the grant's own organization_id
+        must match exactly; any substitution fails closed. Passing None means
+        "no expected scope asserted" (legacy call sites); use verify_for_case to
+        enforce the authoritative case scope.
+        """
         if not secret or not str(secret).strip():
             return False, "secret is required and cannot be empty to verify Handoff Grant"
         resolved_clock = clock if clock is not None else SystemClock()
@@ -152,7 +180,7 @@ class GrantVerifier:
         except Exception:
             return False, "Invalid grant expiration timestamp"
 
-        # Verify HMAC signature
+        # Verify HMAC signature (binds organization scope when the grant carries one)
         is_sig_valid = verify_grant_signature(
             secret=secret,
             grant_id=grant.grant_id,
@@ -166,12 +194,57 @@ class GrantVerifier:
             issued_at=grant.issued_at,
             expires_at=grant.expires_at,
             signature=grant.signature,
+            organization_id=grant.organization_id,
         )
         if not is_sig_valid:
             return False, "Cryptographic grant signature verification failed"
+
+        # Organization scope check: a grant issued for another organization can
+        # never satisfy a case in a different organization (cross-tenant substitution).
+        if expected_organization_id is not None and grant.organization_id != expected_organization_id:
+            return False, (
+                f"Grant organization scope mismatch: grant is bound to organization "
+                f"'{grant.organization_id}' but the authoritative case scope is '{expected_organization_id}'"
+            )
 
         # Verify bound intent hash matches current intent hash
         if grant.bound_intent_hash != current_intent_hash:
             return False, "Bound intent hash does not match current intent hash (material mutation detected)"
 
         return True, None
+
+    @classmethod
+    def verify_for_case(
+        cls,
+        grant: HandoffGrant,
+        state: RiskCaseState,
+        *,
+        secret: str,
+        clock: Optional[ClockProvider] = None,
+    ) -> None:
+        """Verify a grant against an authoritative RiskCaseState, raising on any failure.
+
+        Fails closed with GrantVerificationError when the grant's tenant or
+        organization identity does not match the case's authoritative scope, so a
+        grant issued for one organization can never be replayed against another.
+        """
+        if grant.tenant_id != state.tenant_id:
+            raise GrantVerificationError(
+                f"Grant tenant mismatch: grant is bound to tenant '{grant.tenant_id}' "
+                f"but the authoritative case tenant is '{state.tenant_id}'"
+            )
+        if grant.organization_id != state.organization_id:
+            raise GrantVerificationError(
+                f"Grant organization scope mismatch: grant is bound to organization "
+                f"'{grant.organization_id}' but the authoritative case scope is '{state.organization_id}'"
+            )
+
+        is_valid, err = cls.verify(
+            grant,
+            state.intent.intent_hash or "",
+            secret=secret,
+            clock=clock,
+            expected_organization_id=state.organization_id,
+        )
+        if not is_valid:
+            raise GrantVerificationError(err or "Grant verification failed")

@@ -308,6 +308,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS handoff_grants (
                     grant_id TEXT PRIMARY KEY,
                     tenant_id TEXT NOT NULL,
+                    organization_id TEXT,
                     case_id TEXT NOT NULL,
                     bound_intent_hash TEXT NOT NULL,
                     bound_snapshot_hash TEXT NOT NULL,
@@ -334,6 +335,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS adapter_attempts (
                     idempotency_key TEXT NOT NULL PRIMARY KEY,
                     case_id TEXT NOT NULL,
+                    organization_id TEXT,
                     grant_id TEXT NOT NULL UNIQUE,
                     status TEXT NOT NULL,
                     decision TEXT NOT NULL,
@@ -349,6 +351,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS pending_approval_items (
                     item_id TEXT NOT NULL PRIMARY KEY,
                     case_id TEXT NOT NULL,
+                    organization_id TEXT,
                     grant_id TEXT NOT NULL UNIQUE,
                     idempotency_key TEXT NOT NULL UNIQUE,
                     counterparty TEXT NOT NULL,
@@ -412,6 +415,18 @@ class Database:
                 conn.execute("ALTER TABLE handoff_grants ADD COLUMN bound_snapshot_hash TEXT NOT NULL DEFAULT '';")
             if "used" not in hg_info:
                 conn.execute("ALTER TABLE handoff_grants ADD COLUMN used INTEGER NOT NULL DEFAULT 0;")
+            if "organization_id" not in hg_info:
+                conn.execute("ALTER TABLE handoff_grants ADD COLUMN organization_id TEXT;")
+
+        # Migrate adapter_attempts schema
+        aa_info = {row["name"]: dict(row) for row in conn.execute("PRAGMA table_info(adapter_attempts)").fetchall()}
+        if aa_info and "organization_id" not in aa_info:
+            conn.execute("ALTER TABLE adapter_attempts ADD COLUMN organization_id TEXT;")
+
+        # Migrate pending_approval_items schema
+        pai_info = {row["name"]: dict(row) for row in conn.execute("PRAGMA table_info(pending_approval_items)").fetchall()}
+        if pai_info and "organization_id" not in pai_info:
+            conn.execute("ALTER TABLE pending_approval_items ADD COLUMN organization_id TEXT;")
 
         # Ensure quarantine table exists
         conn.execute("""
@@ -1082,10 +1097,11 @@ class Database:
             g = state.grant
             conn.execute("""
                 INSERT INTO handoff_grants (
-                    grant_id, tenant_id, case_id, bound_intent_hash, bound_snapshot_hash,
+                    grant_id, tenant_id, organization_id, case_id, bound_intent_hash, bound_snapshot_hash,
                     policy_version, outcome, nonce, issued_at, expires_at, signature, status, used
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(grant_id) DO UPDATE SET
+                    organization_id = excluded.organization_id,
                     used = CASE
                         WHEN handoff_grants.used = 1 THEN 1
                         ELSE excluded.used
@@ -1100,7 +1116,7 @@ class Database:
                         ELSE excluded.status
                     END;
             """, (
-                g.grant_id, g.tenant_id, g.case_id, g.bound_intent_hash,
+                g.grant_id, g.tenant_id, g.organization_id, g.case_id, g.bound_intent_hash,
                 g.bound_snapshot_hash, g.policy_version, g.outcome.value,
                 g.nonce, g.issued_at, g.expires_at, g.signature,
                 g.status.value, 1 if g.used else 0
@@ -1480,6 +1496,7 @@ class Database:
 
     @staticmethod
     def _row_to_pending_item(row: sqlite3.Row) -> PendingApprovalItem:
+        org_id = row["organization_id"] if "organization_id" in row.keys() else None
         return PendingApprovalItem(
             item_id=row["item_id"],
             case_id=row["case_id"],
@@ -1492,6 +1509,7 @@ class Database:
             idempotency_key=row["idempotency_key"],
             created_at=row["created_at"],
             status=row["status"],
+            organization_id=org_id,
         )
 
     def get_pending_item(
@@ -1658,6 +1676,7 @@ class Database:
             case_id=grant.case_id,
             case_version=persisted_case.case_version,
             grant_id=grant.grant_id,
+            organization_id=persisted_case.organization_id,
         )
         if idempotency_key != expected_key:
             return AdapterDecision.GRANT_INVALID_OR_EXPIRED, None, "Idempotency key does not match authoritative case derivation"
@@ -1727,11 +1746,11 @@ class Database:
             )
             conn.execute("""
                 INSERT INTO adapter_attempts (
-                    idempotency_key, grant_id, case_id, attempts, status, decision,
+                    idempotency_key, grant_id, case_id, organization_id, attempts, status, decision,
                     ambiguity_state, pending_item_id, error_code, error_message, created_at, updated_at
-                ) VALUES (?, ?, ?, 1, 'RECONCILIATION_REQUIRED', ?, 'RECONCILIATION_REQUIRED', NULL, 'DOWNSTREAM_TIMEOUT', 'Downstream response timed out; reconciliation required', ?, ?);
+                ) VALUES (?, ?, ?, ?, 1, 'RECONCILIATION_REQUIRED', ?, 'RECONCILIATION_REQUIRED', NULL, 'DOWNSTREAM_TIMEOUT', 'Downstream response timed out; reconciliation required', ?, ?);
             """, (
-                idempotency_key, grant.grant_id, grant.case_id,
+                idempotency_key, grant.grant_id, grant.case_id, persisted_case.organization_id,
                 AdapterDecision.DOWNSTREAM_STATUS_UNKNOWN_NO_RETRY.value,
                 now_iso, now_iso
             ))
@@ -1753,11 +1772,11 @@ class Database:
         authoritative_intent = persisted_case.intent
         conn.execute("""
             INSERT INTO pending_approval_items (
-                item_id, case_id, grant_id, idempotency_key, counterparty, destination,
+                item_id, case_id, organization_id, grant_id, idempotency_key, counterparty, destination,
                 amount, currency, purpose, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_FINANCE_APPROVAL', ?);
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_FINANCE_APPROVAL', ?);
         """, (
-            item_id, grant.case_id, grant.grant_id, idempotency_key,
+            item_id, grant.case_id, persisted_case.organization_id, grant.grant_id, idempotency_key,
             authoritative_intent.counterparty or "", authoritative_intent.destination or "",
             authoritative_intent.amount or "", authoritative_intent.currency or "INR",
             authoritative_intent.purpose or "", now_iso
@@ -1765,11 +1784,11 @@ class Database:
 
         conn.execute("""
             INSERT INTO adapter_attempts (
-                idempotency_key, grant_id, case_id, attempts, status, decision,
+                idempotency_key, grant_id, case_id, organization_id, attempts, status, decision,
                 ambiguity_state, pending_item_id, error_code, error_message, created_at, updated_at
-            ) VALUES (?, ?, ?, 1, 'COMPLETED', ?, 'NONE', ?, NULL, NULL, ?, ?);
+            ) VALUES (?, ?, ?, ?, 1, 'COMPLETED', ?, 'NONE', ?, NULL, NULL, ?, ?);
         """, (
-            idempotency_key, grant.grant_id, grant.case_id,
+            idempotency_key, grant.grant_id, grant.case_id, persisted_case.organization_id,
             AdapterDecision.PENDING_ITEM_CREATED.value, item_id, now_iso, now_iso
         ))
 
@@ -1785,5 +1804,6 @@ class Database:
             idempotency_key=idempotency_key,
             created_at=now_iso,
             status="PENDING_FINANCE_APPROVAL",
+            organization_id=persisted_case.organization_id,
         )
         return AdapterDecision.PENDING_ITEM_CREATED, item, None

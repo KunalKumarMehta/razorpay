@@ -54,6 +54,7 @@ class PendingApprovalItem:
         idempotency_key: str,
         created_at: str,
         status: str = "PENDING_FINANCE_APPROVAL",
+        organization_id: Optional[str] = None,
     ):
         self.item_id = item_id
         self.case_id = case_id
@@ -66,6 +67,7 @@ class PendingApprovalItem:
         self.idempotency_key = idempotency_key
         self.created_at = created_at
         self.status = status
+        self.organization_id = organization_id
 
 
 
@@ -118,6 +120,7 @@ class Finding(BaseModel):
     truth_state: TruthState
     detail: str
     evidence_ref: Optional[str] = None
+    organization_id: Optional[str] = None
 
 
 class PolicyEvaluationResult(BaseModel):
@@ -130,6 +133,7 @@ class PolicyEvaluationResult(BaseModel):
     evaluated_intent_hash: Optional[str] = None
     evaluated_snapshot_hash: Optional[str] = None
     policy_version: str = "PP-POLICY-V1"
+    organization_id: Optional[str] = None
     evaluated_at: Optional[str] = None
     expires_at: Optional[str] = None
 
@@ -140,6 +144,7 @@ class HandoffGrant(BaseModel):
 
     grant_id: str
     tenant_id: str
+    organization_id: Optional[str] = None
     case_id: str
     bound_intent_hash: str
     bound_snapshot_hash: str

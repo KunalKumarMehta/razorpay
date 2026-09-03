@@ -1,11 +1,27 @@
 """Server-owned handoff orchestration service."""
 
-from typing import Optional
+from typing import Any, Optional
+
 from payoutproof.core.models import RiskCaseState
 from payoutproof.core.enums import CasePhase, GrantStatus, HandoffStatus, AdapterDecision
 from payoutproof.case_workflow.state_machine import StateMachine
 from payoutproof.adapters.fake_adapter import FakeApprovalRailAdapter
 from payoutproof.core.crypto import derive_idempotency_key, compute_snapshot_hash
+
+
+def _row_organization(row: Any) -> Optional[str]:
+    """Read the organization scope from a durable row, tolerating a legacy column-less schema.
+
+    Older rows (or a pre-migration table) have no organization_id at all; those
+    read as None so they still match un-scoped legacy cases.
+    """
+    try:
+        keys = row.keys()
+    except Exception:
+        return None
+    if "organization_id" not in keys:
+        return None
+    return row["organization_id"]
 
 
 class HandoffService:
@@ -88,12 +104,15 @@ class HandoffService:
                     or grant_row["issued_at"] != persisted_state.grant.issued_at
                     or grant_row["expires_at"] != persisted_state.grant.expires_at
                     or grant_row["signature"] != persisted_state.grant.signature
+                    or _row_organization(grant_row) != persisted_state.grant.organization_id
                 ):
                     conn.rollback()
                     msg = "Refused “initiate human handoff”: authoritative grant record mismatch."
                     return persisted_state.model_copy(update={
                         "last_change": msg,
                     })
+
+
 
                 curr_state = persisted_state
 
@@ -173,6 +192,7 @@ class HandoffService:
                         case_id=curr_state.case_id or "",
                         case_version=curr_state.case_version,
                         grant_id=curr_state.grant.grant_id,
+                        organization_id=curr_state.organization_id,
                     )
                     attempt_case_id = existing_attempt["case_id"]
                     attempt_idem_key = existing_attempt["idempotency_key"]
@@ -184,6 +204,11 @@ class HandoffService:
                         or attempt_grant_id != curr_state.grant.grant_id
                     ):
                         return fail_recovery_integrity("Attempt correlation mismatch with current authoritative state")
+
+                    # Restart recovery re-checks the organization scope: a durable attempt
+                    # or pending item from another organization can never satisfy this case.
+                    if _row_organization(existing_attempt) != curr_state.organization_id:
+                        return fail_recovery_integrity("Attempt organization scope mismatch with current authoritative state")
 
                     decision_str = existing_attempt["decision"]
                     status_str = existing_attempt["status"]
@@ -214,6 +239,7 @@ class HandoffService:
                             or item_row["grant_id"] != curr_state.grant.grant_id
                             or item_row["idempotency_key"] != expected_idem
                             or item_row["status"] != "PENDING_FINANCE_APPROVAL"
+                            or _row_organization(item_row) != curr_state.organization_id
                         ):
                             return fail_recovery_integrity("Recovery validation failed: pending approval item missing or inconsistent")
 
@@ -314,6 +340,18 @@ class HandoffService:
                     msg = "Refused “initiate human handoff”: case snapshot does not match bound grant snapshot hash."
                     return curr_state.model_copy(update={"last_change": msg})
 
+                # Cross-tenant substitution: the grant on the case must carry the
+                # case's own tenant and organization identity.
+                if (
+                    curr_state.grant.tenant_id != curr_state.tenant_id
+                    or curr_state.grant.organization_id != curr_state.organization_id
+                ):
+                    conn.rollback()
+                    msg = "Refused “initiate human handoff”: grant tenant or organization scope does not match the authoritative case scope."
+                    return curr_state.model_copy(update={
+                        "last_change": msg,
+                    })
+
                 # 4. Check eligibility via pure StateMachine.reduce
                 pending_state = StateMachine.reduce(
                     state=curr_state,
@@ -336,6 +374,7 @@ class HandoffService:
                     case_id=pending_state.case_id or "UNKNOWN",
                     case_version=pending_state.case_version,
                     grant_id=pending_state.grant.grant_id,
+                    organization_id=pending_state.organization_id,
                 )
 
                 # Persist pending state so authoritative case and grant pre-exist for adapter submission

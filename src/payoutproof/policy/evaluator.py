@@ -1,7 +1,7 @@
 """Deterministic Policy Gate evaluator."""
 
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional
+from typing import Any, List, Optional
 from payoutproof.core.models import RiskCaseState, PolicyEvaluationResult
 from payoutproof.core.enums import (
     PolicyOutcome,
@@ -47,14 +47,19 @@ class PolicyGate:
         now_iso = eval_dt.isoformat()
         expires_iso = (eval_dt + timedelta(seconds=GRANT_TTL_SECONDS)).isoformat()
 
+        def result(**fields: Any) -> PolicyEvaluationResult:
+            """Build a result stamped with the case's organization identity and policy version."""
+            fields.setdefault("policy_version", policy_version)
+            fields.setdefault("organization_id", state.organization_id)
+            return PolicyEvaluationResult(**fields)
+
         # 1. Check for integrity failures / structural corruption (BLOCKED)
         if state.request_bundle_status == "TAMPERED":
-            return PolicyEvaluationResult(
+            return result(
                 outcome=PolicyOutcome.BLOCKED,
                 reasons=[ReasonCode.CANONICAL_SNAPSHOT_INTEGRITY_FAILED],
                 next_steps=["Reject this snapshot", "Rebuild from admitted evidence under a fresh case version"],
                 evaluated_intent_hash=None,
-                policy_version=policy_version,
                 evaluated_at=now_iso,
                 expires_at=None,
             )
@@ -69,7 +74,7 @@ class PolicyGate:
             and len(state.evidence) > 0
         )
         if not is_admission_valid:
-            return PolicyEvaluationResult(
+            return result(
                 outcome=None,
                 reasons=[ReasonCode.ADMISSION_AUTHORITY_INCOMPLETE],
                 next_steps=[
@@ -77,7 +82,6 @@ class PolicyGate:
                     "Complete evidence admission before policy evaluation",
                 ],
                 evaluated_intent_hash=None,
-                policy_version=policy_version,
                 evaluated_at=now_iso,
                 expires_at=None,
             )
@@ -87,58 +91,53 @@ class PolicyGate:
         # produced no usable structured signal, so it holds without asserting a
         # model decode failure it did not observe.
         if state.investigation.model_status == "FAILED_SCHEMA_ERROR":
-            return PolicyEvaluationResult(
+            return result(
                 outcome=PolicyOutcome.HOLD,
                 reasons=[ReasonCode.REQUIRED_SIGNAL_UNAVAILABLE],
                 next_steps=["Request a corrected instruction and rerun extraction", "Do not create a payout"],
                 evaluated_intent_hash=None,
-                policy_version=policy_version,
                 evaluated_at=now_iso,
                 expires_at=None,
             )
 
         if state.investigation.model_status in ("FAILED_UNUSABLE_AUDIO", "FAILED_TIMEOUT"):
-            return PolicyEvaluationResult(
+            return result(
                 outcome=PolicyOutcome.HOLD,
                 reasons=[ReasonCode.REQUIRED_SIGNAL_UNAVAILABLE, ReasonCode.MODEL_FAILURE],
                 next_steps=["Ask for a readable text instruction or clearer recording", "Do not create a payout"],
                 evaluated_intent_hash=None,
-                policy_version=policy_version,
                 evaluated_at=now_iso,
                 expires_at=None,
             )
 
         # 3. Check for unconfirmed intent or material intent invalidation (HOLD)
         if state.intent.status == IntentStatus.INVALIDATED:
-            return PolicyEvaluationResult(
+            return result(
                 outcome=PolicyOutcome.HOLD,
                 reasons=[ReasonCode.MATERIAL_INTENT_CHANGED, ReasonCode.PREVIOUS_EVALUATION_INVALIDATED],
                 next_steps=["Confirm the edited Payment Intent", "Run a fresh Policy Gate evaluation"],
                 evaluated_intent_hash=None,
-                policy_version=policy_version,
                 evaluated_at=now_iso,
                 expires_at=None,
             )
 
         if state.intent.status != IntentStatus.CONFIRMED or not state.intent.intent_hash:
-            return PolicyEvaluationResult(
+            return result(
                 outcome=PolicyOutcome.HOLD,
                 reasons=[ReasonCode.REQUIRED_SIGNAL_UNAVAILABLE],
                 next_steps=["Payment Operator confirms every material field"],
                 evaluated_intent_hash=None,
-                policy_version=policy_version,
                 evaluated_at=now_iso,
                 expires_at=None,
             )
 
         recomputed_intent_hash = compute_intent_hash(state.intent)
         if recomputed_intent_hash != state.intent.intent_hash:
-            return PolicyEvaluationResult(
+            return result(
                 outcome=PolicyOutcome.HOLD,
                 reasons=[ReasonCode.MATERIAL_INTENT_CHANGED],
                 next_steps=["Confirm the edited Payment Intent", "Run a fresh Policy Gate evaluation"],
                 evaluated_intent_hash=None,
-                policy_version=policy_version,
                 evaluated_at=now_iso,
                 expires_at=None,
             )
@@ -146,12 +145,11 @@ class PolicyGate:
         # 4. Check for contradictory findings (HOLD)
         has_contradiction = any(f.truth_state == TruthState.CONTRADICTED for f in state.findings)
         if has_contradiction:
-            return PolicyEvaluationResult(
+            return result(
                 outcome=PolicyOutcome.HOLD,
                 reasons=[ReasonCode.MATERIAL_EVIDENCE_CONTRADICTION],
                 next_steps=["Resolve the conflicting destination outside PayoutProof", "Finance Control Owner reviews the conflicting destinations"],
                 evaluated_intent_hash=state.intent.intent_hash,
-                policy_version=policy_version,
                 evaluated_at=now_iso,
                 expires_at=None,
             )
@@ -171,7 +169,7 @@ class PolicyGate:
             )
         )
         if is_replayed or is_consumed_unusable_grant:
-            return PolicyEvaluationResult(
+            return result(
                 outcome=PolicyOutcome.HOLD,
                 reasons=[ReasonCode.REQUIRED_SIGNAL_UNAVAILABLE],
                 next_steps=[
@@ -179,7 +177,6 @@ class PolicyGate:
                     "Do not retry handoff",
                 ],
                 evaluated_intent_hash=None,
-                policy_version=policy_version,
                 evaluated_at=now_iso,
                 expires_at=None,
             )
@@ -190,14 +187,19 @@ class PolicyGate:
             and f.truth_state == TruthState.SUPPORTED
             for f in state.findings
         )
+
+        # An approved destination is valid only inside its own organization: the
+        # approval was accepted under that organization's finance policy. Legacy
+        # un-scoped approvals (organization_id None) satisfy only un-scoped cases.
         has_destination_approval = any(
             f.name in (FindingName.DESTINATION_APPROVAL.value, "Destination approval", "destination_approval")
             and f.truth_state == TruthState.SUPPORTED
+            and f.organization_id == state.organization_id
             for f in state.findings
         ) or state.intent.destination_status == DestinationStatus.APPROVED_FOR_COUNTERPARTY
 
         if not has_callback and not has_destination_approval:
-            return PolicyEvaluationResult(
+            return result(
                 outcome=PolicyOutcome.STEP_UP_REQUIRED,
                 reasons=[ReasonCode.UNAPPROVED_DESTINATION, ReasonCode.INDEPENDENT_VERIFICATION_MISSING],
                 next_steps=[
@@ -205,41 +207,37 @@ class PolicyGate:
                     "Complete the separate policy-governed destination-approval process",
                 ],
                 evaluated_intent_hash=state.intent.intent_hash,
-                policy_version=policy_version,
                 evaluated_at=now_iso,
                 expires_at=None,
             )
 
         if not has_callback:
-            return PolicyEvaluationResult(
+            return result(
                 outcome=PolicyOutcome.STEP_UP_REQUIRED,
                 reasons=[ReasonCode.INDEPENDENT_VERIFICATION_MISSING],
                 next_steps=["Call the counterparty using a known number and confirm the exact intent"],
                 evaluated_intent_hash=state.intent.intent_hash,
-                policy_version=policy_version,
                 evaluated_at=now_iso,
                 expires_at=None,
             )
 
         if not has_destination_approval:
-            return PolicyEvaluationResult(
+            return result(
                 outcome=PolicyOutcome.STEP_UP_REQUIRED,
                 reasons=[ReasonCode.UNAPPROVED_DESTINATION],
                 next_steps=["Complete the separate policy-governed destination-approval process"],
                 evaluated_intent_hash=state.intent.intent_hash,
-                policy_version=policy_version,
                 evaluated_at=now_iso,
                 expires_at=None,
             )
 
         # 7. All requirements satisfied -> ELIGIBLE_FOR_HANDOFF
-        return PolicyEvaluationResult(
+        return result(
             outcome=PolicyOutcome.ELIGIBLE_FOR_HANDOFF,
             reasons=[ReasonCode.REQUIRED_EVIDENCE_SATISFIED, ReasonCode.EXACT_INTENT_FROZEN],
             next_steps=["Payment Operator may freshly initiate handoff into the existing approval rail"],
             evaluated_intent_hash=state.intent.intent_hash,
             evaluated_snapshot_hash=compute_snapshot_hash(state),
-            policy_version=policy_version,
             evaluated_at=now_iso,
             expires_at=expires_iso,
         )

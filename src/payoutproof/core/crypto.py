@@ -146,9 +146,14 @@ def create_grant_signature(
     nonce: str,
     issued_at: str,
     expires_at: str,
+    organization_id: Optional[str] = None,
 ) -> str:
     """Create HMAC-SHA256 signature for a Handoff Grant."""
     message = f"{grant_id}|{tenant_id}|{case_id}|{bound_intent_hash}|{bound_snapshot_hash}|{policy_version}|{outcome}|{nonce}|{issued_at}|{expires_at}"
+    # Tenancy expansion seam: bind the organization scope into the signed payload
+    # only when present so legacy un-scoped grants keep byte-identical signatures.
+    if organization_id is not None:
+        message = f"{message}|ORG[{organization_id}]"
     return hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -165,6 +170,7 @@ def verify_grant_signature(
     issued_at: str,
     expires_at: str,
     signature: str,
+    organization_id: Optional[str] = None,
 ) -> bool:
     """Verify HMAC-SHA256 signature of a Handoff Grant using constant-time comparison."""
     expected_sig = create_grant_signature(
@@ -179,6 +185,7 @@ def verify_grant_signature(
         nonce=nonce,
         issued_at=issued_at,
         expires_at=expires_at,
+        organization_id=organization_id,
     )
     return hmac.compare_digest(expected_sig, signature)
 
@@ -188,9 +195,17 @@ def derive_idempotency_key(
     case_id: str,
     case_version: int,
     grant_id: str,
+    organization_id: Optional[str] = None,
 ) -> str:
-    """Deterministically derive server-owned idempotency key from authoritative fields."""
-    return f"IDEM::{tenant_id}::{case_id}::V{case_version}::{grant_id}"
+    """Deterministically derive server-owned idempotency key from authoritative fields.
+
+    The organization scope is bound into the key only when present, preserving
+    byte-identical legacy keys for un-scoped records while distinguishing
+    organizations that share a tenant.
+    """
+    if organization_id is None:
+        return f"IDEM::{tenant_id}::{case_id}::V{case_version}::{grant_id}"
+    return f"IDEM::{tenant_id}::ORG[{organization_id}]::{case_id}::V{case_version}::{grant_id}"
 
 
 def compute_checkpoint_mac(

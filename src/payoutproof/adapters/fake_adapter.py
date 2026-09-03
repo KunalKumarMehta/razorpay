@@ -133,6 +133,7 @@ class FakeApprovalRailAdapter:
                     case_id=persisted_case.case_id or "",
                     case_version=persisted_case.case_version,
                     grant_id=grant.grant_id,
+                    organization_id=persisted_case.organization_id,
                 )
 
                 decision, item, err = self.db.execute_adapter_submission_tx(
