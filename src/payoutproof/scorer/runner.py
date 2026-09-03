@@ -71,6 +71,7 @@ class RuntimeCaseDiagnostics(BaseModel):
     predicted_outcome: Optional[PolicyOutcome]
     predicted_reasons: List[str]
     is_intent_binding_correct: bool
+    observed_intent_binding: Optional[bool] = None
     model_status: str
     intent_status: str
 
@@ -488,6 +489,9 @@ def _score_case_against_oracle(case: EvaluationCase, diagnostics: RuntimeCaseDia
     is_exact = (predicted == gold_out)
     is_abstain_correct = (predicted in (PolicyOutcome.HOLD, PolicyOutcome.STEP_UP_REQUIRED, PolicyOutcome.BLOCKED)) if gold_out != PolicyOutcome.ELIGIBLE_FOR_HANDOFF else True
 
+    expected_ib = PolicyOracle.expected_intent_binding(case)
+    is_ib_correct = (diagnostics.is_intent_binding_correct == expected_ib)
+
     return EvaluationResult(
         case_id=case.case_id,
         suite=case.suite,
@@ -496,7 +500,9 @@ def _score_case_against_oracle(case: EvaluationCase, diagnostics: RuntimeCaseDia
         predicted_outcome=predicted,
         is_unsafe_handoff=is_unsafe,
         is_exact_match=is_exact,
-        is_intent_binding_correct=diagnostics.is_intent_binding_correct,
+        is_intent_binding_correct=is_ib_correct,
+        observed_intent_binding=diagnostics.is_intent_binding_correct,
+        expected_intent_binding=expected_ib,
         is_correct_abstention=is_abstain_correct,
         simulated_no_tool_interactions=case.simulated_no_tool_interactions,
         simulated_tool_interactions=case.simulated_tool_interactions,

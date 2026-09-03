@@ -64,3 +64,16 @@ class PolicyOracle:
     def is_protective_intervention_required(gold_outcome: PolicyOutcome) -> bool:
         """Protective Intervention Required means gold HOLD or STEP_UP_REQUIRED."""
         return gold_outcome in (PolicyOutcome.HOLD, PolicyOutcome.STEP_UP_REQUIRED)
+
+    @staticmethod
+    def expected_intent_binding(case: EvaluationCase) -> bool:
+        """Compute whether intent binding is independently expected to succeed."""
+        if hasattr(case, "expected_intent_binding_correct"):
+            return bool(case.expected_intent_binding_correct)
+        return not (
+            case.is_unauthorized
+            or case.is_unusable_audio
+            or case.has_material_intent_error
+            or case.is_schema_failure
+            or case.mutate_amount_after_grant
+        )
