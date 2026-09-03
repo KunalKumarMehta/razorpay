@@ -81,6 +81,21 @@ class CreateCaseRequest(BaseModel):
     organization_id: Optional[str] = None
 
 
+ORGANIZATION_HEADER = "X-Organization-Id"
+
+
+def _resolve_organization_id(request: Request) -> Optional[str]:
+    """Resolve the caller's active organization from the X-Organization-Id header.
+
+    Whitespace is stripped; an absent or empty header means the caller has no
+    active organization (None), which matches un-scoped legacy cases only.
+    """
+    raw = request.headers.get(ORGANIZATION_HEADER)
+    if raw is None:
+        return None
+    return raw.strip() or None
+
+
 def _resolve_db(request: Request) -> Database:
     """Resolve database instance preferring app.state over legacy module globals."""
     if hasattr(request.app.state, "db") and request.app.state.db is not None:
@@ -153,8 +168,11 @@ def get_release() -> Dict[str, Any]:
 
 @router.get("/api/cases")
 def list_cases(request: Request) -> List[Dict[str, Any]]:
-    """List existing Risk Cases."""
+    """List existing Risk Cases, filtered to the caller's active organization when scoped."""
     active_db = _resolve_db(request)
+    organization_id = _resolve_organization_id(request)
+    if organization_id is not None:
+        return active_db.list_cases(organization_id=organization_id)
     return active_db.list_cases()
 
 
@@ -163,6 +181,7 @@ def create_case(req: CreateCaseRequest, request: Request) -> RiskCaseState:
     """Initialize a new Risk Case (unadmitted) serialized in a transaction."""
     import uuid
     active_db = _resolve_db(request)
+    organization_id = _resolve_organization_id(request)
     case_id = req.case_id or f"RC-{uuid.uuid4().hex[:8].upper()}"
     with active_db.get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE;")
@@ -173,7 +192,7 @@ def create_case(req: CreateCaseRequest, request: Request) -> RiskCaseState:
             state = StateMachine.initial_state(
                 case_id=case_id,
                 tenant_id=req.tenant_id,
-                organization_id=req.organization_id,
+                organization_id=organization_id if organization_id is not None else req.organization_id,
             )
             active_db.save_case_tx(conn, state)
             conn.commit()
@@ -191,8 +210,19 @@ def create_case(req: CreateCaseRequest, request: Request) -> RiskCaseState:
 
 @router.get("/api/cases/{case_id}")
 def get_case(case_id: str, request: Request) -> RiskCaseState:
-    """Get full state of a Risk Case (read-only; returns 404 if absent)."""
+    """Get full state of a Risk Case (read-only; returns 404 if absent or out of scope).
+
+    Zero-existence oracle: a case that does not exist and a case belonging to a
+    different organization are indistinguishable — both return strictly 404.
+    Cross-tenant access never yields 403 or any hint the case exists.
+    """
     active_db = _resolve_db(request)
+    organization_id = _resolve_organization_id(request)
+
+    scope = active_db.get_case_scope(case_id)
+    if scope is None or (organization_id is not None and scope["organization_id"] != organization_id):
+        raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
+
     try:
         state = active_db.load_case(case_id)
     except AuditLedgerIntegrityError as e:
@@ -239,7 +269,14 @@ def dispatch_action(case_id: str, req: ActionRequest, request: Request) -> RiskC
     clock = getattr(request.app.state, "clock", None)
     nonce_provider = getattr(request.app.state, "nonce_provider", None)
 
-    # 4. Missing case returns 404 for all actions
+    # 4. Missing or out-of-scope case returns 404 for all actions (zero-existence oracle:
+    #    a cross-organization case is reported exactly like a missing one)
+    scope = active_db.get_case_scope(case_id)
+    if scope is None:
+        raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
+    request_organization_id = _resolve_organization_id(request)
+    if request_organization_id is not None and scope["organization_id"] != request_organization_id:
+        raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
     try:
         persisted_case = active_db.load_case(case_id)
     except AuditLedgerIntegrityError as e:
@@ -304,6 +341,11 @@ def dispatch_action(case_id: str, req: ActionRequest, request: Request) -> RiskC
         try:
             current_state = active_db.load_case_tx(conn, case_id)
             if not current_state:
+                raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
+
+            # Scope is re-checked inside the write transaction so a concurrent
+            # re-scope or deletion cannot slip an out-of-scope mutation through.
+            if request_organization_id is not None and current_state.organization_id != request_organization_id:
                 raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
 
             next_state = StateMachine.reduce(

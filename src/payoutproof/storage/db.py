@@ -35,9 +35,18 @@ from payoutproof.audit.chain import GENESIS_HASH
 # Authoritative persistence schema identifier for SQLite tables
 SCHEMA_VERSION = "PP-SCHEMA-V1"
 
+# Sentinel for explicitly querying un-scoped (organization_id IS NULL) rows.
+# Distinct from None, which means "no organization filter" (list everything).
+UNSCOPED = object()
+
 
 class DatabaseSchemaError(Exception):
     """Raised when the database schema has unsupported or incoherent drift."""
+    pass
+
+
+class DatabaseConsistencyError(Exception):
+    """Raised when row columns and state_json disagree on organization scope."""
     pass
 
 
@@ -265,6 +274,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS risk_cases (
                     case_id TEXT PRIMARY KEY,
                     tenant_id TEXT NOT NULL,
+                    organization_id TEXT,
                     case_version INTEGER NOT NULL,
                     phase TEXT NOT NULL,
                     state_json TEXT NOT NULL,
@@ -379,6 +389,13 @@ class Database:
                 conn.execute("ALTER TABLE risk_cases ADD COLUMN created_at TEXT NOT NULL DEFAULT '';")
             if "updated_at" not in rc_info:
                 conn.execute("ALTER TABLE risk_cases ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';")
+            # Organization scoping seam: legacy rows stay NULL (un-scoped, compatible).
+            # Only ALTER when the column is absent so repeated migration is crash-free.
+            if "organization_id" not in rc_info:
+                conn.execute("ALTER TABLE risk_cases ADD COLUMN organization_id TEXT;")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_risk_cases_organization ON risk_cases(organization_id);"
+            )
 
         # Inspect and validate handoff_grants schema
         hg_info = {row["name"]: dict(row) for row in conn.execute("PRAGMA table_info(handoff_grants)").fetchall()}
@@ -698,7 +715,7 @@ class Database:
 
         # 1. Inspect existing state and durable records for this case_id
         existing_case_row = conn.execute(
-            "SELECT tenant_id, phase, state_json FROM risk_cases WHERE case_id = ?",
+            "SELECT tenant_id, organization_id, phase, state_json FROM risk_cases WHERE case_id = ?",
             (state.case_id,),
         ).fetchone()
 
@@ -706,6 +723,12 @@ class Database:
             if state.tenant_id != existing_case_row["tenant_id"]:
                 raise AuditLedgerIntegrityError(
                     f"Candidate tenant_id '{state.tenant_id}' conflicts with authoritative row tenant_id '{existing_case_row['tenant_id']}'"
+                )
+            # Organization scope is checked inside this BEGIN IMMEDIATE transaction,
+            # so a case can never be re-scoped or cross-written after its first write.
+            if state.organization_id != existing_case_row["organization_id"]:
+                raise DatabaseConsistencyError(
+                    f"Candidate organization_id '{state.organization_id}' conflicts with authoritative row organization_id '{existing_case_row['organization_id']}'"
                 )
 
         cp_row = conn.execute(
@@ -885,9 +908,9 @@ class Database:
             state_json = json.dumps(state_dict)
 
             rc_cur = conn.execute("""
-                INSERT INTO risk_cases (case_id, tenant_id, case_version, phase, state_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?);
-            """, (state.case_id, state.tenant_id, state.case_version, state.phase.value, state_json, now_iso, now_iso))
+                INSERT INTO risk_cases (case_id, tenant_id, organization_id, case_version, phase, state_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            """, (state.case_id, state.tenant_id, state.organization_id, state.case_version, state.phase.value, state_json, now_iso, now_iso))
             if rc_cur.rowcount != 1:
                 raise AuditLedgerIntegrityError(f"Failed to insert risk_cases row for case '{state.case_id}': expected 1 row affected, got {rc_cur.rowcount}")
 
@@ -1015,9 +1038,9 @@ class Database:
 
             rc_cur = conn.execute("""
                 UPDATE risk_cases
-                SET case_version = ?, phase = ?, state_json = ?, updated_at = ?
+                SET case_version = ?, phase = ?, organization_id = ?, state_json = ?, updated_at = ?
                 WHERE case_id = ?;
-            """, (state.case_version, state.phase.value, state_json, now_iso, state.case_id))
+            """, (state.case_version, state.phase.value, state.organization_id, state_json, now_iso, state.case_id))
             if rc_cur.rowcount != 1:
                 raise AuditLedgerIntegrityError(f"Failed to update risk_cases row for case '{state.case_id}': expected 1 row affected, got {rc_cur.rowcount}")
 
@@ -1101,7 +1124,10 @@ class Database:
         Hydrates RiskCaseState.audit strictly from verified authoritative audit_events rows.
         Raises AuditLedgerIntegrityError on any verification or corruption failure.
         """
-        row = conn.execute("SELECT case_id, tenant_id, state_json FROM risk_cases WHERE case_id = ?", (case_id,)).fetchone()
+        row = conn.execute(
+            "SELECT case_id, tenant_id, organization_id, state_json FROM risk_cases WHERE case_id = ?",
+            (case_id,),
+        ).fetchone()
         if not row:
             return None
 
@@ -1185,8 +1211,15 @@ class Database:
             raise AuditLedgerIntegrityError(f"state_json case_id '{data.get('case_id')}' conflicts with authoritative row case_id '{row['case_id']}'")
         if data.get("tenant_id") is not None and data.get("tenant_id") != row["tenant_id"]:
             raise AuditLedgerIntegrityError(f"state_json tenant_id '{data.get('tenant_id')}' conflicts with authoritative row tenant_id '{row['tenant_id']}'")
+        # Organization scope must agree between the row column and state_json; NULL (un-scoped
+        # legacy) and an absent key are the same scope, any other disagreement is corruption.
+        if "organization_id" in data and data["organization_id"] != row["organization_id"]:
+            raise DatabaseConsistencyError(
+                f"state_json organization_id '{data.get('organization_id')}' conflicts with authoritative row organization_id '{row['organization_id']}'"
+            )
         data["case_id"] = row["case_id"]
         data["tenant_id"] = row["tenant_id"]
+        data["organization_id"] = row["organization_id"]
         data["audit"] = events
         try:
             return RiskCaseState.model_validate(data)
@@ -1197,6 +1230,26 @@ class Database:
         """Load a Risk Case by ID (non-mutating read)."""
         with self.get_connection() as conn:
             return self.load_case_tx(conn, case_id)
+
+    def get_case_scope(self, case_id: str) -> Optional[Dict[str, Any]]:
+        """Return existence and organization scope of a case row, or None when absent.
+
+        Read-only and unverified by design: lets callers enforce a zero-existence
+        oracle (missing case and cross-organization case are indistinguishable)
+        without leaking integrity diagnostics for cases outside their scope.
+        """
+        with self.get_connection() as conn:
+            row = conn.execute(
+                "SELECT case_id, tenant_id, organization_id FROM risk_cases WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "case_id": row["case_id"],
+                "tenant_id": row["tenant_id"],
+                "organization_id": row["organization_id"],
+            }
 
     def verify_case_audit_tx(self, conn: sqlite3.Connection, case_id: str) -> Optional[Dict[str, Any]]:
         """Verify cryptographic integrity of case audit ledger within a connection."""
@@ -1371,14 +1424,35 @@ class Database:
         with self.get_connection() as conn:
             return self.verify_case_audit_tx(conn, case_id)
 
-    def list_cases(self) -> List[Dict[str, Any]]:
-        """List all cases with summary metadata, verifying integrity per row."""
+    def list_cases(self, organization_id: Optional[str | object] = None) -> List[Dict[str, Any]]:
+        """List cases with summary metadata, verifying integrity per row.
+
+        - organization_id=None: no filter, list every case.
+        - organization_id=<str>: only cases scoped to that organization.
+        - organization_id=UNSCOPED: only legacy rows with organization_id IS NULL
+          (`IS ?` is NULL-safe, so those rows match where `= ?` never would).
+        """
         with self.get_connection() as conn:
-            rows = conn.execute("""
-                SELECT case_id, tenant_id, case_version, phase, updated_at, state_json
-                FROM risk_cases
-                ORDER BY updated_at DESC
-            """).fetchall()
+            if organization_id is None:
+                rows = conn.execute("""
+                    SELECT case_id, tenant_id, organization_id, case_version, phase, updated_at
+                    FROM risk_cases
+                    ORDER BY updated_at DESC
+                """).fetchall()
+            elif organization_id is UNSCOPED:
+                rows = conn.execute("""
+                    SELECT case_id, tenant_id, organization_id, case_version, phase, updated_at
+                    FROM risk_cases
+                    WHERE organization_id IS NULL
+                    ORDER BY updated_at DESC
+                """).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT case_id, tenant_id, organization_id, case_version, phase, updated_at
+                    FROM risk_cases
+                    WHERE organization_id IS ?
+                    ORDER BY updated_at DESC
+                """, (organization_id,)).fetchall()
             results = []
             for r in rows:
                 c_id = r["case_id"]
@@ -1392,17 +1466,10 @@ class Database:
                 else:
                     trust_status = "CORRUPTED"
 
-                org_id = None
-                try:
-                    data = json.loads(r["state_json"])
-                    org_id = data.get("organization_id")
-                except Exception:
-                    pass
-
                 results.append({
                     "case_id": c_id,
                     "tenant_id": r["tenant_id"],
-                    "organization_id": org_id,
+                    "organization_id": r["organization_id"],
                     "case_version": r["case_version"],
                     "phase": r["phase"],
                     "updated_at": r["updated_at"],
