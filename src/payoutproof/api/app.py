@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from payoutproof.core.models import RiskCaseState, AuditEvent
 from payoutproof.core.enums import PolicyOutcome, CasePhase, IntentStatus, DemoFakeAdapterMode
 from payoutproof.core.config import AppConfig, ConfigurationError
+from payoutproof.core.release import get_release_metadata, APPLICATION_VERSION
 from payoutproof.core.providers import ClockProvider, NonceProvider
 from payoutproof.case_workflow.state_machine import StateMachine
 from payoutproof.case_workflow.handoff_service import HandoffService
@@ -111,13 +112,21 @@ router = APIRouter()
 
 @router.get("/api/health")
 def get_health() -> Dict[str, Any]:
-    """Liveness, readiness, and capability status distinguishing liveness from maturity."""
+    """Liveness, readiness, capability status, and secret-free release identity.
+
+    The `release` block pins the exact application, policy, schema, model
+    configuration, and Evaluation Version identifiers for this build. It is
+    safe by construction: ReleaseMetadata contains no secrets, no paths, and
+    no environment data (unlike AppConfig, whose secrets must stay redacted).
+    """
+    release = get_release_metadata()
     return {
         "status": "HEALTHY",
         "service": "PayoutProof Control Plane",
-        "version": "0.1.0",
+        "version": release.application_version,
         "database": "SQLite WAL active",
-        "maturity": "IN_DEVELOPMENT",
+        "maturity": release.maturity,
+        "release": release.to_public_dict(),
         "capabilities": {
             "admission": "IN_DEVELOPMENT",
             "policy_gate": "IN_DEVELOPMENT",
@@ -127,6 +136,18 @@ def get_health() -> Dict[str, Any]:
             "durable_replay_protection": "UNIT_TESTED",
         },
     }
+
+
+@router.get("/api/release")
+def get_release() -> Dict[str, Any]:
+    """Secret-free release identity: application, policy, schema, model config, Evaluation Version.
+
+    Publishes exactly the stable identifiers carried by ReleaseMetadata.
+    Evidence scope is declared honestly: the bound Evaluation Version covers
+    the synthetic structured harnesses only, not held-out or pilot proof.
+    """
+    release = get_release_metadata()
+    return release.to_public_dict()
 
 
 @router.get("/api/cases")
@@ -361,7 +382,7 @@ def create_app(
 
     app_instance = FastAPI(
         title="PayoutProof API",
-        version="0.1.0",
+        version=APPLICATION_VERSION,
         description="Trust Agent and Deterministic Policy Gate for Payment Risk",
     )
 
@@ -410,7 +431,7 @@ def __getattr__(name: str) -> Any:
             config = AppConfig.from_env()
             legacy_instance = FastAPI(
                 title="PayoutProof API",
-                version="0.1.0",
+                version=APPLICATION_VERSION,
                 description="Trust Agent and Deterministic Policy Gate for Payment Risk",
             )
             legacy_instance.add_middleware(

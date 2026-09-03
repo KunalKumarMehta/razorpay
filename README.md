@@ -155,3 +155,72 @@ uv run payoutproof verify-audit --case-id <case-id>
 | **Replay & Concurrency Protection** | Single-use HMAC nonces & idempotency | Partial unit checks with known gaps | **NOT YET EVIDENCED** |
 
 See [handoff_ledger.json](./handoff_ledger.json) for the machine-readable development ledger.
+
+---
+
+## Reproducible Pilot Baseline & Supply Chain
+
+### 1. Clean-Checkout Verification Commands
+
+Every pilot baseline artifact is reproducible from a clean checkout without ad-hoc network access:
+
+```bash
+# 1. Verify dependency lockfile integrity (both Python and Node)
+uv lock --check
+npm --prefix web ci --dry-run
+
+# 2. Run static analysis and formatting checks
+uv run ruff check src tests scripts
+
+# 3. Execute unit and integration tests (281 tests)
+uv run pytest -q -p no:cacheprovider
+
+# 4. Run synthetic evaluation harnesses across all suites
+uv run payoutproof eval --suite dev
+uv run payoutproof eval --suite sealed
+uv run payoutproof eval --suite safety
+
+# 5. Build frontend production assets
+npm --prefix web run build
+```
+
+### 2. Secret-Free Release Metadata Endpoints
+
+PayoutProof exposes stable release and provenance identifiers across public boundaries without leaking secrets, credentials, or machine paths:
+
+- **`GET /api/health`**: Returns service liveness, capability status, database WAL status, and the `release` block.
+- **`GET /api/release`**: Returns the secret-free release identity payload:
+  - `application_version`: Mirrored from `pyproject.toml` (`0.1.0`).
+  - `policy_version`: Deterministic Policy Gate identifier (`PP-POLICY-V1`).
+  - `schema_version`: Authoritative persistence schema version (`PP-SCHEMA-V1`).
+  - `audit_checkpoint_version`: Audit checkpoint domain separator (`PAYOUTPROOF_AUDIT_CHECKPOINT_V1`).
+  - `model_configuration_version`: Bound model configuration (`PP-MODEL-CONFIG-V1-SYNTHETIC-STRUCTURED`).
+  - `evaluation_version`: Immutable Evaluation Version (`PP-EVAL-V1-SYNTHETIC-STRUCTURED`).
+  - `evidence_scope`: Scope declaration (`SYNTHETIC_INVARIANT_HARNESS_ONLY_NOT_HELD_OUT`).
+  - `maturity`: Pipeline maturity (`IN_DEVELOPMENT`).
+
+### 3. Automated Software Bill of Materials (SBOM)
+
+An offline, reproducible SBOM generator parses `uv.lock` and `web/package-lock.json` to produce CycloneDX 1.5 and SPDX 2.3 JSON documents:
+
+```bash
+# Generate CycloneDX 1.5 JSON SBOM
+uv run python scripts/generate_sbom.py --format cyclonedx --output build/sbom.cdx.json
+
+# Generate SPDX 2.3 JSON SBOM
+uv run python scripts/generate_sbom.py --format spdx --output build/sbom.spdx.json
+```
+
+### 4. Pinned Container Build
+
+The application container is defined in a multi-stage `Dockerfile` with pinned base images (`python:3.11.9-slim-bookworm` and `node:20.15.1-bookworm-slim`), unprivileged execution user (`appuser:10001`), and healthcheck probes:
+
+```bash
+docker build -t payoutproof:pilot .
+```
+
+### 5. Branch Protection & Promotion Discipline
+
+- The protected `main` branch remains untouched (`aa3bd57`).
+- All development and evaluation baseline work proceeds on dedicated feature branches (`codex/issue-2-pilot-baseline`) and integration branches (`antigravity/mvp-implementation`).
+- Evaluation results honestly declare synthetic scope; no held-out claims or unverified pilot certifications are published.

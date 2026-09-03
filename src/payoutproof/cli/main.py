@@ -20,6 +20,9 @@ def run_benchmark(suite: str):
     console.print("[dim]Exercises deterministic policy plumbing with synthetic cases. Not held-out product performance or proof.[/dim]\n")
 
     report = EvaluationExecutionService.run_suite(suite)
+    console.print(
+        f"[dim]Evaluation Version: {report.evaluation_version} | Policy Version: {report.policy_version} | Config: {report.model_configuration_version}[/dim]\n"
+    )
 
     rep_info = f", {report.base_case_count}×{report.repetition_count}" if report.repetition_count > 1 else ""
     title_text = (

@@ -11,6 +11,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 from payoutproof.core.enums import PolicyOutcome
+from payoutproof.core.release import get_release_metadata, EVIDENCE_SCOPE
 from payoutproof.simulator.generator import Simulator, EvaluationCase, RuntimeCaseInput
 from payoutproof.oracle.oracle import PolicyOracle
 from payoutproof.scorer.scorer import (
@@ -33,7 +34,7 @@ def execute_runtime_case(
     return runner_module.execute_runtime_case(stimulus, evaluation_time=evaluation_time)
 
 
-SYNTHETIC_SCOPE_DECLARATION = "SYNTHETIC_INVARIANT_HARNESS_ONLY_NOT_HELD_OUT"
+SYNTHETIC_SCOPE_DECLARATION = EVIDENCE_SCOPE
 
 
 class _FrozenDict(dict):
@@ -172,6 +173,9 @@ class SuiteExecutionReport(BenchmarkReport):
 
     suite: str
     scope_declaration: str = SYNTHETIC_SCOPE_DECLARATION
+    evaluation_version: str = Field(default_factory=lambda: get_release_metadata().evaluation_version)
+    policy_version: str = Field(default_factory=lambda: get_release_metadata().policy_version)
+    model_configuration_version: str = Field(default_factory=lambda: get_release_metadata().model_configuration_version)
     repetition_count: int
     base_case_count: int
     total_executions: int
@@ -186,6 +190,11 @@ class SuiteExecutionReport(BenchmarkReport):
 
     @model_validator(mode="after")
     def _freeze_all_mappings(self) -> "SuiteExecutionReport":
+        for required_ver in ("evaluation_version", "policy_version", "model_configuration_version"):
+            val = getattr(self, required_ver)
+            if not isinstance(val, str) or not val.strip():
+                raise ValueError(f"SuiteExecutionReport field '{required_ver}' must be a non-empty string")
+
         for field_name in list(self.__dict__.keys()):
             val = getattr(self, field_name)
             frozen_val = _freeze_value(val)
@@ -406,10 +415,14 @@ class EvaluationExecutionService:
         benchmark_report = EvaluationScorer.score_results(evaluation_results_for_scorer)
         total_executions = len(execution_records)
 
+        release = get_release_metadata()
         return SuiteExecutionReport(
             **benchmark_report.model_dump(),
             suite=suite_key,
             scope_declaration=SYNTHETIC_SCOPE_DECLARATION,
+            evaluation_version=release.evaluation_version,
+            policy_version=release.policy_version,
+            model_configuration_version=release.model_configuration_version,
             repetition_count=repetition_count,
             base_case_count=len(base_cases),
             total_executions=total_executions,

@@ -32,6 +32,9 @@ from payoutproof.core.crypto import (
 )
 from payoutproof.audit.chain import GENESIS_HASH
 
+# Authoritative persistence schema identifier for SQLite tables
+SCHEMA_VERSION = "PP-SCHEMA-V1"
+
 
 class DatabaseSchemaError(Exception):
     """Raised when the database schema has unsupported or incoherent drift."""
