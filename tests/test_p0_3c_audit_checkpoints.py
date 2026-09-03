@@ -679,14 +679,14 @@ def test_api_verify_audit_returns_safe_structured_status(tmp_path):
         db_path=str(db_path),
     )
     app = create_app(config=cfg, db=db)
-    client = TestClient(app)
+    client = TestClient(app, headers={"X-Organization-Id": "org_default"})
 
     # 1. Non-existent case -> 404
     r_missing = client.get("/api/audit/verify/RC-NONEXISTENT")
     assert r_missing.status_code == 404
 
     # 2. Valid case -> 200 with structured trusted status
-    s = StateMachine.initial_state(case_id="RC-API-VALID", tenant_id="tenant_01")
+    s = StateMachine.initial_state(case_id="RC-API-VALID", tenant_id="tenant_01", organization_id="org_default")
     db.save_case(s)
 
     r_valid = client.get("/api/audit/verify/RC-API-VALID")
@@ -721,9 +721,9 @@ def test_api_dispatch_action_on_tampered_case_returns_409(tmp_path):
         db_path=str(db_path),
     )
     app = create_app(config=cfg, db=db)
-    client = TestClient(app)
+    client = TestClient(app, headers={"X-Organization-Id": "org_default"})
 
-    s = StateMachine.initial_state(case_id="RC-API-TAMPER", tenant_id="tenant_01")
+    s = StateMachine.initial_state(case_id="RC-API-TAMPER", tenant_id="tenant_01", organization_id="org_default")
     db.save_case(s)
 
     # Corrupt the audit checkpoint MAC in DB
@@ -849,9 +849,9 @@ def test_malformed_details_json_raises_integrity_error_and_returns_409(tmp_path)
         db_path=str(db_path),
     )
     app = create_app(config=cfg, db=db)
-    client = TestClient(app)
+    client = TestClient(app, headers={"X-Organization-Id": "org_default"})
 
-    s = StateMachine.initial_state(case_id="RC-MALFORMED-01", tenant_id="tenant_01")
+    s = StateMachine.initial_state(case_id="RC-MALFORMED-01", tenant_id="tenant_01", organization_id="org_default")
     db.save_case(s)
 
     with db.get_connection() as conn:
@@ -1126,7 +1126,7 @@ def test_malformed_json_db_and_api(tmp_path):
     """Finding 4: Malformed details_json and state_json fail cleanly without leaking secrets, and map to 409 in API."""
     db_path = tmp_path / "malformed_json.db"
     db = Database(db_path=db_path, audit_checkpoint_secret=TEST_AUDIT_CHECKPOINT_SECRET)
-    s = StateMachine.initial_state(case_id="RC-MAL-01", tenant_id="tenant_01")
+    s = StateMachine.initial_state(case_id="RC-MAL-01", tenant_id="tenant_01", organization_id="org_default")
     db.save_case(s)
 
     # Tamper details_json to malformed string
@@ -1151,7 +1151,7 @@ def test_malformed_json_db_and_api(tmp_path):
         audit_checkpoint_secret=TEST_AUDIT_CHECKPOINT_SECRET,
     )
     app = create_app(config, db=db)
-    client = TestClient(app)
+    client = TestClient(app, headers={"X-Organization-Id": "org_default"})
 
     # GET /api/cases/{case_id} returns 409
     r = client.get("/api/cases/RC-MAL-01")

@@ -36,7 +36,6 @@ from payoutproof.audit.chain import GENESIS_HASH
 SCHEMA_VERSION = "PP-SCHEMA-V1"
 
 # Sentinel for explicitly querying un-scoped (organization_id IS NULL) rows.
-# Distinct from None, which means "no organization filter" (list everything).
 UNSCOPED = object()
 
 
@@ -47,6 +46,15 @@ class DatabaseSchemaError(Exception):
 
 class DatabaseConsistencyError(Exception):
     """Raised when row columns and state_json disagree on organization scope."""
+    pass
+
+
+class UnscopedCaseError(ValueError):
+    """Raised when a new Risk Case is persisted without an organization scope.
+
+    Every newly created case must carry a non-empty organization_id; there is
+    no default organization and no un-scoped creation path.
+    """
     pass
 
 
@@ -735,6 +743,15 @@ class Database:
         ).fetchone()
 
         if existing_case_row:
+            cp_row = conn.execute(
+                "SELECT * FROM case_audit_checkpoints WHERE case_id = ?",
+                (state.case_id,),
+            ).fetchone()
+            if cp_row is None:
+                raise AuditLedgerIntegrityError(f"Case '{state.case_id}' lacks audit checkpoint; mutations refused")
+            if cp_row["trust_state"] != AuditTrustState.TRUSTED.value:
+                raise AuditLedgerIntegrityError(f"Case '{state.case_id}' is in untrusted state '{cp_row['trust_state']}'; mutations refused")
+
             if state.tenant_id != existing_case_row["tenant_id"]:
                 raise AuditLedgerIntegrityError(
                     f"Candidate tenant_id '{state.tenant_id}' conflicts with authoritative row tenant_id '{existing_case_row['tenant_id']}'"
@@ -745,11 +762,16 @@ class Database:
                 raise DatabaseConsistencyError(
                     f"Candidate organization_id '{state.organization_id}' conflicts with authoritative row organization_id '{existing_case_row['organization_id']}'"
                 )
-
-        cp_row = conn.execute(
-            "SELECT * FROM case_audit_checkpoints WHERE case_id = ?",
-            (state.case_id,),
-        ).fetchone()
+        else:
+            # New case creation: reject whitespace-only scope if provided
+            if state.organization_id is not None and not str(state.organization_id).strip():
+                raise UnscopedCaseError(
+                    f"Cannot create case '{state.case_id}' with whitespace-only organization_id"
+                )
+            cp_row = conn.execute(
+                "SELECT * FROM case_audit_checkpoints WHERE case_id = ?",
+                (state.case_id,),
+            ).fetchone()
 
         auth_rows = conn.execute(
             "SELECT * FROM audit_events WHERE case_id = ? ORDER BY seq ASC",
@@ -1440,13 +1462,14 @@ class Database:
         with self.get_connection() as conn:
             return self.verify_case_audit_tx(conn, case_id)
 
-    def list_cases(self, organization_id: Optional[str | object] = None) -> List[Dict[str, Any]]:
+    def list_cases(self, organization_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """List cases with summary metadata, verifying integrity per row.
 
-        - organization_id=None: no filter, list every case.
-        - organization_id=<str>: only cases scoped to that organization.
-        - organization_id=UNSCOPED: only legacy rows with organization_id IS NULL
-          (`IS ?` is NULL-safe, so those rows match where `= ?` never would).
+        - organization_id=<str>: only cases scoped to that organization
+          (`IS ?` is NULL-safe, so a scoped query never matches un-scoped legacy rows).
+        - organization_id=None is not a supported caller mode: listing without
+          an explicit organization scope is rejected. Un-scoped legacy rows have
+          no caller and no access path.
         """
         with self.get_connection() as conn:
             if organization_id is None:
@@ -1466,7 +1489,7 @@ class Database:
                 rows = conn.execute("""
                     SELECT case_id, tenant_id, organization_id, case_version, phase, updated_at
                     FROM risk_cases
-                    WHERE organization_id IS ?
+                    WHERE organization_id = ?
                     ORDER BY updated_at DESC
                 """, (organization_id,)).fetchall()
             results = []

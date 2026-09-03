@@ -147,11 +147,12 @@ def test_reset_reducer_refuses_when_authority_or_grant_or_terminal_phase_exists(
 
 def test_no_implicit_case_creation_on_get_or_dispatch(tmp_path, monkeypatch):
     """GET and POST /api/cases/{case_id}/dispatch on missing case return 404; POST /api/cases is sole creation path."""
-    import sys
-    api_app_mod = sys.modules["payoutproof.api.app"]
+    from payoutproof.api.app import create_app
+    from payoutproof.core.config import AppConfig
     db = Database(db_path=tmp_path / "no_implicit.db", audit_checkpoint_secret=TEST_AUDIT_CHECKPOINT_SECRET)
-    monkeypatch.setattr(api_app_mod, "db", db)
-    client = TestClient(api_app_mod.app)
+    cfg = AppConfig.for_tests(grant_secret=TEST_GRANT_SECRET, audit_checkpoint_secret=TEST_AUDIT_CHECKPOINT_SECRET, db_path=str(tmp_path / "no_implicit.db"))
+    app = create_app(config=cfg, db=db)
+    client = TestClient(app, headers={"X-Organization-Id": "org_default"})
 
     missing_id = "RC-NONEXISTENT-999"
 

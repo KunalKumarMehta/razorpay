@@ -1,12 +1,18 @@
-"""FastAPI control plane API for PayoutProof."""
+"""FastAPI control plane API for PayoutProof.
+
+Organization scope is mandatory: every case, policy, grant, handoff, and audit
+route requires a non-blank X-Organization-Id header. There is no default
+organization and no un-scoped legacy access path. Only /api/health and
+/api/release (secret-free release metadata) are exempt.
+"""
 
 import hmac
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, HTTPException, Request, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from payoutproof.core.models import RiskCaseState, AuditEvent
+from payoutproof.core.models import RiskCaseState
 from payoutproof.core.enums import PolicyOutcome, CasePhase, IntentStatus, DemoFakeAdapterMode
 from payoutproof.core.config import AppConfig, ConfigurationError
 from payoutproof.core.release import get_release_metadata, APPLICATION_VERSION
@@ -22,12 +28,6 @@ from payoutproof.storage.db import (
 from payoutproof.adapters.fake_adapter import FakeApprovalRailAdapter
 from payoutproof.audit.chain import AuditChain
 from payoutproof.scorer.service import EvaluationExecutionService
-
-
-# Compatibility attributes for testing / legacy monkeypatching
-db: Optional[Database] = None
-adapter: Optional[FakeApprovalRailAdapter] = None
-_legacy_app: Optional[FastAPI] = None
 
 
 ALLOWED_ACTIONS = {
@@ -84,43 +84,44 @@ class CreateCaseRequest(BaseModel):
 ORGANIZATION_HEADER = "X-Organization-Id"
 
 
-def _resolve_organization_id(request: Request) -> Optional[str]:
-    """Resolve the caller's active organization from the X-Organization-Id header.
+def _require_organization_id(request: Request) -> str:
+    """Resolve the caller's mandatory active organization from X-Organization-Id.
 
-    Whitespace is stripped; an absent or empty header means the caller has no
-    active organization (None), which matches un-scoped legacy cases only.
+    There is no default organization: an absent, empty, or whitespace-only
+    header is rejected with HTTP 400. The resolved value is stripped and used
+    verbatim as the exclusive scope for every subsequent read and write.
     """
     raw = request.headers.get(ORGANIZATION_HEADER)
     if raw is None:
-        return None
-    return raw.strip() or None
+        raise HTTPException(status_code=400, detail="Missing mandatory organization identity")
+    organization_id = raw.strip()
+    if not organization_id:
+        raise HTTPException(status_code=400, detail="Missing mandatory organization identity")
+    return organization_id
 
 
 def _resolve_db(request: Request) -> Database:
-    """Resolve database instance preferring app.state over legacy module globals."""
-    if hasattr(request.app.state, "db") and request.app.state.db is not None:
-        return request.app.state.db
-    import payoutproof.api.app as app_mod
-    if getattr(app_mod, "db", None) is not None:
-        return app_mod.db  # type: ignore
-    raise HTTPException(status_code=500, detail="Database dependency not configured")
+    """Resolve database instance from app.state (sole owner of dependencies)."""
+    db_instance = getattr(request.app.state, "db", None)
+    if db_instance is None:
+        raise HTTPException(status_code=500, detail="Database dependency not configured")
+    return db_instance
 
 
 def _resolve_adapter(request: Request) -> FakeApprovalRailAdapter:
-    """Resolve action adapter preferring app.state over legacy module globals."""
-    if hasattr(request.app.state, "adapter") and request.app.state.adapter is not None:
-        return request.app.state.adapter
-    import payoutproof.api.app as app_mod
-    if getattr(app_mod, "adapter", None) is not None:
-        return app_mod.adapter  # type: ignore
-    raise HTTPException(status_code=500, detail="Adapter dependency not configured")
+    """Resolve action adapter from app.state (sole owner of dependencies)."""
+    adapter_instance = getattr(request.app.state, "adapter", None)
+    if adapter_instance is None:
+        raise HTTPException(status_code=500, detail="Adapter dependency not configured")
+    return adapter_instance
 
 
 def _resolve_config(request: Request) -> AppConfig:
     """Resolve immutable AppConfig attached to app.state."""
-    if hasattr(request.app.state, "config") and request.app.state.config is not None:
-        return request.app.state.config
-    raise HTTPException(status_code=500, detail="Configuration dependency not configured")
+    config = getattr(request.app.state, "config", None)
+    if config is None:
+        raise HTTPException(status_code=500, detail="Configuration dependency not configured")
+    return config
 
 
 router = APIRouter()
@@ -168,20 +169,36 @@ def get_release() -> Dict[str, Any]:
 
 @router.get("/api/cases")
 def list_cases(request: Request) -> List[Dict[str, Any]]:
-    """List existing Risk Cases, filtered to the caller's active organization when scoped."""
+    """List existing Risk Cases strictly within the caller's active organization."""
     active_db = _resolve_db(request)
-    organization_id = _resolve_organization_id(request)
-    if organization_id is not None:
-        return active_db.list_cases(organization_id=organization_id)
-    return active_db.list_cases()
+    organization_id = _require_organization_id(request)
+    return active_db.list_cases(organization_id=organization_id)
 
 
 @router.post("/api/cases")
 def create_case(req: CreateCaseRequest, request: Request) -> RiskCaseState:
-    """Initialize a new Risk Case (unadmitted) serialized in a transaction."""
+    """Initialize a new Risk Case (unadmitted) serialized in a transaction.
+
+    Organization scope is mandatory: provided via X-Organization-Id header
+    or request body. If both are provided, they must agree. Creation without
+    an explicit organization is rejected with HTTP 400.
+    """
     import uuid
     active_db = _resolve_db(request)
-    organization_id = _resolve_organization_id(request)
+    raw_header = request.headers.get(ORGANIZATION_HEADER)
+    header_org = raw_header.strip() if raw_header else None
+    organization_id = header_org or req.organization_id
+    if not organization_id or not str(organization_id).strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Missing mandatory organization identity",
+        )
+    organization_id = str(organization_id).strip()
+    if req.organization_id is not None and header_org is not None and req.organization_id.strip() != header_org:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Request body organization_id '{req.organization_id}' conflicts with active organization '{header_org}'",
+        )
     case_id = req.case_id or f"RC-{uuid.uuid4().hex[:8].upper()}"
     with active_db.get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE;")
@@ -192,7 +209,7 @@ def create_case(req: CreateCaseRequest, request: Request) -> RiskCaseState:
             state = StateMachine.initial_state(
                 case_id=case_id,
                 tenant_id=req.tenant_id,
-                organization_id=organization_id if organization_id is not None else req.organization_id,
+                organization_id=organization_id,
             )
             active_db.save_case_tx(conn, state)
             conn.commit()
@@ -217,10 +234,10 @@ def get_case(case_id: str, request: Request) -> RiskCaseState:
     Cross-tenant access never yields 403 or any hint the case exists.
     """
     active_db = _resolve_db(request)
-    organization_id = _resolve_organization_id(request)
+    organization_id = _require_organization_id(request)
 
     scope = active_db.get_case_scope(case_id)
-    if scope is None or (organization_id is not None and scope["organization_id"] != organization_id):
+    if scope is None or scope["organization_id"] != organization_id:
         raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
 
     try:
@@ -238,6 +255,9 @@ def dispatch_action(case_id: str, req: ActionRequest, request: Request) -> RiskC
 
     All mutations are serialized through SQLite BEGIN IMMEDIATE transactions.
     """
+    # 0. Organization identity is mandatory before any case or action handling
+    request_organization_id = _require_organization_id(request)
+
     action_type = (req.type or "").strip()
 
     # 1. Reject direct internal outcome command names with HTTP 400
@@ -274,8 +294,7 @@ def dispatch_action(case_id: str, req: ActionRequest, request: Request) -> RiskC
     scope = active_db.get_case_scope(case_id)
     if scope is None:
         raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
-    request_organization_id = _resolve_organization_id(request)
-    if request_organization_id is not None and scope["organization_id"] != request_organization_id:
+    if scope["organization_id"] != request_organization_id:
         raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
     try:
         persisted_case = active_db.load_case(case_id)
@@ -345,7 +364,7 @@ def dispatch_action(case_id: str, req: ActionRequest, request: Request) -> RiskC
 
             # Scope is re-checked inside the write transaction so a concurrent
             # re-scope or deletion cannot slip an out-of-scope mutation through.
-            if request_organization_id is not None and current_state.organization_id != request_organization_id:
+            if current_state.organization_id != request_organization_id:
                 raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
 
             next_state = StateMachine.reduce(
@@ -385,11 +404,21 @@ def dispatch_action(case_id: str, req: ActionRequest, request: Request) -> RiskC
 
 @router.get("/api/audit/verify/{case_id}")
 def verify_audit(case_id: str, request: Request) -> Dict[str, Any]:
-    """Verify cryptographic integrity of the audit chain for a case."""
+    """Verify cryptographic integrity of the audit chain for a case in the caller's organization.
+
+    Zero-existence oracle: an absent case and another organization's case are
+    indistinguishable — both return strictly 404.
+    """
     active_db = _resolve_db(request)
+    organization_id = _require_organization_id(request)
+
+    scope = active_db.get_case_scope(case_id)
+    if scope is None or scope["organization_id"] != organization_id:
+        raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
+
     result = active_db.verify_case_audit(case_id)
     if result is None:
-        raise HTTPException(status_code=404, detail="Case not found")
+        raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
 
     return {
         "case_id": case_id,
@@ -468,30 +497,3 @@ def create_app(
 
     app_instance.include_router(router)
     return app_instance
-
-
-def __getattr__(name: str) -> Any:
-    """Lazy module attribute resolver for backwards-compatible test access."""
-    global _legacy_app
-    if name == "app":
-        if _legacy_app is None:
-            config = AppConfig.from_env()
-            legacy_instance = FastAPI(
-                title="PayoutProof API",
-                version=APPLICATION_VERSION,
-                description="Trust Agent and Deterministic Policy Gate for Payment Risk",
-            )
-            legacy_instance.add_middleware(
-                CORSMiddleware,
-                allow_origins=["*"],
-                allow_credentials=True,
-                allow_methods=["*"],
-                allow_headers=["*"],
-            )
-            legacy_instance.state.config = config
-            legacy_instance.state.db = None
-            legacy_instance.state.adapter = None
-            legacy_instance.include_router(router)
-            _legacy_app = legacy_instance
-        return _legacy_app
-    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")

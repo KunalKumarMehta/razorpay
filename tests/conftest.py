@@ -61,7 +61,7 @@ def app(test_config, isolate_test_database):
 
 @pytest.fixture
 def client(app):
-    return TestClient(app)
+    return TestClient(app, headers={"X-Organization-Id": "org_test"})
 
 
 @pytest.fixture(autouse=True)
@@ -88,10 +88,17 @@ def isolate_test_database(tmp_path, monkeypatch):
         enable_demo_adapter_modes=False,
     )
 
+    # The app module no longer owns legacy db/adapter module globals; the
+    # autouse fixture only needs to keep them *absent* so any accidental
+    # fallback path in payoutproof.api.app fails loudly instead of silently
+    # resolving a stale global.
     app_module = sys.modules.get("payoutproof.api.app")
     if app_module is not None:
-        monkeypatch.setattr(app_module, "db", test_db)
-        monkeypatch.setattr(app_module, "adapter", test_adapter)
-        monkeypatch.setattr(app_module, "_legacy_app", None)
+        for legacy_attr in ("db", "adapter", "_legacy_app"):
+            if hasattr(app_module, legacy_attr):
+                raise RuntimeError(
+                    f"payoutproof.api.app must not expose legacy module attribute "
+                    f"'{legacy_attr}'; unscoped access paths were removed in Issue #6"
+                )
 
     yield test_db

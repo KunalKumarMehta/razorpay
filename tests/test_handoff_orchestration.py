@@ -33,7 +33,7 @@ from tests.helpers import (
 
 @pytest.fixture
 def client(app):
-    return TestClient(app)
+    return TestClient(app, headers={"X-Organization-Id": "org_test"})
 
 
 def _setup_eligible_case_via_api(client: TestClient, case_id: str) -> dict:
@@ -150,7 +150,7 @@ def test_api_rejects_malicious_payload_fields_without_state_mutation(client, mon
         enable_demo_adapter_modes=True,
     )
     demo_app = create_app(config=demo_cfg, db=client.app.state.db)
-    demo_client = TestClient(demo_app)
+    demo_client = TestClient(demo_app, headers={"X-Organization-Id": "org_test"})
     res_arbitrary_mode = demo_client.post(
         f"/api/cases/{case_id}/dispatch",
         json={"type": "INITIATE_HANDOFF", "payload": {"fake_adapter_mode": "ARBITRARY_DECISION"}},
@@ -217,7 +217,7 @@ def test_ambiguity_api_path_enters_reconciliation_and_preserves_eligibility(clie
         enable_demo_adapter_modes=True,
     )
     demo_app = create_app(config=demo_cfg, db=client.app.state.db)
-    demo_client = TestClient(demo_app)
+    demo_client = TestClient(demo_app, headers={"X-Organization-Id": "org_test"})
 
     # Dispatch INITIATE_HANDOFF requesting demo-only ambiguous simulation
     res = demo_client.post(
@@ -520,6 +520,7 @@ def test_malicious_api_payload_idempotency_key_is_http_400_and_derived_key_is_bo
         state_obj.case_id or "",
         state_obj.case_version,
         state_obj.grant.grant_id,
+        organization_id=res_ok.json().get("organization_id"),
     )
     assert res_ok.json()["handoff"]["idempotency_key"] == expected_key
 
@@ -821,7 +822,7 @@ def test_exact_stale_state_crash_recovery_reconstructs_coherent_handoff(tmp_path
     assert recovered.phase == CasePhase.COMPLETE
     assert recovered.handoff.status == HandoffStatus.PENDING_IN_APPROVAL_RAIL
     assert recovered.handoff.attempts >= 1
-    expected_key = derive_idempotency_key(recovered.tenant_id, recovered.case_id or "", recovered.case_version, grant.grant_id)
+    expected_key = derive_idempotency_key(recovered.tenant_id, recovered.case_id or "", recovered.case_version, grant.grant_id, organization_id=recovered.organization_id)
     assert recovered.handoff.idempotency_key == expected_key
     assert recovered.handoff.pending_item_id == item.item_id
     assert recovered.grant.status == GrantStatus.CONSUMED
@@ -927,7 +928,7 @@ def test_fake_adapter_mode_gating_and_disabled_rejection(client, monkeypatch):
         enable_demo_adapter_modes=True,
     )
     demo_app = create_app(config=demo_cfg, db=client.app.state.db)
-    demo_client = TestClient(demo_app)
+    demo_client = TestClient(demo_app, headers={"X-Organization-Id": "org_test"})
     res_enabled = demo_client.post(
         f"/api/cases/{case_id}/dispatch",
         json={"type": "INITIATE_HANDOFF", "payload": {"fake_adapter_mode": "SIMULATE_AMBIGUITY"}},

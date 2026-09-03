@@ -157,9 +157,16 @@ def test_concurrent_api_case_creation_prevents_duplicate_and_returns_409(tmp_pat
         grant_secret=TEST_GRANT_SECRET,
         audit_checkpoint_secret=TEST_AUDIT_CHECKPOINT_SECRET,
     )
-    monkeypatch.setattr(api_app, "db", test_db)
-    monkeypatch.setattr(api_app, "adapter", test_adapter)
-    client = TestClient(api_app.app)
+    from payoutproof.api.app import create_app
+    from payoutproof.core.config import AppConfig
+    cfg = AppConfig.for_tests(
+        grant_secret=TEST_GRANT_SECRET,
+        audit_checkpoint_secret=TEST_AUDIT_CHECKPOINT_SECRET,
+        db_path=str(db_file),
+    )
+    test_app = create_app(config=cfg, db=test_db)
+    test_app.state.adapter = test_adapter
+    client = TestClient(test_app, headers={"X-Organization-Id": "org_default"})
 
     case_id = "RC-CONCURRENT-CREATE"
     results = []
@@ -191,9 +198,16 @@ def test_concurrent_api_mutations_serialize_without_lost_updates(tmp_path, monke
         grant_secret=TEST_GRANT_SECRET,
         audit_checkpoint_secret=TEST_AUDIT_CHECKPOINT_SECRET,
     )
-    monkeypatch.setattr(api_app, "db", test_db)
-    monkeypatch.setattr(api_app, "adapter", test_adapter)
-    client = TestClient(api_app.app)
+    from payoutproof.api.app import create_app
+    from payoutproof.core.config import AppConfig
+    cfg = AppConfig.for_tests(
+        grant_secret=TEST_GRANT_SECRET,
+        audit_checkpoint_secret=TEST_AUDIT_CHECKPOINT_SECRET,
+        db_path=str(db_file),
+    )
+    test_app = create_app(config=cfg, db=test_db)
+    test_app.state.adapter = test_adapter
+    client = TestClient(test_app, headers={"X-Organization-Id": "org_default"})
 
     case_id = "RC-MUT-SERIALIZE"
     client.post("/api/cases", json={"case_id": case_id, "tenant_id": "tenant_01"})

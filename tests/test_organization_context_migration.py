@@ -179,20 +179,19 @@ def test_api_header_scopes_creation_and_listing(tmp_path):
     assert res.status_code == 200
     assert res.json()["organization_id"] == "org_beta"
 
-    # Empty header is treated as no active organization
+    # Empty or whitespace-only header is rejected with HTTP 400
     res = client.post("/api/cases", json={"case_id": "RC-HDR-3"}, headers={"X-Organization-Id": "   "})
-    assert res.status_code == 200
-    assert res.json()["organization_id"] is None
+    assert res.status_code == 400
+    assert "missing mandatory organization identity" in res.json()["detail"].lower()
 
     # Scoped listing only returns the caller's organization
     res = client.get("/api/cases", headers={"X-Organization-Id": "org_alpha"})
     assert res.status_code == 200
     assert [c["case_id"] for c in res.json()] == ["RC-HDR-1"]
 
-    # Un-scoped listing still returns every case
+    # Unscoped listing request without header is rejected with HTTP 400
     res = client.get("/api/cases")
-    assert res.status_code == 200
-    assert {c["case_id"] for c in res.json()} == {"RC-HDR-1", "RC-HDR-2", "RC-HDR-3"}
+    assert res.status_code == 400
 
 
 def test_cross_tenant_get_returns_strict_404(tmp_path):
@@ -249,14 +248,12 @@ def test_cross_tenant_dispatch_returns_strict_404(tmp_path):
 
 
 def test_unscoped_caller_can_reach_legacy_unscoped_case(tmp_path):
-    """A caller with no active organization still reaches un-scoped legacy cases."""
+    """A caller with no active organization is rejected at the API boundary with HTTP 400."""
     client = _make_client(tmp_path)
-    client.post("/api/cases", json={"case_id": "RC-LEGACY-9"})
+    res_post = client.post("/api/cases", json={"case_id": "RC-LEGACY-9"})
+    assert res_post.status_code == 400
+    assert "missing mandatory organization identity" in res_post.json()["detail"].lower()
 
-    res = client.get("/api/cases/RC-LEGACY-9")
-    assert res.status_code == 200
-    assert res.json()["organization_id"] is None
-
-    res = client.get("/api/cases/RC-LEGACY-9", headers={"X-Organization-Id": " org_alpha "})
-    assert res.status_code == 404
-    assert res.json()["detail"] == "Case 'RC-LEGACY-9' not found"
+    res_get = client.get("/api/cases/RC-LEGACY-9")
+    assert res_get.status_code == 400
+    assert "missing mandatory organization identity" in res_get.json()["detail"].lower()

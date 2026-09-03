@@ -175,7 +175,7 @@ def test_api_case_creation_and_retrieval_with_organization(tmp_path):
         audit_checkpoint_secret=TEST_AUDIT_CHECKPOINT_SECRET,
         db_path=str(tmp_path / "api_tenant.db"),
     )
-    client = TestClient(create_app(config=config))
+    client = TestClient(create_app(config=config), headers={"X-Organization-Id": "org_razorpay_pilot"})
 
     # 1. Create with organization_id
     res = client.post("/api/cases", json={

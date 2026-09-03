@@ -328,7 +328,7 @@ def test_env_mutation_after_app_construction_cannot_enable_demo_mode(tmp_path, m
         enable_demo_adapter_modes=False,
     )
     app = create_app(config=config)
-    client = TestClient(app)
+    client = TestClient(app, headers={"X-Organization-Id": "org_default"})
 
     # Initialize a case
     res = client.post("/api/cases", json={"case_id": "RC-DEMO-MUT"})
@@ -380,19 +380,12 @@ def test_multi_app_isolation_with_conflicting_legacy_globals(tmp_path, monkeypat
     )
     app2 = create_app(config=cfg2, db=db2)
 
-    # Inject conflicting module-level legacy globals
-    legacy_db_path = str(tmp_path / "legacy.db")
-    legacy_db = Database(db_path=legacy_db_path, audit_checkpoint_secret="d" * 32)
-    legacy_adapter = FakeApprovalRailAdapter(
-        db=legacy_db,
-        grant_secret="c" * 32,
-        audit_checkpoint_secret="d" * 32,
-    )
-    monkeypatch.setattr(app_mod, "db", legacy_db)
-    monkeypatch.setattr(app_mod, "adapter", legacy_adapter)
+    # Legacy globals db and adapter must not exist on module in Issue #6
+    assert not hasattr(app_mod, "db")
+    assert not hasattr(app_mod, "adapter")
 
-    client1 = TestClient(app1)
-    client2 = TestClient(app2)
+    client1 = TestClient(app1, headers={"X-Organization-Id": "org_app1"})
+    client2 = TestClient(app2, headers={"X-Organization-Id": "org_app2"})
 
     # App 1 creates case
     r1 = client1.post("/api/cases", json={"case_id": "RC-APP1-CASE"})
@@ -410,10 +403,7 @@ def test_multi_app_isolation_with_conflicting_legacy_globals(tmp_path, monkeypat
     assert db2.load_case("RC-APP2-CASE") is not None
     assert db2.load_case("RC-APP1-CASE") is None
 
-    # Verify legacy_db is empty and was never touched
-    assert len(legacy_db.list_cases()) == 0
-    assert legacy_db.load_case("RC-APP1-CASE") is None
-    assert legacy_db.load_case("RC-APP2-CASE") is None
+
 
 
 def test_dataclass_fields_have_repr_false_and_safe_dict():
@@ -494,7 +484,10 @@ def test_pure_import_has_no_app_side_effect():
     """Importing payoutproof.api.app does not eagerly instantiate app or mutate globals."""
     import payoutproof.api.app as app_mod
 
-    # create_app returns an isolated instance and does not overwrite app_mod._legacy_app
+    # Legacy attributes must be completely eliminated from module in Issue #6
+    assert not hasattr(app_mod, "_legacy_app")
+    assert not hasattr(app_mod, "db")
+    assert not hasattr(app_mod, "adapter")
     cfg = AppConfig.for_tests(grant_secret=SECRET_A, audit_checkpoint_secret=SECRET_B)
     app1 = create_app(config=cfg)
-    assert app_mod._legacy_app is not app1
+    assert getattr(app_mod, "_legacy_app", None) is not app1

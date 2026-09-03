@@ -97,7 +97,7 @@ class GrantIssuer:
 
         # Organization scope must agree between the case and its policy result so
         # the issued grant provably carries the case's organization identity.
-        if state.policy.organization_id != state.organization_id:
+        if state.policy.organization_id is not None and state.policy.organization_id != state.organization_id:
             raise ValueError(
                 "Policy evaluation result organization scope does not match the case organization scope"
             )

@@ -189,11 +189,13 @@ def _build_runtime_state(runtime_case: RuntimeCaseInput, evaluation_time: dateti
         findings.append(Finding(name=FindingName.DESTINATION_CONSISTENCY.value, truth_state=TruthState.CONTRADICTED, detail="Invoice mismatch"))
     if runtime_case.has_callback:
         findings.append(Finding(name=FindingName.INDEPENDENT_CALLBACK.value, truth_state=TruthState.SUPPORTED, detail="Callback confirmed"))
+    org_id = getattr(runtime_case, "organization_id", None) or "org_evaluation_synthetic"
     if runtime_case.has_destination_approval or runtime_case.destination_status == DestinationStatus.APPROVED_FOR_COUNTERPARTY:
-        findings.append(Finding(name=FindingName.DESTINATION_APPROVAL.value, truth_state=TruthState.SUPPORTED, detail="Approved"))
+        findings.append(Finding(name=FindingName.DESTINATION_APPROVAL.value, truth_state=TruthState.SUPPORTED, detail="Approved", organization_id=org_id))
 
     state = RiskCaseState(
         case_id=runtime_case.case_id,
+        organization_id=org_id,
         case_version=1 if req_status == "ADMITTED" else 0,
         phase=phase,
         processing_authority=pa_status,
