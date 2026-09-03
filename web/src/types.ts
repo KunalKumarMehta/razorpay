@@ -82,6 +82,7 @@ export interface PolicyEvaluationResult {
   reasons: string[];
   next_steps: string[];
   evaluated_intent_hash: string | null;
+  evaluated_snapshot_hash?: string | null;
   policy_version: string;
   evaluated_at?: string;
   expires_at?: string;
@@ -123,12 +124,29 @@ export interface AuditEvent {
   details: Record<string, any>;
 }
 
+export interface ProcessingAuthorityRecord {
+  data_class: string;
+  source: string;
+  subject_category: string;
+  submitter: string;
+  purpose: string;
+  asserted_authority_ref: string;
+  permitted_uses: string[];
+  processing_route: string;
+  redaction_declaration: string;
+  retention_days: number;
+  legal_hold: boolean;
+  restrictions: string[];
+  is_valid: boolean;
+}
+
 export interface RiskCaseState {
   case_id: string | null;
   case_version: number;
   tenant_id: string;
   phase: CasePhase;
   processing_authority: string;
+  authority_record?: ProcessingAuthorityRecord | null;
   request_bundle_status: string;
   intent: PaymentIntent;
   evidence: EvidenceItem[];

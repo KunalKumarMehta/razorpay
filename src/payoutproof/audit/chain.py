@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import List, Dict, Any, Tuple, Optional
 from payoutproof.core.models import AuditEvent
 from payoutproof.core.crypto import compute_audit_hash
+from payoutproof.core.providers import ClockProvider, SystemClock
 
 GENESIS_HASH = "0000000000000000000000000000000000000000000000000000000000000000"
 
@@ -19,11 +20,13 @@ class AuditChain:
         actor: str = "PayoutProof",
         case_id: Optional[str] = None,
         details: Optional[Dict[str, Any]] = None,
+        clock: Optional[ClockProvider] = None,
     ) -> AuditEvent:
         """Append a new event linked to the previous event hash."""
+        resolved_clock = clock if clock is not None else SystemClock()
         seq = len(events) + 1
         prev_hash = events[-1].current_hash if events else GENESIS_HASH
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = resolved_clock.now().isoformat()
         clean_details = details or {}
 
         current_hash = compute_audit_hash(

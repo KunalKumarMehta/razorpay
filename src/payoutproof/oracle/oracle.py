@@ -1,6 +1,6 @@
 """Independent declarative Policy Oracle for ground truth computation."""
 
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 from payoutproof.core.enums import PolicyOutcome, ReasonCode
 from payoutproof.simulator.generator import EvaluationCase
 
@@ -13,16 +13,41 @@ class PolicyOracle:
     """
 
     @staticmethod
-    def evaluate_expected(case: EvaluationCase) -> Tuple[PolicyOutcome, List[str]]:
-        """Compute expected gold outcome and expected reason codes."""
-        if case.is_tampered or case.is_unauthorized:
+    def evaluate_expected(case: EvaluationCase) -> Tuple[Optional[PolicyOutcome], List[str]]:
+        """Compute expected gold outcome and expected reason codes.
+
+        Decides every scenario from its declared truth flags only; it never
+        inspects product output. Material-intent inconsistencies (CAT1) hold
+        because the intent itself is unreliable, and schema failures (CAT6)
+        hold with the required signal unavailable — distinct from unusable
+        audio, which is additionally a model failure. An admission-rejected
+        case never reaches policy evaluation, so it has no expected policy
+        outcome either: None, matching the product's Admission Rejection —
+        never a false BLOCKED.
+        """
+        if case.is_unauthorized:
+            return None, ["ADMISSION_AUTHORITY_INCOMPLETE"]
+
+        if case.is_tampered:
             return PolicyOutcome.BLOCKED, ["CANONICAL_SNAPSHOT_INTEGRITY_FAILED"]
+
+        if case.has_material_intent_error:
+            return PolicyOutcome.HOLD, ["MATERIAL_INTENT_CHANGED"]
+
+        if case.is_schema_failure:
+            return PolicyOutcome.HOLD, ["REQUIRED_SIGNAL_UNAVAILABLE"]
 
         if case.is_unusable_audio:
             return PolicyOutcome.HOLD, ["REQUIRED_SIGNAL_UNAVAILABLE", "MODEL_FAILURE"]
 
         if case.has_contradiction:
             return PolicyOutcome.HOLD, ["MATERIAL_EVIDENCE_CONTRADICTION"]
+
+        if case.mutate_amount_after_grant:
+            return PolicyOutcome.HOLD, ["PREVIOUS_EVALUATION_INVALIDATED"]
+
+        if case.replay_grant_after_storage_restart:
+            return PolicyOutcome.HOLD, ["REQUIRED_SIGNAL_UNAVAILABLE"]
 
         if not case.has_callback and not case.has_destination_approval:
             return PolicyOutcome.STEP_UP_REQUIRED, ["UNAPPROVED_DESTINATION", "INDEPENDENT_VERIFICATION_MISSING"]

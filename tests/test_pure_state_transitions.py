@@ -2,8 +2,17 @@
 
 import pytest
 from payoutproof.case_workflow.state_machine import StateMachine
-from payoutproof.core.enums import CasePhase, PolicyOutcome, IntentStatus, GrantStatus, HandoffStatus, DestinationStatus
+from payoutproof.core.enums import (
+    CasePhase,
+    PolicyOutcome,
+    IntentStatus,
+    GrantStatus,
+    HandoffStatus,
+    DestinationStatus,
+    AdapterDecision,
+)
 from payoutproof.audit.chain import AuditChain
+from tests.helpers import make_authorized_bundle_action, TEST_GRANT_SECRET
 
 
 def test_full_happy_path_walkthrough():
@@ -11,7 +20,7 @@ def test_full_happy_path_walkthrough():
     assert s.phase == CasePhase.EVIDENCE_ADMISSION
 
     # 1. Admit authorized bundle
-    s = StateMachine.reduce(s, {"type": "ADMIT_AUTHORIZED_BUNDLE", "payload": {"case_id": "RC-TEST-HP"}})
+    s = StateMachine.reduce(s, make_authorized_bundle_action(case_id="RC-TEST-HP"))
     assert s.phase == CasePhase.INVESTIGATION
     assert s.case_version == 1
 
@@ -36,16 +45,20 @@ def test_full_happy_path_walkthrough():
     assert s.phase == CasePhase.READY_FOR_HUMAN_HANDOFF
 
     # 7. Issue grant
-    s = StateMachine.reduce(s, {"type": "ISSUE_GRANT"})
+    s = StateMachine.reduce(s, {"type": "ISSUE_GRANT"}, grant_secret=TEST_GRANT_SECRET)
     assert s.grant is not None
     assert s.grant.status == GrantStatus.ACTIVE
 
     # 8. Operator initiates handoff
-    s = StateMachine.reduce(s, {"type": "INITIATE_HANDOFF"})
+    s = StateMachine.reduce(s, {"type": "INITIATE_HANDOFF"}, grant_secret=TEST_GRANT_SECRET)
     assert s.phase == CasePhase.HANDOFF_IN_PROGRESS
 
-    # 9. Adapter accepts handoff
-    s = StateMachine.reduce(s, {"type": "HANDOFF_ACCEPTED", "payload": {"pending_item_id": "RAIL-001"}})
+    # 9. Server maps adapter decision into internal typed state transition
+    s = StateMachine.apply_adapter_decision(
+        s,
+        AdapterDecision.PENDING_ITEM_CREATED,
+        pending_item_id="RAIL-001",
+    )
     assert s.phase == CasePhase.COMPLETE
     assert s.grant.status == GrantStatus.CONSUMED
     assert s.handoff.status == HandoffStatus.PENDING_IN_APPROVAL_RAIL
@@ -57,13 +70,13 @@ def test_full_happy_path_walkthrough():
 
 def test_material_edit_invalidates_evaluation_and_grant():
     s = StateMachine.initial_state(case_id="RC-TEST-MUT")
-    s = StateMachine.reduce(s, {"type": "ADMIT_AUTHORIZED_BUNDLE"})
+    s = StateMachine.reduce(s, make_authorized_bundle_action(case_id="RC-TEST-MUT"))
     s = StateMachine.reduce(s, {"type": "EXTRACT_INTENT"})
     s = StateMachine.reduce(s, {"type": "CONFIRM_INTENT"})
     s = StateMachine.reduce(s, {"type": "ADD_CALLBACK_EVIDENCE"})
     s = StateMachine.reduce(s, {"type": "ADD_DESTINATION_APPROVAL"})
     s = StateMachine.reduce(s, {"type": "EVALUATE_POLICY"})
-    s = StateMachine.reduce(s, {"type": "ISSUE_GRANT"})
+    s = StateMachine.reduce(s, {"type": "ISSUE_GRANT"}, grant_secret=TEST_GRANT_SECRET)
 
     assert s.policy.outcome == PolicyOutcome.ELIGIBLE_FOR_HANDOFF
     assert s.grant.status == GrantStatus.ACTIVE
@@ -77,6 +90,6 @@ def test_material_edit_invalidates_evaluation_and_grant():
     assert s.phase == CasePhase.OPERATOR_INTERVENTION
 
     # Trying to initiate handoff with invalidated grant must be refused
-    s_refused = StateMachine.reduce(s, {"type": "INITIATE_HANDOFF"})
+    s_refused = StateMachine.reduce(s, {"type": "INITIATE_HANDOFF"}, grant_secret=TEST_GRANT_SECRET)
     assert "Refused" in s_refused.last_change
     assert s_refused.handoff.status == HandoffStatus.NOT_STARTED

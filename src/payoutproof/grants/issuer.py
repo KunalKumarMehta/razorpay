@@ -3,15 +3,26 @@
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
 from payoutproof.core.models import RiskCaseState, HandoffGrant
-from payoutproof.core.enums import PolicyOutcome, GrantStatus
+from payoutproof.core.enums import (
+    PolicyOutcome,
+    GrantStatus,
+    CasePhase,
+    ProcessingAuthorityStatus,
+)
 from payoutproof.core.crypto import (
     generate_nonce,
     create_grant_signature,
     verify_grant_signature,
     compute_snapshot_hash,
+    compute_intent_hash,
+)
+from payoutproof.core.providers import (
+    ClockProvider,
+    NonceProvider,
+    SystemClock,
+    SystemNonce,
 )
 
-DEFAULT_GRANT_SECRET = "payoutproof-local-grant-signing-secret-2026"
 GRANT_VALIDITY_SECONDS = 300  # 5 minutes
 
 
@@ -22,25 +33,62 @@ class GrantIssuer:
     def issue_grant(
         cls,
         state: RiskCaseState,
-        secret: str = DEFAULT_GRANT_SECRET,
+        *,
+        secret: str,
         validity_seconds: int = GRANT_VALIDITY_SECONDS,
+        clock: Optional[ClockProvider] = None,
+        nonce_provider: Optional[NonceProvider] = None,
     ) -> HandoffGrant:
         """Issue a fresh Handoff Grant bound to case, intent hash, and snapshot hash."""
+        if not secret or not str(secret).strip():
+            raise ValueError("secret is required and cannot be empty to issue Handoff Grant")
+        resolved_clock = clock if clock is not None else SystemClock()
+        resolved_nonce_provider = nonce_provider if nonce_provider is not None else SystemNonce()
+
+        # 0. Check processing authority and admitted evidence
+        is_admission_valid = (
+            state.request_bundle_status == "ADMITTED"
+            and state.phase != CasePhase.ADMISSION_REJECTED
+            and state.processing_authority == ProcessingAuthorityStatus.VALID
+            and state.authority_record is not None
+            and state.authority_record.is_valid
+            and len(state.evidence) > 0
+        )
+        if not is_admission_valid:
+            raise ValueError("Cannot issue Handoff Grant without valid processing authority and admitted evidence")
+
         if state.policy.outcome != PolicyOutcome.ELIGIBLE_FOR_HANDOFF:
             raise ValueError(f"Cannot issue Handoff Grant for case with policy outcome {state.policy.outcome}")
 
-        if not state.intent.intent_hash or state.policy.evaluated_intent_hash != state.intent.intent_hash:
-            raise ValueError("Evaluated intent hash mismatch or intent not frozen")
+        if not state.policy.policy_version or not str(state.policy.policy_version).strip():
+            raise ValueError("Policy evaluation version is required to issue Handoff Grant")
 
         if not state.case_id:
             raise ValueError("Case ID is required to issue Handoff Grant")
 
-        nonce = generate_nonce(16)
+        if not state.intent.intent_hash:
+            raise ValueError("Payment Intent must be confirmed and hashed before issuing grant")
+
+        recomputed_intent_hash = compute_intent_hash(state.intent)
+        if recomputed_intent_hash != state.intent.intent_hash:
+            raise ValueError("Recomputed intent hash mismatch; Payment Intent was mutated after confirmation")
+
+        if state.policy.evaluated_intent_hash != state.intent.intent_hash:
+            raise ValueError("Evaluated intent hash mismatch or intent not frozen")
+
+        if not state.policy.evaluated_snapshot_hash:
+            raise ValueError("Policy evaluation result is missing evaluated_snapshot_hash")
+
+        recomputed_snapshot_hash = compute_snapshot_hash(state)
+        if state.policy.evaluated_snapshot_hash != recomputed_snapshot_hash:
+            raise ValueError("Evaluated snapshot hash mismatch: case state was mutated after policy evaluation")
+
+        nonce = resolved_nonce_provider.generate_nonce(16)
         grant_id = f"HG-{state.case_id}-{nonce[:8]}"
-        now = datetime.now(timezone.utc)
+        now = resolved_clock.now()
         issued_at = now.isoformat()
         expires_at = (now + timedelta(seconds=validity_seconds)).isoformat()
-        snapshot_hash = compute_snapshot_hash(state)
+        snapshot_hash = recomputed_snapshot_hash
 
         signature = create_grant_signature(
             secret=secret,
@@ -81,9 +129,15 @@ class GrantVerifier:
         cls,
         grant: HandoffGrant,
         current_intent_hash: str,
-        secret: str = DEFAULT_GRANT_SECRET,
+        *,
+        secret: str,
+        clock: Optional[ClockProvider] = None,
     ) -> Tuple[bool, Optional[str]]:
         """Verify validity of a Handoff Grant."""
+        if not secret or not str(secret).strip():
+            return False, "secret is required and cannot be empty to verify Handoff Grant"
+        resolved_clock = clock if clock is not None else SystemClock()
+
         if grant.status != GrantStatus.ACTIVE:
             return False, f"Grant is not active (status: {grant.status})"
 
@@ -93,10 +147,10 @@ class GrantVerifier:
         # Check expiration
         try:
             expires_dt = datetime.fromisoformat(grant.expires_at)
-            if datetime.now(timezone.utc) > expires_dt:
+            if resolved_clock.now() > expires_dt:
                 return False, "Grant has expired"
-        except Exception as e:
-            return False, f"Invalid expiration timestamp: {e}"
+        except Exception:
+            return False, "Invalid grant expiration timestamp"
 
         # Verify HMAC signature
         is_sig_valid = verify_grant_signature(

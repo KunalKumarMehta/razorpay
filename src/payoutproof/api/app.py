@@ -1,38 +1,72 @@
 """FastAPI control plane API for PayoutProof."""
 
+import hmac
 from typing import Dict, Any, Optional, List
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Request, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from payoutproof.core.models import RiskCaseState, AuditEvent
-from payoutproof.core.enums import PolicyOutcome, CasePhase, IntentStatus
+from payoutproof.core.enums import PolicyOutcome, CasePhase, IntentStatus, DemoFakeAdapterMode
+from payoutproof.core.config import AppConfig, ConfigurationError
+from payoutproof.core.providers import ClockProvider, NonceProvider
 from payoutproof.case_workflow.state_machine import StateMachine
-from payoutproof.storage.db import Database
+from payoutproof.case_workflow.handoff_service import HandoffService
+from payoutproof.storage.db import (
+    Database,
+    StaleCaseStateError,
+    GrantTransitionError,
+    AuditLedgerIntegrityError,
+)
 from payoutproof.adapters.fake_adapter import FakeApprovalRailAdapter
 from payoutproof.audit.chain import AuditChain
-from payoutproof.simulator.generator import Simulator
-from payoutproof.scorer.scorer import EvaluationScorer
-from payoutproof.grants.issuer import DEFAULT_GRANT_SECRET
+from payoutproof.scorer.service import EvaluationExecutionService
 
-app = FastAPI(
-    title="PayoutProof API",
-    version="0.1.0",
-    description="Trust Agent and Deterministic Policy Gate for Payment Risk",
-)
 
-# Enable CORS for local Vite dev server
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Compatibility attributes for testing / legacy monkeypatching
+db: Optional[Database] = None
+adapter: Optional[FakeApprovalRailAdapter] = None
+_legacy_app: Optional[FastAPI] = None
 
-# Global in-memory / SQLite singletons
-db = Database()
-adapter = FakeApprovalRailAdapter(grant_secret=DEFAULT_GRANT_SECRET)
+
+ALLOWED_ACTIONS = {
+    "RESET",
+    "ADMIT_AUTHORIZED_BUNDLE",
+    "SUBMIT_UNAUTHORIZED_BUNDLE",
+    "EXTRACT_INTENT",
+    "FAIL_MODEL",
+    "CONFIRM_INTENT",
+    "ADD_CALLBACK_EVIDENCE",
+    "ADD_DESTINATION_APPROVAL",
+    "ADD_CONTRADICTION",
+    "SUBMIT_TAMPERED_SNAPSHOT",
+    "EVALUATE_POLICY",
+    "ISSUE_GRANT",
+    "EDIT_AMOUNT",
+    "MODIFY_INTENT",
+    "INITIATE_HANDOFF",
+}
+
+REMOVED_OUTCOME_COMMANDS = {
+    "HANDOFF_ACCEPTED",
+    "HANDOFF_AMBIGUOUS",
+    "REPLAY_GRANT",
+}
+
+DISALLOWED_PAYLOAD_FIELDS = {
+    "pending_item_id",
+    "adapter_decision",
+    "outcome",
+    "grant_status",
+    "used",
+    "state",
+    "phase",
+    "case_version",
+    "status",
+    "last_adapter_decision",
+    "policy_outcome",
+    "idempotency_key",
+}
 
 
 class ActionRequest(BaseModel):
@@ -45,99 +79,351 @@ class CreateCaseRequest(BaseModel):
     tenant_id: str = "tenant_default"
 
 
-@app.get("/api/health")
+def _resolve_db(request: Request) -> Database:
+    """Resolve database instance preferring app.state over legacy module globals."""
+    if hasattr(request.app.state, "db") and request.app.state.db is not None:
+        return request.app.state.db
+    import payoutproof.api.app as app_mod
+    if getattr(app_mod, "db", None) is not None:
+        return app_mod.db  # type: ignore
+    raise HTTPException(status_code=500, detail="Database dependency not configured")
+
+
+def _resolve_adapter(request: Request) -> FakeApprovalRailAdapter:
+    """Resolve action adapter preferring app.state over legacy module globals."""
+    if hasattr(request.app.state, "adapter") and request.app.state.adapter is not None:
+        return request.app.state.adapter
+    import payoutproof.api.app as app_mod
+    if getattr(app_mod, "adapter", None) is not None:
+        return app_mod.adapter  # type: ignore
+    raise HTTPException(status_code=500, detail="Adapter dependency not configured")
+
+
+def _resolve_config(request: Request) -> AppConfig:
+    """Resolve immutable AppConfig attached to app.state."""
+    if hasattr(request.app.state, "config") and request.app.state.config is not None:
+        return request.app.state.config
+    raise HTTPException(status_code=500, detail="Configuration dependency not configured")
+
+
+router = APIRouter()
+
+
+@router.get("/api/health")
 def get_health() -> Dict[str, Any]:
-    """Liveness, readiness, and capability status."""
+    """Liveness, readiness, and capability status distinguishing liveness from maturity."""
     return {
         "status": "HEALTHY",
         "service": "PayoutProof Control Plane",
         "version": "0.1.0",
         "database": "SQLite WAL active",
+        "maturity": "IN_DEVELOPMENT",
         "capabilities": {
-            "admission": "READY",
-            "policy_gate": "READY",
-            "grant_issuer": "READY",
-            "fake_adapter": "READY",
-            "audit_chain": "READY",
-        }
+            "admission": "IN_DEVELOPMENT",
+            "policy_gate": "IN_DEVELOPMENT",
+            "grant_issuer": "IN_DEVELOPMENT",
+            "fake_adapter": "IN_DEVELOPMENT",
+            "audit_chain": "IN_DEVELOPMENT",
+            "durable_replay_protection": "UNIT_TESTED",
+        },
     }
 
 
-@app.get("/api/cases")
-def list_cases() -> List[Dict[str, Any]]:
+@router.get("/api/cases")
+def list_cases(request: Request) -> List[Dict[str, Any]]:
     """List existing Risk Cases."""
-    return db.list_cases()
+    active_db = _resolve_db(request)
+    return active_db.list_cases()
 
 
-@app.post("/api/cases")
-def create_case(req: CreateCaseRequest) -> RiskCaseState:
-    """Initialize a new Risk Case."""
-    case_id = req.case_id or f"RC-DEMO-{Simulator.generate_dev_corpus()[0].case_id.split('-')[-1]}"
-    state = StateMachine.initial_state(case_id=case_id, tenant_id=req.tenant_id)
-    db.save_case(state)
-    return state
+@router.post("/api/cases")
+def create_case(req: CreateCaseRequest, request: Request) -> RiskCaseState:
+    """Initialize a new Risk Case (unadmitted) serialized in a transaction."""
+    import uuid
+    active_db = _resolve_db(request)
+    case_id = req.case_id or f"RC-{uuid.uuid4().hex[:8].upper()}"
+    with active_db.get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE;")
+        try:
+            existing = active_db.load_case_tx(conn, case_id)
+            if existing is not None:
+                raise HTTPException(status_code=409, detail=f"Case '{case_id}' already exists")
+            state = StateMachine.initial_state(case_id=case_id, tenant_id=req.tenant_id)
+            active_db.save_case_tx(conn, state)
+            conn.commit()
+            return state
+        except AuditLedgerIntegrityError as e:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail=f"Audit ledger integrity failure: {e}")
+        except HTTPException:
+            conn.rollback()
+            raise
+        except Exception:
+            conn.rollback()
+            raise
 
 
-@app.get("/api/cases/{case_id}")
-def get_case(case_id: str) -> RiskCaseState:
-    """Get full state of a Risk Case."""
-    state = db.load_case(case_id)
+@router.get("/api/cases/{case_id}")
+def get_case(case_id: str, request: Request) -> RiskCaseState:
+    """Get full state of a Risk Case (read-only; returns 404 if absent)."""
+    active_db = _resolve_db(request)
+    try:
+        state = active_db.load_case(case_id)
+    except AuditLedgerIntegrityError as e:
+        raise HTTPException(status_code=409, detail=f"Audit ledger integrity failure: {e}")
     if not state:
-        # If not found, initialize a fresh demo case
-        state = StateMachine.initial_state(case_id=case_id)
-        db.save_case(state)
+        raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
     return state
 
 
-@app.post("/api/cases/{case_id}/dispatch")
-def dispatch_action(case_id: str, req: ActionRequest) -> RiskCaseState:
-    """Dispatch a lifecycle transition action to a Risk Case."""
-    current_state = db.load_case(case_id)
-    if not current_state:
-        current_state = StateMachine.initial_state(case_id=case_id)
+@router.post("/api/cases/{case_id}/dispatch")
+def dispatch_action(case_id: str, req: ActionRequest, request: Request) -> RiskCaseState:
+    """Dispatch a lifecycle transition action to a Risk Case.
 
-    # Apply pure state transition
-    next_state = StateMachine.reduce(
-        state=current_state,
-        action={"type": req.type, "payload": req.payload},
-        adapter=adapter,
-        grant_secret=DEFAULT_GRANT_SECRET,
-    )
+    All mutations are serialized through SQLite BEGIN IMMEDIATE transactions.
+    """
+    action_type = (req.type or "").strip()
 
-    # Persist updated state and audit events
-    db.save_case(next_state)
-    return next_state
+    # 1. Reject direct internal outcome command names with HTTP 400
+    if action_type in REMOVED_OUTCOME_COMMANDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Direct outcome command '{action_type}' has been removed from API. Outcomes are server-owned.",
+        )
+
+    # 2. Reject unsupported actions with HTTP 400
+    if action_type not in ALLOWED_ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Malformed or unsupported action command type: '{req.type}'",
+        )
+
+    # 3. Reject client payload fields such as pending_item_id, adapter_decision, outcome, grant_status, used, or state overrides
+    payload = req.payload or {}
+    disallowed_found = [k for k in payload.keys() if k in DISALLOWED_PAYLOAD_FIELDS]
+    if disallowed_found:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Disallowed client payload fields: {disallowed_found}. Clients cannot author adapter outcomes or state overrides.",
+        )
+
+    active_db = _resolve_db(request)
+    active_adapter = _resolve_adapter(request)
+    config = _resolve_config(request)
+    clock = getattr(request.app.state, "clock", None)
+    nonce_provider = getattr(request.app.state, "nonce_provider", None)
+
+    # 4. Missing case returns 404 for all actions
+    try:
+        persisted_case = active_db.load_case(case_id)
+    except AuditLedgerIntegrityError as e:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Audit ledger integrity failure: {e}",
+        )
+    if not persisted_case:
+        raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
+
+    # 5. Reject fake_adapter_mode for non-handoff actions or when disabled
+    fake_adapter_mode = payload.get("fake_adapter_mode")
+    if fake_adapter_mode is not None:
+        if action_type != "INITIATE_HANDOFF":
+            raise HTTPException(
+                status_code=400,
+                detail="fake_adapter_mode is only permitted for INITIATE_HANDOFF",
+            )
+        if not config.enable_demo_adapter_modes:
+            raise HTTPException(
+                status_code=400,
+                detail="fake_adapter_mode simulation is disabled. Demo simulation modes are only permitted in local demo mode.",
+            )
+
+    # 6. Handle INITIATE_HANDOFF via server-owned HandoffService (which opens its own BEGIN IMMEDIATE)
+    if action_type == "INITIATE_HANDOFF":
+        simulate_ambiguity = False
+        if fake_adapter_mode is not None:
+            try:
+                mode_enum = DemoFakeAdapterMode(fake_adapter_mode)
+                simulate_ambiguity = (mode_enum == DemoFakeAdapterMode.SIMULATE_AMBIGUITY)
+            except (ValueError, KeyError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid fake_adapter_mode '{fake_adapter_mode}'. Only {[m.value for m in DemoFakeAdapterMode]} is permitted.",
+                )
+
+        try:
+            next_state = HandoffService.execute_handoff(
+                state=persisted_case,
+                adapter=active_adapter,
+                grant_secret=config.grant_secret,
+                simulate_ambiguity=simulate_ambiguity,
+            )
+            return next_state
+        except AuditLedgerIntegrityError as e:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Audit ledger integrity failure: {e}",
+            )
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(
+                status_code=500,
+                detail="Internal error during handoff processing; operation aborted safely fail-closed.",
+            )
+
+    # 7. For all other mutating actions, serialize in an explicit BEGIN IMMEDIATE transaction
+    with active_db.get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE;")
+        try:
+            current_state = active_db.load_case_tx(conn, case_id)
+            if not current_state:
+                raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
+
+            next_state = StateMachine.reduce(
+                state=current_state,
+                action={"type": action_type, "payload": payload},
+                grant_secret=config.grant_secret,
+                clock=clock,
+                nonce_provider=nonce_provider,
+            )
+
+            # Persist updated state and audit events
+            active_db.save_case_tx(conn, next_state)
+            conn.commit()
+            return next_state
+        except AuditLedgerIntegrityError as e:
+            conn.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail=f"Audit ledger integrity failure: {e}",
+            )
+        except (StaleCaseStateError, GrantTransitionError) as e:
+            conn.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail=f"State conflict: {e}",
+            )
+        except HTTPException:
+            conn.rollback()
+            raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Internal error during action dispatch: {e}",
+            )
 
 
-@app.get("/api/audit/verify/{case_id}")
-def verify_audit(case_id: str) -> Dict[str, Any]:
+@router.get("/api/audit/verify/{case_id}")
+def verify_audit(case_id: str, request: Request) -> Dict[str, Any]:
     """Verify cryptographic integrity of the audit chain for a case."""
-    state = db.load_case(case_id)
-    if not state:
+    active_db = _resolve_db(request)
+    result = active_db.verify_case_audit(case_id)
+    if result is None:
         raise HTTPException(status_code=404, detail="Case not found")
 
-    is_valid, broken_seq, reason = AuditChain.verify_chain(state.audit)
     return {
         "case_id": case_id,
-        "total_events": len(state.audit),
-        "is_valid": is_valid,
-        "broken_at_seq": broken_seq,
-        "reason": reason,
+        "total_events": result["event_count"],
+        "event_count": result["event_count"],
+        "is_valid": result["is_valid"],
+        "trust_state": result["trust_state"],
+        "broken_at_seq": result.get("broken_at_seq"),
+        "reason": result.get("reason"),
     }
 
 
-@app.post("/api/evaluate/run")
+@router.post("/api/evaluate/run")
 def run_evaluation(suite: str = "dev") -> Dict[str, Any]:
     """Run an evaluation benchmark suite and return aggregate statistical report."""
-    from payoutproof.scorer.runner import execute_case_under_test
+    try:
+        report = EvaluationExecutionService.run_suite(suite)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return report.model_dump(mode="json")
 
-    if suite.lower() == "sealed":
-        cases = Simulator.generate_sealed_corpus()
-    elif suite.lower() == "safety":
-        cases = Simulator.generate_safety_corpus()
+
+
+def create_app(
+    config: Optional[AppConfig] = None,
+    db: Optional[Database] = None,
+    clock: Optional[ClockProvider] = None,
+    nonce_provider: Optional[NonceProvider] = None,
+) -> FastAPI:
+    """Factory creating FastAPI application configured with AppConfig.
+
+    Owns Database, adapter, and dependencies attached via app.state.
+    Strict default composition from AppConfig.from_env; no silent secret fallback.
+    """
+    if config is None:
+        config = AppConfig.from_env()
+
+    app_instance = FastAPI(
+        title="PayoutProof API",
+        version="0.1.0",
+        description="Trust Agent and Deterministic Policy Gate for Payment Risk",
+    )
+
+    app_instance.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    if db is not None:
+        db_secret = getattr(db, "audit_checkpoint_secret", None)
+        if db_secret is None or not hmac.compare_digest(str(db_secret), config.audit_checkpoint_secret):
+            raise ConfigurationError(
+                "Injected Database audit_checkpoint_secret does not match AppConfig audit_checkpoint_secret"
+            )
+        resolved_db = db
     else:
-        cases = Simulator.generate_dev_corpus()
+        resolved_db = Database(
+            db_path=config.db_path,
+            audit_checkpoint_secret=config.audit_checkpoint_secret,
+        )
 
-    results = [execute_case_under_test(c) for c in cases]
-    report = EvaluationScorer.score_results(results)
-    return report.model_dump()
+    resolved_adapter = FakeApprovalRailAdapter(
+        db=resolved_db,
+        grant_secret=config.grant_secret,
+        audit_checkpoint_secret=config.audit_checkpoint_secret,
+    )
+
+    app_instance.state.config = config
+    app_instance.state.db = resolved_db
+    app_instance.state.adapter = resolved_adapter
+    app_instance.state.clock = clock
+    app_instance.state.nonce_provider = nonce_provider
+
+    app_instance.include_router(router)
+    return app_instance
+
+
+def __getattr__(name: str) -> Any:
+    """Lazy module attribute resolver for backwards-compatible test access."""
+    global _legacy_app
+    if name == "app":
+        if _legacy_app is None:
+            config = AppConfig.from_env()
+            legacy_instance = FastAPI(
+                title="PayoutProof API",
+                version="0.1.0",
+                description="Trust Agent and Deterministic Policy Gate for Payment Risk",
+            )
+            legacy_instance.add_middleware(
+                CORSMiddleware,
+                allow_origins=["*"],
+                allow_credentials=True,
+                allow_methods=["*"],
+                allow_headers=["*"],
+            )
+            legacy_instance.state.config = config
+            legacy_instance.state.db = None
+            legacy_instance.state.adapter = None
+            legacy_instance.include_router(router)
+            _legacy_app = legacy_instance
+        return _legacy_app
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")

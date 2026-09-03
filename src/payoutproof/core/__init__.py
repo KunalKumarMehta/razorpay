@@ -11,6 +11,7 @@ from payoutproof.core.enums import (
     ProcessingAuthorityStatus,
     AdapterDecision,
     ReasonCode,
+    AuditTrustState,
 )
 from payoutproof.core.models import (
     ProcessingAuthorityRecord,
@@ -23,6 +24,7 @@ from payoutproof.core.models import (
     AuditEvent,
     CaseInvestigation,
     RiskCaseState,
+    CaseAuditCheckpoint,
 )
 from payoutproof.core.crypto import (
     sha256_hex,
@@ -32,9 +34,22 @@ from payoutproof.core.crypto import (
     generate_nonce,
     create_grant_signature,
     verify_grant_signature,
+    compute_checkpoint_mac,
+    verify_checkpoint_mac,
 )
+from payoutproof.core.providers import (
+    ClockProvider,
+    NonceProvider,
+    SystemClock,
+    SystemNonce,
+    FixedClock,
+    SequentialNonce,
+)
+from payoutproof.core.config import AppConfig, ConfigurationError
 
 __all__ = [
+    "AppConfig",
+    "ConfigurationError",
     "TruthState",
     "PolicyOutcome",
     "CasePhase",
@@ -45,6 +60,7 @@ __all__ = [
     "ProcessingAuthorityStatus",
     "AdapterDecision",
     "ReasonCode",
+    "AuditTrustState",
     "ProcessingAuthorityRecord",
     "PaymentIntent",
     "EvidenceItem",
@@ -55,6 +71,7 @@ __all__ = [
     "AuditEvent",
     "CaseInvestigation",
     "RiskCaseState",
+    "CaseAuditCheckpoint",
     "sha256_hex",
     "compute_intent_hash",
     "compute_snapshot_hash",
@@ -62,4 +79,12 @@ __all__ = [
     "generate_nonce",
     "create_grant_signature",
     "verify_grant_signature",
+    "compute_checkpoint_mac",
+    "verify_checkpoint_mac",
+    "ClockProvider",
+    "NonceProvider",
+    "SystemClock",
+    "SystemNonce",
+    "FixedClock",
+    "SequentialNonce",
 ]

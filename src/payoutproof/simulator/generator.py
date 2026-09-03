@@ -3,9 +3,45 @@
 import hashlib
 import json
 from typing import List, Dict, Any, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 from payoutproof.core.enums import PolicyOutcome, TruthState, DestinationStatus
+
+
+class RuntimeCaseInput(BaseModel):
+    """Frozen runtime-observable stimulus for one evaluation case.
+
+    Contains only inputs the PayoutProof product can observe at execution time.
+    Evaluator metadata and answer labels (suite, category, scenario description,
+    speaker profile, gold outcome, expected reasons) are deliberately excluded
+    so product execution can never read evaluator truth.
+    """
+    model_config = ConfigDict(frozen=True)
+
+    case_id: str
+    language: str
+    modality: str
+    counterparty: str
+    destination: str
+    destination_status: DestinationStatus
+    amount: str
+    currency: str = "INR"
+    purpose: str
+    instruction_ref: str
+    has_callback: bool
+    has_destination_approval: bool
+    has_contradiction: bool
+    is_tampered: bool = False
+    is_unauthorized: bool = False
+    is_unusable_audio: bool = False
+    has_material_intent_error: bool = False
+    is_schema_failure: bool = False
+    # How a detected material intent inconsistency manifests: the previously
+    # confirmed intent was invalidated, or a material field was edited after
+    # confirmation so the frozen intent hash no longer matches.
+    intent_error_mode: str = "INVALIDATED"
+    mutate_amount_after_grant: bool = False
+    replay_grant_after_storage_restart: bool = False
 
 
 class EvaluationCase(BaseModel):
@@ -30,10 +66,41 @@ class EvaluationCase(BaseModel):
     is_tampered: bool = False
     is_unusable_audio: bool = False
     is_unauthorized: bool = False
+    has_material_intent_error: bool = False
+    is_schema_failure: bool = False
+    intent_error_mode: str = "INVALIDATED"
+    mutate_amount_after_grant: bool = False
+    replay_grant_after_storage_restart: bool = False
     gold_outcome: PolicyOutcome
     expected_reasons: List[str] = Field(default_factory=list)
     simulated_no_tool_interactions: int = 7  # Baseline gestures without PayoutProof
     simulated_tool_interactions: int = 3     # Gestures with PayoutProof
+
+    def to_runtime_input(self) -> RuntimeCaseInput:
+        """Project to runtime-observable stimulus, stripping evaluator metadata and answer labels."""
+        return RuntimeCaseInput(
+            case_id=self.case_id,
+            language=self.language,
+            modality=self.modality,
+            counterparty=self.counterparty,
+            destination=self.destination,
+            destination_status=self.destination_status,
+            amount=self.amount,
+            currency=self.currency,
+            purpose=self.purpose,
+            instruction_ref=self.instruction_ref,
+            has_callback=self.has_callback,
+            has_destination_approval=self.has_destination_approval,
+            has_contradiction=self.has_contradiction,
+            is_tampered=self.is_tampered,
+            is_unauthorized=self.is_unauthorized,
+            is_unusable_audio=self.is_unusable_audio,
+            has_material_intent_error=self.has_material_intent_error,
+            is_schema_failure=self.is_schema_failure,
+            intent_error_mode=self.intent_error_mode,
+            mutate_amount_after_grant=self.mutate_amount_after_grant,
+            replay_grant_after_storage_restart=self.replay_grant_after_storage_restart,
+        )
 
 
 class Simulator:
@@ -197,7 +264,30 @@ class Simulator:
             for rep in range(3):
                 cid = f"SAFETY-{cat_name[:4]}-{idx:03d}"
                 is_tamp = (cat_name == "CAT9_TAMPERED_SNAPSHOT")
-                is_unusable = (cat_name == "CAT4_UNUSABLE_AUDIO_FAILURE" or cat_name == "CAT6_EXTRACTION_SCHEMA_FAIL")
+                # CAT4 is the only unusable-audio category; CAT6 is a schema
+                # failure, a distinct failure mode.
+                is_unusable = (cat_name == "CAT4_UNUSABLE_AUDIO_FAILURE")
+                material_intent_error = (cat_name == "CAT1_MATERIAL_INTENT_ERROR")
+                schema_failure = (cat_name == "CAT6_EXTRACTION_SCHEMA_FAIL")
+                mutate_amount_after_grant = (cat_name == "CAT7_MATERIAL_MUTATION")
+                replay_grant_after_storage_restart = (cat_name == "CAT8_DUPLICATE_REPLAY")
+                # CAT1 variants cover both detected-inconsistency representations.
+                intent_error_mode = (
+                    ["INVALIDATED", "HASH_MISMATCH", "INVALIDATED"][rep]
+                    if material_intent_error else "INVALIDATED"
+                )
+
+                # CAT7 and CAT8 require an eligible initial runtime state:
+                # confirmed bound intent, verified callback, approved destination,
+                # and all required evidence.
+                is_eligible_initial = mutate_amount_after_grant or replay_grant_after_storage_restart
+                has_cb = is_eligible_initial
+                has_da = is_eligible_initial
+                dest_st = (
+                    DestinationStatus.APPROVED_FOR_COUNTERPARTY
+                    if is_eligible_initial
+                    else DestinationStatus.UNAPPROVED
+                )
 
                 cases.append(EvaluationCase(
                     case_id=cid,
@@ -209,16 +299,21 @@ class Simulator:
                     scenario_description=f"{desc} (variant {rep+1})",
                     counterparty=f"Safety Target {idx}",
                     destination=f"HDFC ••{9000+idx}",
-                    destination_status=DestinationStatus.UNAPPROVED,
+                    destination_status=dest_st,
                     amount="500000",
                     currency="INR",
                     purpose="Critical safety invariant test",
                     instruction_ref=f"INSTR-SAFE-{idx:03d}",
-                    has_callback=False,
-                    has_destination_approval=False,
+                    has_callback=has_cb,
+                    has_destination_approval=has_da,
                     has_contradiction=(cat_name == "CAT3_CONTRADICTORY_EVIDENCE"),
                     is_tampered=is_tamp,
                     is_unusable_audio=is_unusable,
+                    has_material_intent_error=material_intent_error,
+                    is_schema_failure=schema_failure,
+                    intent_error_mode=intent_error_mode,
+                    mutate_amount_after_grant=mutate_amount_after_grant,
+                    replay_grant_after_storage_restart=replay_grant_after_storage_restart,
                     gold_outcome=gold_out,
                     expected_reasons=[primary_reason],
                     simulated_no_tool_interactions=9,

@@ -80,6 +80,7 @@ class AdapterDecision(str, Enum):
     PENDING_ITEM_CREATED = "PENDING_ITEM_CREATED"
     REPLAY_REJECTED = "REPLAY_REJECTED"
     DOWNSTREAM_STATUS_UNKNOWN_NO_RETRY = "DOWNSTREAM_STATUS_UNKNOWN_NO_RETRY"
+    RECOVERY_INTEGRITY_FAILURE_NO_RETRY = "RECOVERY_INTEGRITY_FAILURE_NO_RETRY"
     GRANT_INVALID_OR_EXPIRED = "GRANT_INVALID_OR_EXPIRED"
     INTENT_MISMATCH = "INTENT_MISMATCH"
 
@@ -110,3 +111,14 @@ class FindingName(str, Enum):
     DESTINATION_RELATIONSHIP = "Destination relationship"
     INSTRUCTION_CONSISTENCY = "Instruction consistency"
     AASIST_SYNTHETIC_SCORE = "AASIST synthetic speech check"
+
+
+class DemoFakeAdapterMode(str, Enum):
+    """Documented local-demo-only fake adapter simulation modes."""
+    SIMULATE_AMBIGUITY = "SIMULATE_AMBIGUITY"
+
+
+class AuditTrustState(str, Enum):
+    """Trust states for case audit checkpoints."""
+    TRUSTED = "TRUSTED"
+    LEGACY_UNTRUSTED = "LEGACY_UNTRUSTED"

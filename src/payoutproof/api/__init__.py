@@ -1,5 +1,5 @@
 """API package."""
 
-from payoutproof.api.app import app
+from payoutproof.api.app import create_app
 
-__all__ = ["app"]
+__all__ = ["create_app"]

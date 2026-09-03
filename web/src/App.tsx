@@ -15,7 +15,30 @@ import {
   Sparkles,
   BarChart3,
 } from 'lucide-react';
-import { RiskCaseState, BenchmarkReport } from './types';
+import { RiskCaseState, BenchmarkReport, ProcessingAuthorityRecord } from './types';
+
+const SYNTHETIC_AUTHORITY_RECORD: ProcessingAuthorityRecord = {
+  data_class: 'SYNTHETIC_VOICE_AND_TEXT',
+  source: 'DEMO_COMMUNICATION_CHANNEL',
+  subject_category: 'VENDOR',
+  submitter: 'Payment Operator (Demo)',
+  purpose: 'Synthetic payment intent extraction and deterministic policy verification',
+  asserted_authority_ref: 'POLICY-DEMO-AUTH-2026',
+  permitted_uses: ['PAYMENT_INTENT_EXTRACTION', 'POLICY_GATE_EVALUATION'],
+  processing_route: 'LOCAL_ONLY_SYNTHETIC_PIPELINE',
+  redaction_declaration: 'SYNTHETIC_DISCLOSED_NO_PII',
+  retention_days: 7,
+  legal_hold: false,
+  restrictions: ['NO_MODEL_TRAINING', 'LOCAL_STORAGE_ONLY'],
+  is_valid: true,
+};
+
+const SYNTHETIC_EVIDENCE_INPUT = {
+  content: 'SYNTHETIC DEMO EVIDENCE: Urgent payment of INR 4,25,000 to Kaveri Components account HDFC 4821 for tooling deposit.',
+  mime_type: 'text/plain',
+  filename: 'synthetic_instruction.txt',
+  title: 'Synthetic urgent voice note + message bundle',
+};
 
 const INITIAL_STATE: RiskCaseState = {
   case_id: null,
@@ -23,6 +46,7 @@ const INITIAL_STATE: RiskCaseState = {
   tenant_id: 'tenant_default',
   phase: 'EVIDENCE_ADMISSION',
   processing_authority: 'NOT_CHECKED',
+  authority_record: null,
   request_bundle_status: 'NOT_ADMITTED',
   intent: {
     counterparty: null,
@@ -87,9 +111,6 @@ const ACTION_CATALOG: [string, string][] = [
   ['Issue single-use Handoff Grant', 'ISSUE_GRANT'],
   ['Materially edit amount (₹4.25L ➔ ₹4.75L)', 'EDIT_AMOUNT'],
   ['Operator initiates handoff', 'INITIATE_HANDOFF'],
-  ['Adapter confirms pending item', 'HANDOFF_ACCEPTED'],
-  ['Simulate ambiguous adapter status', 'HANDOFF_AMBIGUOUS'],
-  ['Replay same Handoff Grant', 'REPLAY_GRANT'],
 ];
 
 const SCENARIOS = [
@@ -105,7 +126,6 @@ const SCENARIOS = [
       'EVALUATE_POLICY',
       'ISSUE_GRANT',
       'INITIATE_HANDOFF',
-      'HANDOFF_ACCEPTED',
     ],
   },
   {
@@ -181,8 +201,7 @@ const SCENARIOS = [
       'EVALUATE_POLICY',
       'ISSUE_GRANT',
       'INITIATE_HANDOFF',
-      'HANDOFF_AMBIGUOUS',
-      'REPLAY_GRANT',
+      'INITIATE_HANDOFF',
     ],
   },
 ];
@@ -198,14 +217,42 @@ export function App() {
   const [benchmarkLoading, setBenchmarkLoading] = useState<boolean>(false);
   const [auditValid, setAuditValid] = useState<boolean>(true);
 
-  // Fetch initial case from API
+  // Fetch initial case from API or create if absent
   useEffect(() => {
     fetchCase('RC-DEMO-042');
   }, []);
 
+  const createFreshCase = async (prefix = 'RC-SCENARIO') => {
+    try {
+      const newCaseId = `${prefix}-${Date.now().toString(36).toUpperCase()}`;
+      const res = await fetch('/api/cases', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ case_id: newCaseId, tenant_id: 'tenant_default' }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setCaseState(data);
+        setApiOnline(true);
+        return data;
+      }
+    } catch {
+      setApiOnline(false);
+    }
+    return null;
+  };
+
   const fetchCase = async (caseId: string) => {
     try {
-      const res = await fetch(`/api/cases/${caseId}`);
+      let res = await fetch(`/api/cases/${caseId}`);
+      if (res.status === 404) {
+        // Missing case returns 404; explicitly create initial case via POST /api/cases
+        res = await fetch('/api/cases', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ case_id: caseId, tenant_id: 'tenant_default' }),
+        });
+      }
       if (res.ok) {
         const data = await res.json();
         setCaseState(data);
@@ -219,10 +266,35 @@ export function App() {
   const dispatchAction = async (actionType: string, isFromScenario = false) => {
     try {
       const caseId = caseState.case_id || 'RC-DEMO-042';
+      let payload: Record<string, any> = {};
+
+      if (actionType === 'ADMIT_AUTHORIZED_BUNDLE') {
+        payload = {
+          case_id: caseId,
+          processing_authority: SYNTHETIC_AUTHORITY_RECORD,
+          evidence: SYNTHETIC_EVIDENCE_INPUT,
+          title: SYNTHETIC_EVIDENCE_INPUT.title,
+        };
+      } else if (actionType === 'SUBMIT_UNAUTHORIZED_BUNDLE') {
+        payload = {
+          case_id: caseId,
+          // Incomplete / omitted authority demonstrates Admission Rejection
+        };
+      } else if (
+        actionType === 'INITIATE_HANDOFF' &&
+        isFromScenario &&
+        SCENARIOS[activeScenario]?.name === 'Replay / ambiguity' &&
+        scenarioStep === 7
+      ) {
+        payload = {
+          fake_adapter_mode: 'SIMULATE_AMBIGUITY',
+        };
+      }
+
       const res = await fetch(`/api/cases/${caseId}/dispatch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: actionType, payload: {} }),
+        body: JSON.stringify({ type: actionType, payload }),
       });
 
       if (res.ok) {
@@ -262,10 +334,10 @@ export function App() {
     }
   };
 
-  const startScenario = (index: number) => {
+  const startScenario = async (index: number) => {
     setActiveScenario(index);
     setScenarioStep(0);
-    dispatchAction('RESET');
+    await createFreshCase(`RC-SCENARIO-${index + 1}`);
   };
 
   const formatAmount = (amt: string | null, curr = 'INR') => {
@@ -338,7 +410,7 @@ export function App() {
           </div>
 
           <button
-            onClick={() => dispatchAction('RESET')}
+            onClick={() => createFreshCase('RC-DEMO')}
             style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 14px', borderRadius: 8, background: 'var(--surface-raised)', border: '1px solid var(--surface-border)', color: 'var(--text-main)', fontSize: 13, fontWeight: 600 }}
           >
             <RefreshCw size={14} /> Reset State
@@ -384,7 +456,7 @@ export function App() {
             gap: 8,
           }}
         >
-          <BarChart3 size={16} /> Benchmark & Acceptance Gates
+          <BarChart3 size={16} /> Policy Harness & Acceptance Gates
         </button>
       </div>
 
@@ -452,7 +524,13 @@ export function App() {
                       <span style={{ width: 20, height: 20, borderRadius: '50%', background: isDone ? 'var(--accent)' : isNext ? 'var(--accent)' : 'var(--surface-border)', color: isDone || isNext ? '#000' : '#888', display: 'grid', placeItems: 'center', fontSize: 11, fontWeight: 800 }}>
                         {isDone ? '✓' : idx + 1}
                       </span>
-                      <span style={{ flex: 1 }}>{actionLabels[stepType] || stepType}</span>
+                      <span style={{ flex: 1 }}>
+                        {SCENARIOS[activeScenario]?.name === 'Replay / ambiguity' && idx === 7
+                          ? 'Operator initiates handoff (simulate ambiguity mode)'
+                          : SCENARIOS[activeScenario]?.name === 'Replay / ambiguity' && idx === 8
+                          ? 'Second handoff gesture (demonstrates safe replay rejection)'
+                          : actionLabels[stepType] || stepType}
+                      </span>
                       {isNext && <ArrowRight size={14} />}
                     </button>
                   );
@@ -710,9 +788,12 @@ export function App() {
       {activeTab === 'benchmark' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
           <div style={{ background: 'var(--surface)', border: '1px solid var(--surface-border)', borderRadius: 14, padding: 20 }}>
-            <h2 style={{ fontSize: 18, fontWeight: 800, marginBottom: 8 }}>Evaluation Suite & Acceptance Gates</h2>
-            <p style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 16 }}>
-              Run our gold declarative oracle benchmark across development, sealed held-out, and critical safety invariant suites.
+            <div style={{ display: 'inline-block', padding: '4px 10px', borderRadius: 6, background: '#fef3c7', color: '#92400e', fontSize: 12, fontWeight: 800, letterSpacing: '0.05em', marginBottom: 12 }}>
+              DEVELOPMENT POLICY HARNESS / SYNTHETIC STRUCTURED CASES / NOT A SEALED EVALUATION
+            </div>
+            <h2 style={{ fontSize: 18, fontWeight: 800, marginBottom: 8 }}>Development Policy Harness</h2>
+            <p style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 16, lineHeight: 1.5 }}>
+              This harness exercises deterministic policy plumbing and boundary invariants on synthetic structured cases. It does <strong>not</strong> represent a sealed evaluation, held-out benchmark, product accuracy, or proof of real-world performance. Predeclared gates are targets only.
             </p>
 
             <div style={{ display: 'flex', gap: 12 }}>
@@ -729,7 +810,7 @@ export function App() {
                   border: '1px solid var(--surface-border)',
                 }}
               >
-                Run Development Suite (45 Cases)
+                Run 45-Case Development Harness
               </button>
 
               <button
@@ -745,7 +826,7 @@ export function App() {
                   border: '1px solid var(--surface-border)',
                 }}
               >
-                Run Sealed Suite (90 Cases)
+                Run 90-Case Synthetic Policy Harness
               </button>
 
               <button
@@ -761,7 +842,7 @@ export function App() {
                   border: '1px solid var(--surface-border)',
                 }}
               >
-                Run Critical Safety Invariant Suite (27 Cases)
+                Run 27-Case Critical Safety Invariant Harness
               </button>
             </div>
           </div>
@@ -777,46 +858,46 @@ export function App() {
                   {benchmarkReport.unsafe_handoffs_count} Unsafe Handoffs
                 </div>
                 <div style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>
-                  Gate: exactly 0 unsafe handoffs (Passed)
+                  Target: 0 unsafe handoffs ({benchmarkReport.passed_safety_gate ? 'Target Met in Harness' : 'Target Failed'})
                 </div>
               </div>
 
               {/* 3-Action Accuracy Card */}
               <div style={{ background: 'var(--surface)', border: '1px solid var(--surface-border)', borderRadius: 14, padding: 18 }}>
                 <span style={{ fontSize: 12, fontWeight: 800, color: 'var(--text-muted)', textTransform: 'uppercase' }}>
-                  3-Action Correctness
+                  3-Action Correctness (Harness)
                 </span>
                 <div style={{ fontSize: 28, fontWeight: 800, color: 'var(--accent)', marginTop: 6 }}>
                   {(benchmarkReport.three_action_accuracy * 100).toFixed(1)}%
                 </div>
                 <div style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>
-                  95% CI: {(benchmarkReport.three_action_wilson[0] * 100).toFixed(1)}%–{(benchmarkReport.three_action_wilson[1] * 100).toFixed(1)}% (Gate ≥ 90.0%)
+                  95% CI: {(benchmarkReport.three_action_wilson[0] * 100).toFixed(1)}%–{(benchmarkReport.three_action_wilson[1] * 100).toFixed(1)}% (Target: ≥ 90.0% · {benchmarkReport.three_action_accuracy >= 0.90 ? 'Target Met in Harness' : 'Below Target'})
                 </div>
               </div>
 
               {/* Protective Recall Card */}
               <div style={{ background: 'var(--surface)', border: '1px solid var(--surface-border)', borderRadius: 14, padding: 18 }}>
                 <span style={{ fontSize: 12, fontWeight: 800, color: 'var(--text-muted)', textTransform: 'uppercase' }}>
-                  Protective Intervention Recall
+                  Protective Intervention Recall (Harness)
                 </span>
                 <div style={{ fontSize: 28, fontWeight: 800, color: 'var(--accent)', marginTop: 6 }}>
                   {(benchmarkReport.protective_recall * 100).toFixed(1)}%
                 </div>
                 <div style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>
-                  TP: {benchmarkReport.protective_tp} | FN: {benchmarkReport.protective_fn} (Gate ≥ 95.0%)
+                  TP: {benchmarkReport.protective_tp} | FN: {benchmarkReport.protective_fn} (Target: ≥ 95.0% · {benchmarkReport.protective_recall >= 0.95 ? 'Target Met in Harness' : 'Below Target'})
                 </div>
               </div>
 
               {/* Interaction Reduction Card */}
               <div style={{ background: 'var(--surface)', border: '1px solid var(--surface-border)', borderRadius: 14, padding: 18 }}>
                 <span style={{ fontSize: 12, fontWeight: 800, color: 'var(--text-muted)', textTransform: 'uppercase' }}>
-                  Operator Interaction Reduction
+                  Simulated Interaction Reduction
                 </span>
                 <div style={{ fontSize: 28, fontWeight: 800, color: 'var(--accent)', marginTop: 6 }}>
                   {benchmarkReport.interaction_reduction_pct.toFixed(1)}%
                 </div>
                 <div style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>
-                  {benchmarkReport.total_no_tool_interactions} baseline ➔ {benchmarkReport.total_tool_interactions} gestures (Gate ≥ 30.0%)
+                  {benchmarkReport.total_no_tool_interactions} baseline ➔ {benchmarkReport.total_tool_interactions} gestures (Target: ≥ 30.0% · {benchmarkReport.passed_interaction_gate ? 'Target Met in Harness' : 'Below Target'})
                 </div>
               </div>
             </div>

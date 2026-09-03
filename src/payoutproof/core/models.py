@@ -16,6 +16,7 @@ from payoutproof.core.enums import (
     ProcessingAuthorityStatus,
     AdapterDecision,
     ReasonCode,
+    AuditTrustState,
 )
 
 
@@ -29,11 +30,43 @@ class ProcessingAuthorityRecord(BaseModel):
     submitter: str = Field(..., description="Identity/role of submitter")
     purpose: str = Field(..., description="Specific permitted purpose for processing")
     asserted_authority_ref: str = Field(..., description="Reference to policy or explicit consent record")
-    permitted_uses: List[str] = Field(default_factory=list, description="Allowlisted processing uses")
-    retention_days: int = Field(default=7, description="Declared retention lifecycle in days")
-    legal_hold: bool = Field(default=False, description="Whether data is subject to legal hold")
-    restrictions: List[str] = Field(default_factory=list, description="Any restrictions on processing")
-    is_valid: bool = Field(default=True, description="Whether authority criteria are met")
+    permitted_uses: List[str] = Field(..., description="Allowlisted processing uses")
+    processing_route: str = Field(..., description="Declared processing route (e.g. 'LOCAL_ONLY')")
+    redaction_declaration: str = Field(..., description="Declaration of redaction and sanitization applied")
+    retention_days: int = Field(..., gt=0, le=365, description="Declared retention lifecycle in days (positive bounded)")
+    legal_hold: bool = Field(..., description="Whether data is subject to legal hold")
+    restrictions: List[str] = Field(..., description="Any restrictions on processing")
+    is_valid: bool = Field(..., description="Whether authority criteria are met")
+
+
+class PendingApprovalItem:
+    """A pending payout review item in the downstream maker-checker approval rail."""
+    def __init__(
+        self,
+        item_id: str,
+        case_id: str,
+        counterparty: str,
+        destination: str,
+        amount: str,
+        currency: str,
+        purpose: str,
+        grant_id: str,
+        idempotency_key: str,
+        created_at: str,
+        status: str = "PENDING_FINANCE_APPROVAL",
+    ):
+        self.item_id = item_id
+        self.case_id = case_id
+        self.counterparty = counterparty
+        self.destination = destination
+        self.amount = amount
+        self.currency = currency
+        self.purpose = purpose
+        self.grant_id = grant_id
+        self.idempotency_key = idempotency_key
+        self.created_at = created_at
+        self.status = status
+
 
 
 class PaymentIntent(BaseModel):
@@ -95,6 +128,7 @@ class PolicyEvaluationResult(BaseModel):
     reasons: List[ReasonCode] = Field(default_factory=list)
     next_steps: List[str] = Field(default_factory=list)
     evaluated_intent_hash: Optional[str] = None
+    evaluated_snapshot_hash: Optional[str] = None
     policy_version: str = "PP-POLICY-V1"
     evaluated_at: Optional[str] = None
     expires_at: Optional[str] = None
@@ -167,6 +201,7 @@ class RiskCaseState(BaseModel):
     tenant_id: str = "tenant_default"
     phase: CasePhase = CasePhase.EVIDENCE_ADMISSION
     processing_authority: ProcessingAuthorityStatus = ProcessingAuthorityStatus.NOT_CHECKED
+    authority_record: Optional[ProcessingAuthorityRecord] = None
     request_bundle_status: str = "NOT_ADMITTED"
     intent: PaymentIntent = Field(default_factory=PaymentIntent)
     evidence: List[EvidenceItem] = Field(default_factory=list)
@@ -177,3 +212,20 @@ class RiskCaseState(BaseModel):
     handoff: HandoffRecord = Field(default_factory=HandoffRecord)
     last_change: str = "Case initialized; awaiting processing authority check."
     audit: List[AuditEvent] = Field(default_factory=list)
+
+    @property
+    def processing_authority_record(self) -> Optional[ProcessingAuthorityRecord]:
+        """Accessor alias for authority_record."""
+        return self.authority_record
+
+
+class CaseAuditCheckpoint(BaseModel):
+    """Authenticated authoritative audit checkpoint for a case."""
+    model_config = ConfigDict(frozen=True)
+
+    case_id: str
+    event_count: int
+    tip_hash: str
+    trust_state: AuditTrustState = AuditTrustState.TRUSTED
+    checkpoint_mac: str
+    updated_at: str
