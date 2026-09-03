@@ -35,6 +35,7 @@ class HandoffService:
         *,
         grant_secret: str,
         simulate_ambiguity: bool = False,
+        clock: Optional[Any] = None,
     ) -> RiskCaseState:
         """Execute server-owned handoff attempt atomically inside a SQLite transaction.
 
@@ -52,6 +53,7 @@ class HandoffService:
         """
         if not grant_secret or not str(grant_secret).strip():
             raise ValueError("grant_secret is required and cannot be empty")
+        effective_clock = clock if clock is not None else getattr(adapter, "clock", None)
         db = adapter.db
         with db.get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE;")
@@ -258,6 +260,7 @@ class HandoffService:
                                     state=base_state,
                                     action={"type": "INITIATE_HANDOFF", "payload": {}},
                                     grant_secret=grant_secret,
+                                    clock=effective_clock,
                                 )
                             reconciled = StateMachine.apply_adapter_decision(
                                 state=base_state,
@@ -272,6 +275,7 @@ class HandoffService:
                                 state=curr_state,
                                 action={"type": "INITIATE_HANDOFF", "payload": {}},
                                 grant_secret=grant_secret,
+                                clock=effective_clock,
                             )
                             db.save_case_tx(conn, retried)
                             conn.commit()
@@ -357,6 +361,7 @@ class HandoffService:
                     state=curr_state,
                     action={"type": "INITIATE_HANDOFF", "payload": {}},
                     grant_secret=grant_secret,
+                    clock=effective_clock,
                 )
 
                 if (

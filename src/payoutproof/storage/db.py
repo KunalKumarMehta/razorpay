@@ -371,11 +371,49 @@ class Database:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS operator_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    subject TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    organization_id TEXT NOT NULL,
+                    idp_issuer TEXT NOT NULL,
+                    issued_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    last_seen_at TEXT,
+                    revoked_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS auth_login_states (
+                    state_token TEXT PRIMARY KEY,
+                    nonce TEXT NOT NULL,
+                    code TEXT UNIQUE,
+                    redirect_uri TEXT,
+                    issuer TEXT NOT NULL,
+                    code_expires_at TEXT,
+                    consumed_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS case_action_actors (
+                    case_id TEXT NOT NULL,
+                    organization_id TEXT,
+                    action_type TEXT NOT NULL,
+                    actor_subject TEXT NOT NULL,
+                    actor_role TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_risk_cases_tenant ON risk_cases(tenant_id);
                 CREATE INDEX IF NOT EXISTS idx_audit_case ON audit_events(case_id);
                 CREATE INDEX IF NOT EXISTS idx_grants_case ON handoff_grants(case_id);
                 CREATE INDEX IF NOT EXISTS idx_pending_items_case_id ON pending_approval_items(case_id);
                 CREATE INDEX IF NOT EXISTS idx_audit_checkpoints_case ON case_audit_checkpoints(case_id);
+                CREATE INDEX IF NOT EXISTS idx_operator_sessions_token ON operator_sessions(token_hash);
+                CREATE INDEX IF NOT EXISTS idx_operator_sessions_subject ON operator_sessions(subject);
+                CREATE INDEX IF NOT EXISTS idx_case_action_actors_case ON case_action_actors(case_id, action_type, recorded_at);
             """)
             conn.commit()
             self._migrate_db(conn)
@@ -1515,6 +1553,187 @@ class Database:
                     "trust_state": trust_status,
                 })
             return results
+
+    # ==========================================================================
+    # Operator sessions, OIDC login states, and action attribution (Issue #7)
+    # ==========================================================================
+
+    def create_operator_session(
+        self,
+        session_id: str,
+        token_hash: str,
+        subject: str,
+        display_name: str,
+        role: str,
+        tenant_id: str,
+        organization_id: str,
+        idp_issuer: str,
+        issued_at: str,
+        expires_at: str,
+        last_seen_at: Optional[str] = None,
+    ) -> None:
+        """Persist a new operator session row keyed by the hashed opaque token."""
+        if not token_hash or not str(token_hash).strip():
+            raise ValueError("token_hash is required")
+        with self.get_connection() as conn:
+            conn.execute("""
+                INSERT INTO operator_sessions (
+                    session_id, token_hash, subject, display_name, role, tenant_id,
+                    organization_id, idp_issuer, issued_at, expires_at, last_seen_at, revoked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL);
+            """, (
+                session_id, token_hash, subject, display_name, role, tenant_id,
+                organization_id, idp_issuer, issued_at, expires_at, last_seen_at,
+            ))
+            conn.commit()
+
+    def get_operator_session(self, token_hash: str) -> Optional[Dict[str, Any]]:
+        """Fetch an operator session row by hashed token, or None when absent."""
+        if not token_hash:
+            return None
+        with self.get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM operator_sessions WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def revoke_operator_session(self, token_hash: str, revoked_at: str) -> bool:
+        """Mark a session revoked; returns False when the row does not exist."""
+        with self.get_connection() as conn:
+            cur = conn.execute(
+                "UPDATE operator_sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
+                (revoked_at, token_hash),
+            )
+            conn.commit()
+            return cur.rowcount == 1
+
+    def touch_operator_session(self, token_hash: str, last_seen_at: str) -> bool:
+        """Update last_seen_at for activity tracking; no-op on unknown tokens."""
+        with self.get_connection() as conn:
+            cur = conn.execute(
+                "UPDATE operator_sessions SET last_seen_at = ? WHERE token_hash = ?",
+                (last_seen_at, token_hash),
+            )
+            conn.commit()
+            return cur.rowcount == 1
+
+    def create_login_state(
+        self,
+        state_token: str,
+        nonce: str,
+        issuer: str,
+        created_at: str,
+        redirect_uri: Optional[str] = None,
+        code: Optional[str] = None,
+        code_expires_at: Optional[str] = None,
+    ) -> None:
+        """Persist a single-use OIDC authorization state (CSRF defense in depth)."""
+        with self.get_connection() as conn:
+            conn.execute("""
+                INSERT INTO auth_login_states (
+                    state_token, nonce, code, redirect_uri, issuer, code_expires_at, consumed_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?);
+            """, (state_token, nonce, code, redirect_uri, issuer, code_expires_at, created_at))
+            conn.commit()
+
+    def record_login_state_code(
+        self,
+        state_token: str,
+        code: str,
+        code_expires_at: Optional[str],
+    ) -> bool:
+        """Attach the provider-issued authorization code to its login state.
+
+        Fails (returns False) when the state row is absent or already carries a
+        code, so a replayed authorize redirect cannot bind a second code.
+        """
+        with self.get_connection() as conn:
+            cur = conn.execute(
+                "UPDATE auth_login_states SET code = ?, code_expires_at = ? "
+                "WHERE state_token = ? AND code IS NULL AND consumed_at IS NULL",
+                (code, code_expires_at, state_token),
+            )
+            conn.commit()
+            return cur.rowcount == 1
+
+    def consume_login_state(self, state_token: str, consumed_at: str) -> Optional[Dict[str, Any]]:
+        """Atomically consume a login state (single-use) and return its row.
+
+        Returns None when the state is absent, already consumed, or concurrently
+        claimed — the caller then refuses the callback fail-closed.
+        """
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                row = conn.execute(
+                    "SELECT * FROM auth_login_states WHERE state_token = ?",
+                    (state_token,),
+                ).fetchone()
+                if row is None:
+                    conn.rollback()
+                    return None
+                if row["consumed_at"] is not None:
+                    conn.rollback()
+                    return None
+                cur = conn.execute(
+                    "UPDATE auth_login_states SET consumed_at = ? WHERE state_token = ? AND consumed_at IS NULL",
+                    (consumed_at, state_token),
+                )
+                if cur.rowcount != 1:
+                    conn.rollback()
+                    return None
+                conn.commit()
+                return dict(row)
+            except Exception:
+                conn.rollback()
+                raise
+
+    def record_case_action(
+        self,
+        case_id: str,
+        action_type: str,
+        actor_subject: str,
+        actor_role: str,
+        recorded_at: str,
+        organization_id: Optional[str] = None,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> None:
+        """Record who dispatched which action on a case (session-derived attribution).
+
+        With `conn` provided the insert rides the caller's BEGIN IMMEDIATE
+        transaction, so attribution and state mutation commit atomically.
+        """
+        params = (case_id, organization_id, action_type, actor_subject, actor_role, recorded_at)
+        sql = """
+            INSERT INTO case_action_actors (
+                case_id, organization_id, action_type, actor_subject, actor_role, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?);
+        """
+        if conn is not None:
+            conn.execute(sql, params)
+            return
+        with self.get_connection() as c:
+            c.execute(sql, params)
+            c.commit()
+
+    def get_latest_case_action(
+        self,
+        case_id: str,
+        action_type: str,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the most recent recorded dispatch of `action_type` on a case, or None."""
+        sql = (
+            "SELECT * FROM case_action_actors WHERE case_id = ? AND action_type = ? "
+            "ORDER BY recorded_at DESC, rowid DESC LIMIT 1"
+        )
+        if conn is not None:
+            row = conn.execute(sql, (case_id, action_type)).fetchone()
+            return dict(row) if row else None
+        with self.get_connection() as c:
+            row = c.execute(sql, (case_id, action_type)).fetchone()
+            return dict(row) if row else None
 
 
     @staticmethod

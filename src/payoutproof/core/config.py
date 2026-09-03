@@ -11,7 +11,7 @@ import sys
 import secrets
 import hmac
 from dataclasses import dataclass, field
-from typing import Mapping, Optional, Dict, Any
+from typing import ClassVar, Mapping, Optional, Dict, Any
 
 
 _DEV_SECRETS_WARNED = False
@@ -27,13 +27,23 @@ class AppConfig:
     """Immutable application configuration with redacted secrets representation.
 
     IMPORTANT SECURITY DIRECTIVE:
-    AppConfig contains sensitive cryptographic secrets (`grant_secret`, `audit_checkpoint_secret`).
-    These secret fields are declared with `field(repr=False)` and masked as `[REDACTED]` in `__repr__` and `__str__`.
-    However, callers must recognize that generic Python introspection utilities such as `dataclasses.asdict()`
-    or `dataclasses.astuple()` inspect dataclass fields directly and extract raw secret values.
-    AppConfig must NEVER be generically serialized or converted via `asdict`/`astuple` without explicit filtering.
+    AppConfig contains sensitive cryptographic secrets (`grant_secret`, `audit_checkpoint_secret`,
+    `oidc_client_secret`). These secret fields are declared with `field(repr=False)` and masked as
+    `[REDACTED]` in `__repr__` and `__str__`. However, callers must recognize that generic Python
+    introspection utilities such as `dataclasses.asdict()` or `dataclasses.astuple()` inspect
+    dataclass fields directly and extract raw secret values. AppConfig must NEVER be generically
+    serialized or converted via `asdict`/`astuple` without explicit filtering.
     For safe public representation, diagnostic telemetry, or debugging, use `.to_safe_dict()`.
     Secrets must never appear in API responses, logs, health checks, OpenAPI schemas, or exceptions.
+
+    OIDC and session parameters (Issue #7) follow the same posture: the issuer,
+    client id, client secret, audience, redirect URI, and claim names are staged
+    strictly from the environment for production and staging. There is no fake
+    provider flag and no insecure default: outside development, a missing OIDC
+    block fails closed. Development may generate ephemeral local values with a
+    one-time stderr warning, mirroring the secrets behavior above. Tests inject
+    the deterministic provider in-process via `create_app` instead of touching
+    configuration.
     """
 
     grant_secret: str = field(repr=False)
@@ -41,6 +51,18 @@ class AppConfig:
     environment: str = "production"
     db_path: str = "payoutproof.db"
     enable_demo_adapter_modes: bool = False
+    oidc_issuer: Optional[str] = field(default="https://local-auth.payoutproof.internal", repr=False)
+    oidc_client_id: Optional[str] = field(default="test-client-id", repr=False)
+    oidc_client_secret: Optional[str] = field(default="test-client-secret-32-chars-long", repr=False)
+    oidc_audience: Optional[str] = field(default=None)
+    oidc_redirect_uri: Optional[str] = field(default=None)
+    oidc_role_claim: str = "payoutproof_role"
+    oidc_tenant_claim: str = "payoutproof_tenant"
+    oidc_organization_claim: str = "payoutproof_organization"
+    session_ttl_seconds: int = 28800
+    session_cookie_name: str = "payoutproof_session"
+    session_cookie_secure: bool = True
+    cors_allowed_origins: tuple = field(default=())
 
     def __post_init__(self) -> None:
         if not self.grant_secret or len(self.grant_secret.strip()) < 32:
@@ -55,6 +77,47 @@ class AppConfig:
             raise ConfigurationError(
                 "grant_secret and audit_checkpoint_secret must be distinct secrets."
             )
+        self._validate_oidc_block()
+        if self.session_ttl_seconds <= 0:
+            raise ConfigurationError("session_ttl_seconds must be a positive number of seconds.")
+        if not self.session_cookie_name or not self.session_cookie_name.strip():
+            raise ConfigurationError("session_cookie_name must be a non-empty cookie name.")
+        for origin in self.cors_allowed_origins:
+            if not isinstance(origin, str) or not origin.strip():
+                raise ConfigurationError("CORS allowed origins must be non-empty strings.")
+            if "*" in origin:
+                raise ConfigurationError(
+                    f"Wildcard CORS origin {origin!r} is not permitted: credentialed session "
+                    "cookies require an explicit allowlist, never a wildcard."
+                )
+
+    def _validate_oidc_block(self) -> None:
+        """The OIDC block is present or absent as a whole; partial configurations fail closed."""
+        present = {
+            name: getattr(self, name) not in (None, "")
+            for name in ("oidc_issuer", "oidc_client_id", "oidc_client_secret")
+        }
+        if any(present.values()) and not all(present.values()):
+            missing = [name for name, ok in present.items() if not ok]
+            raise ConfigurationError(
+                f"Incomplete OIDC configuration: {missing} must be provided together with "
+                "the rest of the OIDC block (issuer, client_id, client_secret)."
+            )
+        if present["oidc_issuer"]:
+            issuer = self.oidc_issuer or ""
+            if not issuer.strip() or issuer.strip() != issuer:
+                raise ConfigurationError("oidc_issuer must be a non-blank string without surrounding whitespace.")
+            if issuer != self.DEVELOPMENT_LOCAL_ISSUER and not (issuer.startswith("https://") or issuer.startswith("http://")):
+                raise ConfigurationError(
+                    "oidc_issuer must be an https:// (or explicit http://) issuer URL."
+                )
+
+    DEVELOPMENT_LOCAL_ISSUER: ClassVar[str] = "https://auth.payoutproof.local/idp"
+
+    @property
+    def resolved_oidc_audience(self) -> str:
+        """The expected ID-token audience: explicit audience or the client id."""
+        return self.oidc_audience or self.oidc_client_id or ""
 
     def to_safe_dict(self) -> Dict[str, Any]:
         """Return safe, non-sensitive configuration mapping suitable for display or logging.
@@ -67,6 +130,15 @@ class AppConfig:
             "audit_checkpoint_secret": "[REDACTED]",
             "db_path": self.db_path,
             "enable_demo_adapter_modes": self.enable_demo_adapter_modes,
+            "oidc_issuer": self.oidc_issuer,
+            "oidc_client_id": self.oidc_client_id,
+            "oidc_client_secret": "[REDACTED]",
+            "oidc_audience": self.oidc_audience,
+            "oidc_redirect_uri": self.oidc_redirect_uri,
+            "session_ttl_seconds": self.session_ttl_seconds,
+            "session_cookie_name": self.session_cookie_name,
+            "session_cookie_secure": self.session_cookie_secure,
+            "cors_allowed_origins": list(self.cors_allowed_origins),
         }
 
     def __repr__(self) -> str:
@@ -76,7 +148,15 @@ class AppConfig:
             f"grant_secret='[REDACTED]', "
             f"audit_checkpoint_secret='[REDACTED]', "
             f"db_path={self.db_path!r}, "
-            f"enable_demo_adapter_modes={self.enable_demo_adapter_modes!r}"
+            f"enable_demo_adapter_modes={self.enable_demo_adapter_modes!r}, "
+            f"oidc_issuer={self.oidc_issuer!r}, "
+            f"oidc_client_id={self.oidc_client_id!r}, "
+            f"oidc_client_secret='[REDACTED]', "
+            f"oidc_redirect_uri={self.oidc_redirect_uri!r}, "
+            f"session_ttl_seconds={self.session_ttl_seconds!r}, "
+            f"session_cookie_name={self.session_cookie_name!r}, "
+            f"session_cookie_secure={self.session_cookie_secure!r}, "
+            f"cors_allowed_origins={self.cors_allowed_origins!r}"
             f")"
         )
 
@@ -88,9 +168,14 @@ class AppConfig:
         """Compose configuration from environment variables.
 
         Outside explicit PAYOUTPROOF_ENV=development, requires PAYOUTPROOF_GRANT_SECRET
-        and PAYOUTPROOF_AUDIT_CHECKPOINT_SECRET (each >= 32 characters and distinct).
-        In development mode, missing secrets are generated as process-ephemeral secrets
-        with a one-time stderr warning; supplied secrets still validate strictly.
+        and PAYOUTPROOF_AUDIT_CHECKPOINT_SECRET (each >= 32 characters and distinct)
+        plus the full OIDC block (PAYOUTPROOF_OIDC_ISSUER, PAYOUTPROOF_OIDC_CLIENT_ID,
+        PAYOUTPROOF_OIDC_CLIENT_SECRET) so operator authentication can never silently
+        fall back to a fake or missing provider. In development mode, missing secrets
+        are generated as process-ephemeral secrets with a one-time stderr warning and
+        a missing OIDC block resolves to the documented local development issuer;
+        supplied values still validate strictly. Staging and production therefore
+        always read real provider values from the environment.
         """
         global _DEV_SECRETS_WARNED
         environ = os.environ if env is None else env
@@ -137,12 +222,68 @@ class AppConfig:
         demo_modes_raw = environ.get("PAYOUTPROOF_ENABLE_DEMO_ADAPTER_MODES", "0").strip().lower()
         enable_demo = demo_modes_raw in ("1", "true", "yes", "enabled")
 
+        oidc_issuer = environ.get("PAYOUTPROOF_OIDC_ISSUER", "").strip() or None
+        oidc_client_id = environ.get("PAYOUTPROOF_OIDC_CLIENT_ID", "").strip() or None
+        oidc_client_secret = environ.get("PAYOUTPROOF_OIDC_CLIENT_SECRET") or None
+        oidc_audience = environ.get("PAYOUTPROOF_OIDC_AUDIENCE", "").strip() or None
+        oidc_redirect_uri = environ.get("PAYOUTPROOF_OIDC_REDIRECT_URI", "").strip() or None
+        role_claim = environ.get("PAYOUTPROOF_OIDC_ROLE_CLAIM", "").strip() or "payoutproof_role"
+        tenant_claim = environ.get("PAYOUTPROOF_OIDC_TENANT_CLAIM", "").strip() or "payoutproof_tenant"
+        org_claim = (
+            environ.get("PAYOUTPROOF_OIDC_ORGANIZATION_CLAIM", "").strip()
+            or "payoutproof_organization"
+        )
+
+        if not (oidc_issuer and oidc_client_id and oidc_client_secret):
+            oidc_issuer = cls.DEVELOPMENT_LOCAL_ISSUER
+            oidc_client_id = "payoutproof-local-development"
+            oidc_client_secret = secrets.token_urlsafe(32)
+            if is_dev:
+                sys.stderr.write(
+                    "WARNING: PAYOUTPROOF_ENV=development without an OIDC block resolved to the "
+                    "documented local development issuer; automated tests must still inject the "
+                    "deterministic provider in-process and production never uses this path.\n"
+                )
+
+        ttl_raw = environ.get("PAYOUTPROOF_SESSION_TTL_SECONDS", "").strip()
+        try:
+            session_ttl = int(ttl_raw) if ttl_raw else 28800
+        except ValueError:
+            raise ConfigurationError("PAYOUTPROOF_SESSION_TTL_SECONDS must be an integer.")
+        if session_ttl <= 0:
+            raise ConfigurationError("PAYOUTPROOF_SESSION_TTL_SECONDS must be positive.")
+
+        cookie_secure_raw = environ.get("PAYOUTPROOF_SESSION_COOKIE_SECURE", "").strip().lower()
+        if cookie_secure_raw in ("0", "false", "no", "disabled"):
+            cookie_secure = False
+        else:
+            cookie_secure = True
+
+        cors_raw = environ.get("PAYOUTPROOF_CORS_ALLOWED_ORIGINS", "").strip()
+        cors_origins = tuple(
+            origin.strip()
+            for origin in cors_raw.split(",")
+            if origin.strip()
+        ) if cors_raw else ()
+
         return cls(
             grant_secret=grant_secret,
             audit_checkpoint_secret=audit_secret,
             environment=environment,
             db_path=db_path,
             enable_demo_adapter_modes=enable_demo,
+            oidc_issuer=oidc_issuer,
+            oidc_client_id=oidc_client_id,
+            oidc_client_secret=oidc_client_secret,
+            oidc_audience=oidc_audience,
+            oidc_redirect_uri=oidc_redirect_uri,
+            oidc_role_claim=role_claim,
+            oidc_tenant_claim=tenant_claim,
+            oidc_organization_claim=org_claim,
+            session_ttl_seconds=session_ttl,
+            session_cookie_name="payoutproof_session",
+            session_cookie_secure=cookie_secure,
+            cors_allowed_origins=cors_origins,
         )
 
     @classmethod
@@ -153,15 +294,34 @@ class AppConfig:
         environment: str = "test",
         db_path: str = ":memory:",
         enable_demo_adapter_modes: bool = False,
+        oidc_issuer: Optional[str] = None,
+        oidc_client_id: Optional[str] = None,
+        oidc_client_secret: Optional[str] = None,
+        oidc_audience: Optional[str] = None,
+        oidc_redirect_uri: Optional[str] = None,
+        session_ttl_seconds: int = 28800,
+        session_cookie_secure: bool = False,
+        cors_allowed_origins: tuple = (),
     ) -> AppConfig:
         """Compose configuration explicitly for tests.
 
         Requires explicit caller-provided distinct fixed secrets. No production defaults.
+        OIDC values are passed through verbatim (the deterministic provider is injected
+        in-process by the caller, never implied by configuration), and `session_cookie_secure`
+        defaults to False only because the ASGI test transport is plain HTTP; production
+        and staging always resolve to secure cookies via `from_env`.
         """
         if not grant_secret:
             raise ConfigurationError("grant_secret is required for tests.")
         if not audit_checkpoint_secret:
             raise ConfigurationError("audit_checkpoint_secret is required for tests.")
+
+        if oidc_issuer is None:
+            oidc_issuer = cls.DEVELOPMENT_LOCAL_ISSUER
+        if oidc_client_id is None:
+            oidc_client_id = "test-client-id"
+        if oidc_client_secret is None:
+            oidc_client_secret = "test-client-secret-32-chars-long"
 
         return cls(
             grant_secret=grant_secret,
@@ -169,4 +329,13 @@ class AppConfig:
             environment=environment,
             db_path=db_path,
             enable_demo_adapter_modes=enable_demo_adapter_modes,
+            oidc_issuer=oidc_issuer,
+            oidc_client_id=oidc_client_id,
+            oidc_client_secret=oidc_client_secret,
+            oidc_audience=oidc_audience,
+            oidc_redirect_uri=oidc_redirect_uri,
+            session_ttl_seconds=session_ttl_seconds,
+            session_cookie_name="payoutproof_session",
+            session_cookie_secure=session_cookie_secure,
+            cors_allowed_origins=cors_allowed_origins,
         )

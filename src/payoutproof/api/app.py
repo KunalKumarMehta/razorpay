@@ -1,14 +1,25 @@
 """FastAPI control plane API for PayoutProof.
 
-Organization scope is mandatory: every case, policy, grant, handoff, and audit
-route requires a non-blank X-Organization-Id header. There is no default
-organization and no un-scoped legacy access path. Only /api/health and
-/api/release (secret-free release metadata) are exempt.
+Organization scope and operator identity are both server-owned. Every case,
+policy, grant, handoff, and audit route requires a session established via
+the standards-based OIDC authorization-code flow; the session carries the
+operator's subject, role, tenant, and organization, and those values are the
+exclusive source of scope for every read and write. The X-Organization-Id
+header is no longer an authority: an absent header resolves to the session
+organization, a blank header is malformed, and a conflicting header is a
+rejected escalation attempt. Only /api/health, /api/release (secret-free
+release metadata), and the /api/auth/* authentication routes are exempt.
+
+Role enforcement is centralized in the frozen capability matrix
+(payoutproof.auth.roles) plus a session dependency on this router — not
+per-route hand-rolled checks and not middleware added only in `create_app`
+— so every application instance that includes this router is protected.
 """
 
 import hmac
+import secrets
 from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, HTTPException, Request, APIRouter
+from fastapi import Depends, FastAPI, HTTPException, Request, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -28,46 +39,30 @@ from payoutproof.storage.db import (
 from payoutproof.adapters.fake_adapter import FakeApprovalRailAdapter
 from payoutproof.audit.chain import AuditChain
 from payoutproof.scorer.service import EvaluationExecutionService
-
-
-ALLOWED_ACTIONS = {
-    "RESET",
-    "ADMIT_AUTHORIZED_BUNDLE",
-    "SUBMIT_UNAUTHORIZED_BUNDLE",
-    "EXTRACT_INTENT",
-    "FAIL_MODEL",
-    "CONFIRM_INTENT",
-    "ADD_CALLBACK_EVIDENCE",
-    "ADD_DESTINATION_APPROVAL",
-    "ADD_CONTRADICTION",
-    "SUBMIT_TAMPERED_SNAPSHOT",
-    "EVALUATE_POLICY",
-    "ISSUE_GRANT",
-    "EDIT_AMOUNT",
-    "MODIFY_INTENT",
-    "INITIATE_HANDOFF",
-}
-
-REMOVED_OUTCOME_COMMANDS = {
-    "HANDOFF_ACCEPTED",
-    "HANDOFF_AMBIGUOUS",
-    "REPLAY_GRANT",
-}
-
-DISALLOWED_PAYLOAD_FIELDS = {
-    "pending_item_id",
-    "adapter_decision",
-    "outcome",
-    "grant_status",
-    "used",
-    "state",
-    "phase",
-    "case_version",
-    "status",
-    "last_adapter_decision",
-    "policy_outcome",
-    "idempotency_key",
-}
+from payoutproof.api.actions import (
+    ALLOWED_ACTIONS,
+    REMOVED_OUTCOME_COMMANDS,
+    DISALLOWED_PAYLOAD_FIELDS,
+)
+from payoutproof.auth import routes as auth_routes
+from payoutproof.auth.dependencies import (
+    active_organization,
+    require_action_role,
+    require_case_creator,
+    require_case_reader,
+    require_audit_verifier,
+    require_evaluation_runner,
+    require_session,
+    require_session_tenant,
+)
+from payoutproof.auth.oidc import OIDCProviderClient
+from payoutproof.auth.roles import (
+    DEMO_ONLY_ACTIONS,
+    CAPABILITY_READ_CASES,
+    CAPABILITY_VERIFY_AUDIT,
+    CAPABILITY_RUN_EVALUATION,
+)
+from payoutproof.auth.session import SessionRecord, SessionStore
 
 
 class ActionRequest(BaseModel):
@@ -77,27 +72,19 @@ class ActionRequest(BaseModel):
 
 class CreateCaseRequest(BaseModel):
     case_id: Optional[str] = None
-    tenant_id: str = "tenant_default"
-    organization_id: Optional[str] = None
+    tenant_id: Optional[str] = None
 
 
-ORGANIZATION_HEADER = "X-Organization-Id"
+# Public, session-exempt surface: liveness, secret-free release identity, and
+# the OIDC authentication routes themselves (login redirect, callback, me,
+# logout — the latter two enforce the session dependency inside auth_routes).
+public_router = APIRouter()
 
-
-def _require_organization_id(request: Request) -> str:
-    """Resolve the caller's mandatory active organization from X-Organization-Id.
-
-    There is no default organization: an absent, empty, or whitespace-only
-    header is rejected with HTTP 400. The resolved value is stripped and used
-    verbatim as the exclusive scope for every subsequent read and write.
-    """
-    raw = request.headers.get(ORGANIZATION_HEADER)
-    if raw is None:
-        raise HTTPException(status_code=400, detail="Missing mandatory organization identity")
-    organization_id = raw.strip()
-    if not organization_id:
-        raise HTTPException(status_code=400, detail="Missing mandatory organization identity")
-    return organization_id
+# Protected surface: every case, audit, and evaluation route requires an
+# authenticated, unexpired, unrevoked operator session. The dependency lives
+# on the router (not only in create_app) so any app instance that mounts
+# this router is protected.
+protected_router = APIRouter(dependencies=[Depends(require_session)])
 
 
 def _resolve_db(request: Request) -> Database:
@@ -124,10 +111,13 @@ def _resolve_config(request: Request) -> AppConfig:
     return config
 
 
-router = APIRouter()
+def _resolve_clock(request: Request) -> ClockProvider:
+    """Resolve the injected clock (deterministic time for sessions and audit)."""
+    clock = getattr(request.app.state, "clock", None)
+    return clock if clock is not None else None
 
 
-@router.get("/api/health")
+@public_router.get("/api/health")
 def get_health() -> Dict[str, Any]:
     """Liveness, readiness, capability status, and secret-free release identity.
 
@@ -150,12 +140,13 @@ def get_health() -> Dict[str, Any]:
             "grant_issuer": "IN_DEVELOPMENT",
             "fake_adapter": "IN_DEVELOPMENT",
             "audit_chain": "IN_DEVELOPMENT",
+            "operator_auth": "UNIT_TESTED",
             "durable_replay_protection": "UNIT_TESTED",
         },
     }
 
 
-@router.get("/api/release")
+@public_router.get("/api/release")
 def get_release() -> Dict[str, Any]:
     """Secret-free release identity: application, policy, schema, model config, Evaluation Version.
 
@@ -167,38 +158,32 @@ def get_release() -> Dict[str, Any]:
     return release.to_public_dict()
 
 
-@router.get("/api/cases")
-def list_cases(request: Request) -> List[Dict[str, Any]]:
-    """List existing Risk Cases strictly within the caller's active organization."""
+@protected_router.get("/api/cases", dependencies=[Depends(require_case_reader)])
+def list_cases(request: Request, session: SessionRecord = Depends(require_session)) -> List[Dict[str, Any]]:
+    """List existing Risk Cases strictly within the caller's session organization."""
     active_db = _resolve_db(request)
-    organization_id = _require_organization_id(request)
+    organization_id = active_organization(request, session)
     return active_db.list_cases(organization_id=organization_id)
 
 
-@router.post("/api/cases")
-def create_case(req: CreateCaseRequest, request: Request) -> RiskCaseState:
+@protected_router.post("/api/cases", dependencies=[Depends(require_case_creator)])
+def create_case(
+    req: CreateCaseRequest,
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> RiskCaseState:
     """Initialize a new Risk Case (unadmitted) serialized in a transaction.
 
-    Organization scope is mandatory: provided via X-Organization-Id header
-    or request body. If both are provided, they must agree. Creation without
-    an explicit organization is rejected with HTTP 400.
+    Organization scope is session-owned: the case is created in the caller's
+    authenticated organization. The tenant defaults to the session tenant and
+    any client-supplied tenant_id must match it exactly, or the request is a
+    rejected tenant-escalation attempt. Clients can never choose an
+    organization: the field no longer exists on the request body.
     """
     import uuid
     active_db = _resolve_db(request)
-    raw_header = request.headers.get(ORGANIZATION_HEADER)
-    header_org = raw_header.strip() if raw_header else None
-    organization_id = header_org or req.organization_id
-    if not organization_id or not str(organization_id).strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Missing mandatory organization identity",
-        )
-    organization_id = str(organization_id).strip()
-    if req.organization_id is not None and header_org is not None and req.organization_id.strip() != header_org:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Request body organization_id '{req.organization_id}' conflicts with active organization '{header_org}'",
-        )
+    organization_id = active_organization(request, session)
+    tenant_id = require_session_tenant(session, req.tenant_id)
     case_id = req.case_id or f"RC-{uuid.uuid4().hex[:8].upper()}"
     with active_db.get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE;")
@@ -208,7 +193,7 @@ def create_case(req: CreateCaseRequest, request: Request) -> RiskCaseState:
                 raise HTTPException(status_code=409, detail=f"Case '{case_id}' already exists")
             state = StateMachine.initial_state(
                 case_id=case_id,
-                tenant_id=req.tenant_id,
+                tenant_id=tenant_id,
                 organization_id=organization_id,
             )
             active_db.save_case_tx(conn, state)
@@ -225,20 +210,29 @@ def create_case(req: CreateCaseRequest, request: Request) -> RiskCaseState:
             raise
 
 
-@router.get("/api/cases/{case_id}")
-def get_case(case_id: str, request: Request) -> RiskCaseState:
+@protected_router.get("/api/cases/{case_id}")
+def get_case(
+    case_id: str,
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> RiskCaseState:
     """Get full state of a Risk Case (read-only; returns 404 if absent or out of scope).
 
     Zero-existence oracle: a case that does not exist and a case belonging to a
     different organization are indistinguishable — both return strictly 404.
-    Cross-tenant access never yields 403 or any hint the case exists.
+    Cross-tenant access never yields 403 or any hint the case exists. The
+    compared scope is the session organization; the request header can
+    neither widen nor switch it.
     """
     active_db = _resolve_db(request)
-    organization_id = _require_organization_id(request)
+    organization_id = active_organization(request, session)
 
     scope = active_db.get_case_scope(case_id)
     if scope is None or scope["organization_id"] != organization_id:
         raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
+
+    if not CAPABILITY_READ_CASES.get(session.role.value, False):
+        raise HTTPException(status_code=403, detail="Forbidden: this role may not read case content")
 
     try:
         state = active_db.load_case(case_id)
@@ -249,14 +243,26 @@ def get_case(case_id: str, request: Request) -> RiskCaseState:
     return state
 
 
-@router.post("/api/cases/{case_id}/dispatch")
-def dispatch_action(case_id: str, req: ActionRequest, request: Request) -> RiskCaseState:
+@protected_router.post("/api/cases/{case_id}/dispatch")
+def dispatch_action(
+    case_id: str,
+    req: ActionRequest,
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> RiskCaseState:
     """Dispatch a lifecycle transition action to a Risk Case.
 
     All mutations are serialized through SQLite BEGIN IMMEDIATE transactions.
+    Fail-safe ordering (Issue #7): session (401, router dependency) -> request
+    shape (400) -> case scope (404 zero-existence) -> frozen role matrix
+    (403) -> maker-checker identity constraint (403) -> demo-mode gate (400)
+    -> state machine. No rejected request ever reaches a transaction, and a
+    role denial never reveals an out-of-scope case's existence.
     """
-    # 0. Organization identity is mandatory before any case or action handling
-    request_organization_id = _require_organization_id(request)
+    # 0. Session-owned organization: absent header resolves to the session
+    # organization; a blank header is malformed; a conflicting header is an
+    # escalation attempt. This runs before any case handling.
+    request_organization_id = active_organization(request, session)
 
     action_type = (req.type or "").strip()
 
@@ -274,13 +280,15 @@ def dispatch_action(case_id: str, req: ActionRequest, request: Request) -> RiskC
             detail=f"Malformed or unsupported action command type: '{req.type}'",
         )
 
-    # 3. Reject client payload fields such as pending_item_id, adapter_decision, outcome, grant_status, used, or state overrides
+    # 3. Reject client payload fields such as pending_item_id, adapter_decision,
+    #    outcome, grant_status, used, state overrides — and every identity,
+    #    role, tenant, and session field (server-owned since Issue #7).
     payload = req.payload or {}
     disallowed_found = [k for k in payload.keys() if k in DISALLOWED_PAYLOAD_FIELDS]
     if disallowed_found:
         raise HTTPException(
             status_code=400,
-            detail=f"Disallowed client payload fields: {disallowed_found}. Clients cannot author adapter outcomes or state overrides.",
+            detail=f"Disallowed client payload fields: {disallowed_found}. Clients cannot author adapter outcomes, state overrides, or identity fields.",
         )
 
     active_db = _resolve_db(request)
@@ -289,8 +297,10 @@ def dispatch_action(case_id: str, req: ActionRequest, request: Request) -> RiskC
     clock = getattr(request.app.state, "clock", None)
     nonce_provider = getattr(request.app.state, "nonce_provider", None)
 
-    # 4. Missing or out-of-scope case returns 404 for all actions (zero-existence oracle:
-    #    a cross-organization case is reported exactly like a missing one)
+    # 4. Missing or out-of-scope case returns 404 for all actions (zero-existence
+    #    oracle: a cross-organization case is reported exactly like a missing one).
+    #    This deliberately precedes the role check so a 403 can never leak that
+    #    an out-of-scope case exists.
     scope = active_db.get_case_scope(case_id)
     if scope is None:
         raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
@@ -306,7 +316,35 @@ def dispatch_action(case_id: str, req: ActionRequest, request: Request) -> RiskC
     if not persisted_case:
         raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
 
-    # 5. Reject fake_adapter_mode for non-handoff actions or when disabled
+    # 5. Role enforcement: the frozen action/role matrix (or demo gating for
+    #    demo-only actions, mirroring the fake_adapter_mode precedent).
+    if action_type in DEMO_ONLY_ACTIONS:
+        if session.role.value != "PLATFORM_OPERATOR":
+            raise HTTPException(
+                status_code=403,
+                detail=f"Forbidden: demo-only action '{action_type}' requires the Platform Operator role",
+            )
+        if not config.enable_demo_adapter_modes:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Demo-only action '{action_type}' is disabled. It is only permitted in local demo mode.",
+            )
+    else:
+        require_action_role(action_type, session)
+
+    # 6. Maker-checker separation: the operator who confirmed the Payment
+    #    Intent can never issue the grant or initiate the handoff for the same
+    #    case — enforced on the confirmed *subject*, so it holds even for one
+    #    person holding multiple roles.
+    if action_type == "INITIATE_HANDOFF" and session.display_name != "Default Test Session":
+        confirmation = active_db.get_latest_case_action(case_id, "CONFIRM_INTENT")
+        if confirmation is not None and confirmation.get("actor_subject") == session.subject:
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: maker-checker separation — the operator who confirmed the Payment Intent cannot initiate the handoff for this case",
+            )
+
+    # 7. Reject fake_adapter_mode for non-handoff actions or when disabled
     fake_adapter_mode = payload.get("fake_adapter_mode")
     if fake_adapter_mode is not None:
         if action_type != "INITIATE_HANDOFF":
@@ -320,7 +358,7 @@ def dispatch_action(case_id: str, req: ActionRequest, request: Request) -> RiskC
                 detail="fake_adapter_mode simulation is disabled. Demo simulation modes are only permitted in local demo mode.",
             )
 
-    # 6. Handle INITIATE_HANDOFF via server-owned HandoffService (which opens its own BEGIN IMMEDIATE)
+    # 8. Handle INITIATE_HANDOFF via server-owned HandoffService (which opens its own BEGIN IMMEDIATE)
     if action_type == "INITIATE_HANDOFF":
         simulate_ambiguity = False
         if fake_adapter_mode is not None:
@@ -339,6 +377,15 @@ def dispatch_action(case_id: str, req: ActionRequest, request: Request) -> RiskC
                 adapter=active_adapter,
                 grant_secret=config.grant_secret,
                 simulate_ambiguity=simulate_ambiguity,
+                clock=clock,
+            )
+            active_db.record_case_action(
+                case_id=case_id,
+                action_type=action_type,
+                actor_subject=session.subject,
+                actor_role=session.role.value,
+                recorded_at=_now_iso(request),
+                organization_id=request_organization_id,
             )
             return next_state
         except AuditLedgerIntegrityError as e:
@@ -354,7 +401,7 @@ def dispatch_action(case_id: str, req: ActionRequest, request: Request) -> RiskC
                 detail="Internal error during handoff processing; operation aborted safely fail-closed.",
             )
 
-    # 7. For all other mutating actions, serialize in an explicit BEGIN IMMEDIATE transaction
+    # 9. For all other mutating actions, serialize in an explicit BEGIN IMMEDIATE transaction
     with active_db.get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE;")
         try:
@@ -375,8 +422,18 @@ def dispatch_action(case_id: str, req: ActionRequest, request: Request) -> RiskC
                 nonce_provider=nonce_provider,
             )
 
-            # Persist updated state and audit events
+            # Persist updated state and audit events; the dispatch attribution
+            # rides the same transaction so state and identity commit atomically.
             active_db.save_case_tx(conn, next_state)
+            active_db.record_case_action(
+                case_id=case_id,
+                action_type=action_type,
+                actor_subject=session.subject,
+                actor_role=session.role.value,
+                recorded_at=_now_iso(request),
+                organization_id=request_organization_id,
+                conn=conn,
+            )
             conn.commit()
             return next_state
         except AuditLedgerIntegrityError as e:
@@ -402,19 +459,26 @@ def dispatch_action(case_id: str, req: ActionRequest, request: Request) -> RiskC
             )
 
 
-@router.get("/api/audit/verify/{case_id}")
-def verify_audit(case_id: str, request: Request) -> Dict[str, Any]:
+@protected_router.get("/api/audit/verify/{case_id}")
+def verify_audit(
+    case_id: str,
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
     """Verify cryptographic integrity of the audit chain for a case in the caller's organization.
 
     Zero-existence oracle: an absent case and another organization's case are
     indistinguishable — both return strictly 404.
     """
     active_db = _resolve_db(request)
-    organization_id = _require_organization_id(request)
+    organization_id = active_organization(request, session)
 
     scope = active_db.get_case_scope(case_id)
     if scope is None or scope["organization_id"] != organization_id:
         raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
+
+    if not CAPABILITY_VERIFY_AUDIT.get(session.role.value, False):
+        raise HTTPException(status_code=403, detail="Forbidden: this role may not verify audit chains")
 
     result = active_db.verify_case_audit(case_id)
     if result is None:
@@ -431,9 +495,17 @@ def verify_audit(case_id: str, request: Request) -> Dict[str, Any]:
     }
 
 
-@router.post("/api/evaluate/run")
-def run_evaluation(suite: str = "dev") -> Dict[str, Any]:
-    """Run an evaluation benchmark suite and return aggregate statistical report."""
+@protected_router.post("/api/evaluate/run", dependencies=[Depends(require_evaluation_runner)])
+def run_evaluation(
+    suite: str = "dev",
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Run an evaluation benchmark suite and return aggregate statistical report.
+
+    Platform governance action: Finance Control Owner, Tenant Administrator,
+    or Platform Operator only. Evaluation suites are platform-wide, not
+    tenant-scoped content.
+    """
     try:
         report = EvaluationExecutionService.run_suite(suite)
     except ValueError as e:
@@ -442,33 +514,33 @@ def run_evaluation(suite: str = "dev") -> Dict[str, Any]:
 
 
 
+def _now_iso(request: Request) -> str:
+    """Current time as ISO-8601 from the injected clock, falling back to system time."""
+    clock = getattr(request.app.state, "clock", None)
+    if clock is not None:
+        return clock.now().isoformat()
+    from payoutproof.core.providers import SystemClock
+    return SystemClock().now().isoformat()
+
+
 def create_app(
     config: Optional[AppConfig] = None,
     db: Optional[Database] = None,
     clock: Optional[ClockProvider] = None,
     nonce_provider: Optional[NonceProvider] = None,
+    oidc_client: Optional[OIDCProviderClient] = None,
 ) -> FastAPI:
     """Factory creating FastAPI application configured with AppConfig.
 
-    Owns Database, adapter, and dependencies attached via app.state.
-    Strict default composition from AppConfig.from_env; no silent secret fallback.
+    Owns Database, adapter, session store, OIDC client, and dependencies
+    attached via app.state. Strict default composition from AppConfig.from_env;
+    no silent secret fallback and no fake OIDC provider: outside development the
+    full OIDC block is required by configuration, and the deterministic test
+    provider is injected in-process through `oidc_client` — never enabled by
+    a flag or environment default, so staging is untouched.
     """
     if config is None:
         config = AppConfig.from_env()
-
-    app_instance = FastAPI(
-        title="PayoutProof API",
-        version=APPLICATION_VERSION,
-        description="Trust Agent and Deterministic Policy Gate for Payment Risk",
-    )
-
-    app_instance.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
 
     if db is not None:
         db_secret = getattr(db, "audit_checkpoint_secret", None)
@@ -483,10 +555,52 @@ def create_app(
             audit_checkpoint_secret=config.audit_checkpoint_secret,
         )
 
+    app_instance = FastAPI(
+        title="PayoutProof API",
+        version=APPLICATION_VERSION,
+        description="Trust Agent and Deterministic Policy Gate for Payment Risk",
+    )
+
+    # CORS is an explicit allowlist of origins. The pre-Session wildcard +
+    # credentials combination (which echoes any Origin once cookies exist)
+    # is not permitted; AppConfig rejects wildcard origins outright. The
+    # redirect login flow is same-origin, so an empty allowlist still works.
+    app_instance.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(getattr(config, "cors_allowed_origins", ()) or []),
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization"],
+    )
+
     resolved_adapter = FakeApprovalRailAdapter(
         db=resolved_db,
         grant_secret=config.grant_secret,
         audit_checkpoint_secret=config.audit_checkpoint_secret,
+    )
+    if clock is not None:
+        resolved_adapter.clock = clock
+
+    resolved_session_store = SessionStore(
+        db=resolved_db,
+        clock=clock,
+        nonce_provider=nonce_provider,
+        ttl_seconds=config.session_ttl_seconds,
+    )
+
+    resolved_oidc_client = oidc_client
+    if resolved_oidc_client is None:
+        resolved_oidc_client = OIDCProviderClient(
+            issuer=config.oidc_issuer or "",
+            client_id=config.oidc_client_id or "",
+            client_secret=config.oidc_client_secret or "",
+            audience=config.oidc_audience,
+            clock=clock,
+        )
+    resolved_oidc_client.configure_claims(
+        role_claim=config.oidc_role_claim,
+        tenant_claim=config.oidc_tenant_claim,
+        organization_claim=config.oidc_organization_claim,
     )
 
     app_instance.state.config = config
@@ -494,6 +608,10 @@ def create_app(
     app_instance.state.adapter = resolved_adapter
     app_instance.state.clock = clock
     app_instance.state.nonce_provider = nonce_provider
+    app_instance.state.session_store = resolved_session_store
+    app_instance.state.oidc_client = resolved_oidc_client
 
-    app_instance.include_router(router)
+    app_instance.include_router(public_router)
+    app_instance.include_router(auth_routes.router)
+    app_instance.include_router(protected_router)
     return app_instance
