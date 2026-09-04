@@ -71,7 +71,7 @@ PLATFORM_GLOBAL_REQUESTS_PER_HOUR = 1_000
 # Pre-parse request-body ceiling (>= item ceiling + JSON-escape headroom).
 PLATFORM_MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024
 
-# Exactly mirrors admission.validator.ALLOWED_MIME_TYPES (7 formats).
+# Exactly mirrors admission.validator.ALLOWED_MIME_TYPES (10 formats).
 PLATFORM_SUPPORTED_FORMATS: FrozenSet[str] = frozenset({
     "audio/wav",
     "audio/x-wav",
@@ -80,6 +80,9 @@ PLATFORM_SUPPORTED_FORMATS: FrozenSet[str] = frozenset({
     "audio/ogg",
     "text/plain",
     "application/json",
+    "application/pdf",
+    "image/png",
+    "image/jpeg",
 })
 
 # Sentinel organization_id for the global platform backstop bucket, and the

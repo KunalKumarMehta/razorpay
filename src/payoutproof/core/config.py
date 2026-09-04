@@ -79,6 +79,8 @@ class AppConfig:
     enable_settings_admin: bool = False
     settings_admin_token: Optional[str] = field(default=None, repr=False)
     database_url: Optional[str] = field(default=None, repr=False)
+    evidence_encryption_key: Optional[str] = field(default=None, repr=False)
+    object_store_path: str = "data/evidence_store"
 
     def __post_init__(self) -> None:
         if self.grant_key_ring is not None:
@@ -180,6 +182,10 @@ class AppConfig:
                 "settings_admin_token is configured but enable_settings_admin is false; "
                 "remove the token or enable the flag."
             )
+        if self.evidence_encryption_key is not None and len(self.evidence_encryption_key.strip()) < 32:
+            raise ConfigurationError(
+                "evidence_encryption_key must be at least 32 characters."
+            )
 
     def _validate_oidc_block(self) -> None:
         """The OIDC block is present or absent as a whole; partial configurations fail closed."""
@@ -237,6 +243,8 @@ class AppConfig:
             "enable_settings_admin": self.enable_settings_admin,
             "settings_admin_token": "[REDACTED]" if self.settings_admin_token else None,
             "database_url": "[REDACTED]" if self.database_url else None,
+            "evidence_encryption_key": "[REDACTED]" if self.evidence_encryption_key else None,
+            "object_store_path": self.object_store_path,
         }
 
     def __repr__(self) -> str:
@@ -258,7 +266,9 @@ class AppConfig:
             f"cors_allowed_origins={self.cors_allowed_origins!r}, "
             f"enable_settings_admin={self.enable_settings_admin!r}, "
             f"settings_admin_token='[REDACTED]' if self.settings_admin_token else None, "
-            f"database_url='[REDACTED]' if self.database_url else None"
+            f"database_url='[REDACTED]' if self.database_url else None, "
+            f"evidence_encryption_key='[REDACTED]' if self.evidence_encryption_key else None, "
+            f"object_store_path={self.object_store_path!r}"
             f")"
         )
 
@@ -379,6 +389,21 @@ class AppConfig:
             if origin.strip()
         ) if cors_raw else ()
 
+        evidence_encryption_key = environ.get("PAYOUTPROOF_EVIDENCE_ENCRYPTION_KEY") or None
+        if evidence_encryption_key is not None:
+            evidence_encryption_key = evidence_encryption_key.strip() or None
+        if not evidence_encryption_key:
+            if is_dev:
+                evidence_encryption_key = secrets.token_urlsafe(32)
+                missing_any = True
+            else:
+                evidence_encryption_key = secrets.token_urlsafe(32)
+
+        object_store_path = (
+            environ.get("PAYOUTPROOF_OBJECT_STORE_PATH", "data/evidence_store").strip()
+            or "data/evidence_store"
+        )
+
         # Issue #10: tenant operating-settings admin surface. Strictly opt-in:
         # the flag defaults off, and when off the token must not be set at all
         # (a token-without-flag is rejected in __post_init__ as drift).
@@ -441,6 +466,8 @@ class AppConfig:
             enable_settings_admin=enable_settings_admin,
             settings_admin_token=settings_admin_token,
             database_url=database_url,
+            evidence_encryption_key=evidence_encryption_key,
+            object_store_path=object_store_path,
         )
 
     @classmethod
@@ -465,6 +492,8 @@ class AppConfig:
         enable_settings_admin: bool = False,
         settings_admin_token: Optional[str] = None,
         database_url: Optional[str] = None,
+        evidence_encryption_key: Optional[str] = None,
+        object_store_path: str = "data/test_evidence_store",
     ) -> AppConfig:
         """Compose configuration explicitly for tests.
 
@@ -491,6 +520,9 @@ class AppConfig:
             membership_secret = DEFAULT_TEST_MEMBERSHIP_SECRET
         if not membership_secret:
             raise ConfigurationError("membership_secret is required for tests.")
+
+        if evidence_encryption_key is None:
+            evidence_encryption_key = "test-evidence-encryption-key-32-chars-long"
 
         if oidc_issuer is None:
             oidc_issuer = cls.DEVELOPMENT_LOCAL_ISSUER
@@ -528,4 +560,6 @@ class AppConfig:
             enable_settings_admin=enable_settings_admin,
             settings_admin_token=settings_admin_token,
             database_url=database_url,
+            evidence_encryption_key=evidence_encryption_key,
+            object_store_path=object_store_path,
         )

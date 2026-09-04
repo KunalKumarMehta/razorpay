@@ -985,6 +985,31 @@ class Database:
                 for col_stmt in [
                     "ALTER TABLE case_audit_checkpoints ADD COLUMN IF NOT EXISTS key_id TEXT;",
                     "ALTER TABLE handoff_grants ADD COLUMN IF NOT EXISTS key_id TEXT;",
+                    """CREATE TABLE IF NOT EXISTS admitted_evidence (
+                        evidence_id TEXT PRIMARY KEY,
+                        tenant_id TEXT NOT NULL,
+                        organization_id TEXT NOT NULL,
+                        case_id TEXT,
+                        item_type TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        content_hash TEXT NOT NULL,
+                        detected_mime_type TEXT NOT NULL,
+                        claimed_mime_type TEXT NOT NULL,
+                        plaintext_size_bytes INTEGER NOT NULL,
+                        ciphertext_size_bytes INTEGER NOT NULL,
+                        storage_uri TEXT NOT NULL,
+                        encryption_algorithm TEXT NOT NULL,
+                        key_id TEXT,
+                        authority_ref TEXT NOT NULL,
+                        data_class TEXT NOT NULL,
+                        retention_days INTEGER NOT NULL,
+                        lifecycle_status TEXT NOT NULL,
+                        admitted_at TEXT NOT NULL,
+                        retention_expires_at TEXT,
+                        quarantine_reason TEXT
+                    );""",
+                    "CREATE INDEX IF NOT EXISTS idx_admitted_evidence_case ON admitted_evidence(case_id);",
+                    "CREATE INDEX IF NOT EXISTS idx_admitted_evidence_org ON admitted_evidence(organization_id);",
                 ]:
                     try:
                         conn.execute(col_stmt)
@@ -995,6 +1020,32 @@ class Database:
 
         with self.get_connection() as conn:
             conn.executescript("""
+                CREATE TABLE IF NOT EXISTS admitted_evidence (
+                    evidence_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    organization_id TEXT NOT NULL,
+                    case_id TEXT,
+                    item_type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    detected_mime_type TEXT NOT NULL,
+                    claimed_mime_type TEXT NOT NULL,
+                    plaintext_size_bytes INTEGER NOT NULL,
+                    ciphertext_size_bytes INTEGER NOT NULL,
+                    storage_uri TEXT NOT NULL,
+                    encryption_algorithm TEXT NOT NULL,
+                    key_id TEXT,
+                    authority_ref TEXT NOT NULL,
+                    data_class TEXT NOT NULL,
+                    retention_days INTEGER NOT NULL,
+                    lifecycle_status TEXT NOT NULL,
+                    admitted_at TEXT NOT NULL,
+                    retention_expires_at TEXT,
+                    quarantine_reason TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_admitted_evidence_case ON admitted_evidence(case_id);
+                CREATE INDEX IF NOT EXISTS idx_admitted_evidence_org ON admitted_evidence(organization_id);
+
                 CREATE TABLE IF NOT EXISTS risk_cases (
                     case_id TEXT PRIMARY KEY,
                     tenant_id TEXT NOT NULL,
@@ -6414,4 +6465,198 @@ class Database:
             ),
         ).fetchone()
         return int(row[0])
+
+    def save_admitted_evidence_tx(
+        self,
+        conn: sqlite3.Connection,
+        evidence_id: str,
+        tenant_id: str,
+        organization_id: str,
+        case_id: Optional[str],
+        item_type: str,
+        title: str,
+        content_hash: str,
+        detected_mime_type: str,
+        claimed_mime_type: str,
+        plaintext_size_bytes: int,
+        ciphertext_size_bytes: int,
+        storage_uri: str,
+        encryption_algorithm: str,
+        key_id: Optional[str],
+        authority_ref: str,
+        data_class: str,
+        retention_days: int,
+        lifecycle_status: str,
+        admitted_at: str,
+        retention_expires_at: Optional[str] = None,
+        quarantine_reason: Optional[str] = None,
+    ) -> None:
+        """Persist an admitted or quarantined evidence record to the ledger."""
+        # Check if record already exists; if so, update, else insert.
+        existing = conn.execute(
+            "SELECT evidence_id FROM admitted_evidence WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE admitted_evidence SET
+                    tenant_id = ?,
+                    organization_id = ?,
+                    case_id = ?,
+                    item_type = ?,
+                    title = ?,
+                    content_hash = ?,
+                    detected_mime_type = ?,
+                    claimed_mime_type = ?,
+                    plaintext_size_bytes = ?,
+                    ciphertext_size_bytes = ?,
+                    storage_uri = ?,
+                    encryption_algorithm = ?,
+                    key_id = ?,
+                    authority_ref = ?,
+                    data_class = ?,
+                    retention_days = ?,
+                    lifecycle_status = ?,
+                    admitted_at = ?,
+                    retention_expires_at = ?,
+                    quarantine_reason = ?
+                WHERE evidence_id = ?
+                """,
+                (
+                    tenant_id,
+                    organization_id,
+                    case_id,
+                    item_type,
+                    title,
+                    content_hash,
+                    detected_mime_type,
+                    claimed_mime_type,
+                    int(plaintext_size_bytes),
+                    int(ciphertext_size_bytes),
+                    storage_uri,
+                    encryption_algorithm,
+                    key_id,
+                    authority_ref,
+                    data_class,
+                    int(retention_days),
+                    lifecycle_status,
+                    admitted_at,
+                    retention_expires_at,
+                    quarantine_reason,
+                    evidence_id,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO admitted_evidence (
+                    evidence_id,
+                    tenant_id,
+                    organization_id,
+                    case_id,
+                    item_type,
+                    title,
+                    content_hash,
+                    detected_mime_type,
+                    claimed_mime_type,
+                    plaintext_size_bytes,
+                    ciphertext_size_bytes,
+                    storage_uri,
+                    encryption_algorithm,
+                    key_id,
+                    authority_ref,
+                    data_class,
+                    retention_days,
+                    lifecycle_status,
+                    admitted_at,
+                    retention_expires_at,
+                    quarantine_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    evidence_id,
+                    tenant_id,
+                    organization_id,
+                    case_id,
+                    item_type,
+                    title,
+                    content_hash,
+                    detected_mime_type,
+                    claimed_mime_type,
+                    int(plaintext_size_bytes),
+                    int(ciphertext_size_bytes),
+                    storage_uri,
+                    encryption_algorithm,
+                    key_id,
+                    authority_ref,
+                    data_class,
+                    int(retention_days),
+                    lifecycle_status,
+                    admitted_at,
+                    retention_expires_at,
+                    quarantine_reason,
+                ),
+            )
+
+    def save_admitted_evidence(self, **kwargs: Any) -> None:
+        """Persist an admitted evidence record using a fresh connection."""
+        with self.get_connection() as conn:
+            self.save_admitted_evidence_tx(conn, **kwargs)
+
+    def load_admitted_evidence_tx(
+        self,
+        conn: sqlite3.Connection,
+        evidence_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Load an admitted evidence record by its primary key."""
+        row = conn.execute(
+            "SELECT * FROM admitted_evidence WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return dict(row)
+
+    def load_admitted_evidence(self, evidence_id: str) -> Optional[Dict[str, Any]]:
+        """Load an admitted evidence record by its primary key using a fresh connection."""
+        with self.get_connection() as conn:
+            return self.load_admitted_evidence_tx(conn, evidence_id)
+
+    def list_case_evidence_tx(
+        self,
+        conn: sqlite3.Connection,
+        case_id: str,
+        organization_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List all admitted evidence items associated with a case."""
+        if organization_id is not None:
+            rows = conn.execute(
+                """
+                SELECT * FROM admitted_evidence
+                WHERE case_id = ? AND organization_id = ?
+                ORDER BY admitted_at ASC
+                """,
+                (case_id, organization_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM admitted_evidence
+                WHERE case_id = ?
+                ORDER BY admitted_at ASC
+                """,
+                (case_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_case_evidence(
+        self,
+        case_id: str,
+        organization_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List all admitted evidence items associated with a case using a fresh connection."""
+        with self.get_connection() as conn:
+            return self.list_case_evidence_tx(conn, case_id, organization_id)
+
 

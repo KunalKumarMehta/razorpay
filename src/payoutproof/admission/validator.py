@@ -13,10 +13,15 @@ ALLOWED_MIME_TYPES = {
     "audio/ogg",
     "text/plain",
     "application/json",
+    "application/pdf",
+    "image/png",
+    "image/jpeg",
 }
 
-MAX_AUDIO_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
-MAX_TEXT_SIZE_BYTES = 1 * 1024 * 1024    # 1 MB
+MAX_AUDIO_SIZE_BYTES = 10 * 1024 * 1024       # 10 MB
+MAX_TEXT_SIZE_BYTES = 1 * 1024 * 1024          # 1 MB
+MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024     # 10 MB
+MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024        # 10 MB
 
 
 class AdmissionValidator:
@@ -117,7 +122,13 @@ class AdmissionValidator:
         if "audio" in normalized_mime and len(content_bytes) > MAX_AUDIO_SIZE_BYTES:
             return False, None, f"Audio exceeds size limit ({MAX_AUDIO_SIZE_BYTES} bytes)"
 
-        if ("text" in normalized_mime or "application" in normalized_mime) and len(content_bytes) > MAX_TEXT_SIZE_BYTES:
+        if "pdf" in normalized_mime and len(content_bytes) > MAX_DOCUMENT_SIZE_BYTES:
+            return False, None, f"Document exceeds size limit ({MAX_DOCUMENT_SIZE_BYTES} bytes)"
+
+        if "image" in normalized_mime and len(content_bytes) > MAX_IMAGE_SIZE_BYTES:
+            return False, None, f"Image exceeds size limit ({MAX_IMAGE_SIZE_BYTES} bytes)"
+
+        if ("text" in normalized_mime or "json" in normalized_mime) and len(content_bytes) > MAX_TEXT_SIZE_BYTES:
             return False, None, f"Payload exceeds size limit ({MAX_TEXT_SIZE_BYTES} bytes)"
 
         content_hash = sha256_hex(content_bytes)

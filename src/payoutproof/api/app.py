@@ -16,6 +16,7 @@ per-route hand-rolled checks and not middleware added only in `create_app`
 — so every application instance that includes this router is protected.
 """
 
+import base64
 import hmac
 import secrets
 import sqlite3
@@ -24,6 +25,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from fastapi import Depends, FastAPI, HTTPException, Request, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from payoutproof.core.models import RiskCaseState
@@ -1660,6 +1662,131 @@ def run_evaluation(
     return report.model_dump(mode="json")
 
 
+class AdmitEvidenceRequest(BaseModel):
+    case_id: str
+    item_type: str = "DOCUMENT"
+    title: str = "Uploaded Evidence"
+    content_base64: str
+    declared_mime_type: Optional[str] = None
+    processing_authority: Optional[Dict[str, Any]] = None
+    evidence_id: Optional[str] = None
+
+
+@protected_router.post("/api/evidence/admit")
+async def admit_evidence_endpoint(
+    request: Request,
+    payload: AdmitEvidenceRequest,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Admit authorized real evidence into encrypted storage and transactional ledger."""
+    organization_id = active_organization(request, session)
+    tenant_id = session.tenant_id
+
+    try:
+        content_bytes = base64.b64decode(payload.content_base64)
+    except Exception:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid base64 encoding in content_base64",
+        )
+
+    admission_service = getattr(request.app.state, "admission_service", None)
+    if admission_service is None:
+        raise HTTPException(status_code=500, detail="AdmissionService not configured")
+
+    from payoutproof.admission.service import AdmissionStatus
+    result = admission_service.admit_evidence(
+        case_id=payload.case_id,
+        tenant_id=tenant_id,
+        organization_id=organization_id,
+        processing_authority=payload.processing_authority,
+        content=content_bytes,
+        declared_mime_type=payload.declared_mime_type,
+        title=payload.title,
+        evidence_id=payload.evidence_id,
+    )
+
+    if result.status == AdmissionStatus.ADMISSION_REJECTED:
+        return JSONResponse(
+            status_code=400,
+            content=result.to_safe_dict(),
+        )
+    elif result.status == AdmissionStatus.QUARANTINED:
+        return JSONResponse(
+            status_code=422,
+            content=result.to_safe_dict(),
+        )
+
+    return result.to_safe_dict()
+
+
+@protected_router.get("/api/evidence/{evidence_id}/status")
+async def get_evidence_status_endpoint(
+    request: Request,
+    evidence_id: str,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Retrieve safe metadata and lifecycle status for admitted evidence."""
+    organization_id = active_organization(request, session)
+    active_db = _resolve_db(request)
+
+    record = active_db.load_admitted_evidence(evidence_id)
+    if not record or record.get("organization_id") != organization_id:
+        raise HTTPException(status_code=404, detail=f"Evidence {evidence_id} not found")
+
+    return {
+        "evidence_id": record["evidence_id"],
+        "case_id": record.get("case_id"),
+        "tenant_id": record["tenant_id"],
+        "organization_id": record["organization_id"],
+        "item_type": record["item_type"],
+        "title": record["title"],
+        "content_hash": record["content_hash"],
+        "detected_mime_type": record["detected_mime_type"],
+        "claimed_mime_type": record["claimed_mime_type"],
+        "plaintext_size_bytes": record["plaintext_size_bytes"],
+        "ciphertext_size_bytes": record["ciphertext_size_bytes"],
+        "storage_uri": record["storage_uri"],
+        "encryption_algorithm": record["encryption_algorithm"],
+        "key_id": record.get("key_id"),
+        "lifecycle_status": record["lifecycle_status"],
+        "admitted_at": record["admitted_at"],
+        "quarantine_reason": record.get("quarantine_reason"),
+    }
+
+
+@protected_router.get("/api/cases/{case_id}/evidence")
+async def list_case_evidence_endpoint(
+    request: Request,
+    case_id: str,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """List all admitted evidence records bound to a case."""
+    organization_id = active_organization(request, session)
+    active_db = _resolve_db(request)
+
+    items = active_db.list_case_evidence(case_id, organization_id=organization_id)
+    safe_items = [
+        {
+            "evidence_id": r["evidence_id"],
+            "case_id": r.get("case_id"),
+            "item_type": r["item_type"],
+            "title": r["title"],
+            "content_hash": r["content_hash"],
+            "detected_mime_type": r["detected_mime_type"],
+            "claimed_mime_type": r["claimed_mime_type"],
+            "plaintext_size_bytes": r["plaintext_size_bytes"],
+            "ciphertext_size_bytes": r["ciphertext_size_bytes"],
+            "storage_uri": r["storage_uri"],
+            "encryption_algorithm": r["encryption_algorithm"],
+            "key_id": r.get("key_id"),
+            "lifecycle_status": r["lifecycle_status"],
+            "admitted_at": r["admitted_at"],
+        }
+        for r in items
+    ]
+    return {"case_id": case_id, "evidence": safe_items}
+
 
 def _now_iso(request: Request) -> str:
     """Current time as ISO-8601 from the injected clock, falling back to system time."""
@@ -1676,6 +1803,8 @@ def create_app(
     clock: Optional[ClockProvider] = None,
     nonce_provider: Optional[NonceProvider] = None,
     oidc_client: Optional[OIDCProviderClient] = None,
+    object_store: Optional[Any] = None,
+    admission_service: Optional[Any] = None,
 ) -> FastAPI:
     """Factory creating FastAPI application configured with AppConfig.
 
@@ -1751,6 +1880,24 @@ def create_app(
         organization_claim=config.oidc_organization_claim,
     )
 
+    resolved_object_store = object_store
+    if resolved_object_store is None:
+        from payoutproof.storage.encrypted_store import EncryptedObjectStore
+        enc_key = config.evidence_encryption_key or config.grant_secret
+        resolved_object_store = EncryptedObjectStore(
+            base_dir=config.object_store_path,
+            encryption_key=config.grant_key_ring or enc_key,
+        )
+
+    resolved_admission_service = admission_service
+    if resolved_admission_service is None:
+        from payoutproof.admission.service import AdmissionService
+        resolved_admission_service = AdmissionService(
+            db=resolved_db,
+            object_store=resolved_object_store,
+            clock=clock,
+        )
+
     app_instance.state.config = config
     app_instance.state.db = resolved_db
     app_instance.state.adapter = resolved_adapter
@@ -1758,6 +1905,8 @@ def create_app(
     app_instance.state.nonce_provider = nonce_provider
     app_instance.state.session_store = resolved_session_store
     app_instance.state.oidc_client = resolved_oidc_client
+    app_instance.state.object_store = resolved_object_store
+    app_instance.state.admission_service = resolved_admission_service
 
     app_instance.include_router(public_router)
     app_instance.include_router(auth_routes.router)
