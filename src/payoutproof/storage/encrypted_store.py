@@ -37,6 +37,11 @@ class DecryptionIntegrityError(ObjectStoreError):
     pass
 
 
+class SecurityScanError(ObjectStoreError):
+    """Raised when path traversal or security violation is detected."""
+    pass
+
+
 @dataclass(frozen=True)
 class StoredObjectRef:
     """Immutable descriptor of an encrypted object in storage."""

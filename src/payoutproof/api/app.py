@@ -1788,6 +1788,96 @@ async def list_case_evidence_endpoint(
     return {"case_id": case_id, "evidence": safe_items}
 
 
+class RunExtractionJobRequest(BaseModel):
+    evidence_id: str
+    simulation_mode: Optional[str] = None
+
+
+@protected_router.post("/api/cases/{case_id}/jobs/extract")
+async def run_extraction_job_endpoint(
+    request: Request,
+    case_id: str,
+    payload: RunExtractionJobRequest,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Enqueue and execute a Trust Agent extraction job for admitted evidence."""
+    organization_id = active_organization(request, session)
+    tenant_id = session.tenant_id
+
+    active_db = _resolve_db(request)
+    case_row = active_db.load_case(case_id)
+    if not case_row or case_row.organization_id != organization_id:
+        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+
+    trust_agent_service = getattr(request.app.state, "trust_agent_service", None)
+    if trust_agent_service is None:
+        raise HTTPException(status_code=500, detail="TrustAgentService not configured")
+
+    from payoutproof.agent.provider import SimulationMode
+    mode = None
+    if payload.simulation_mode:
+        try:
+            mode = SimulationMode(payload.simulation_mode.upper())
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid simulation_mode '{payload.simulation_mode}'. Valid: {[m.value for m in SimulationMode]}",
+            )
+
+    try:
+        job = trust_agent_service.run_extraction_job(
+            case_id=case_id,
+            evidence_id=payload.evidence_id,
+            tenant_id=tenant_id,
+            organization_id=organization_id,
+            simulation_mode=mode,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return job.to_public_dict()
+
+
+@protected_router.get("/api/jobs/{job_id}")
+async def get_extraction_job_endpoint(
+    request: Request,
+    job_id: str,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Retrieve public record and provenance of a Trust Agent extraction job."""
+    organization_id = active_organization(request, session)
+    trust_agent_service = getattr(request.app.state, "trust_agent_service", None)
+    if trust_agent_service is None:
+        raise HTTPException(status_code=500, detail="TrustAgentService not configured")
+
+    job = trust_agent_service.get_job(job_id, organization_id=organization_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    return job.to_public_dict()
+
+
+@protected_router.get("/api/cases/{case_id}/jobs")
+async def list_case_extraction_jobs_endpoint(
+    request: Request,
+    case_id: str,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """List all extraction jobs executed for a case."""
+    organization_id = active_organization(request, session)
+    trust_agent_service = getattr(request.app.state, "trust_agent_service", None)
+    if trust_agent_service is None:
+        raise HTTPException(status_code=500, detail="TrustAgentService not configured")
+
+    active_db = _resolve_db(request)
+    case_row = active_db.load_case(case_id)
+    if not case_row or case_row.organization_id != organization_id:
+        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+
+    jobs = trust_agent_service.list_case_jobs(case_id, organization_id=organization_id)
+    return {"case_id": case_id, "jobs": [j.to_public_dict() for j in jobs]}
+
+
 def _now_iso(request: Request) -> str:
     """Current time as ISO-8601 from the injected clock, falling back to system time."""
     clock = getattr(request.app.state, "clock", None)
@@ -1805,6 +1895,7 @@ def create_app(
     oidc_client: Optional[OIDCProviderClient] = None,
     object_store: Optional[Any] = None,
     admission_service: Optional[Any] = None,
+    trust_agent_service: Optional[Any] = None,
 ) -> FastAPI:
     """Factory creating FastAPI application configured with AppConfig.
 
@@ -1898,6 +1989,17 @@ def create_app(
             clock=clock,
         )
 
+    resolved_trust_agent_service = trust_agent_service
+    if resolved_trust_agent_service is None:
+        from payoutproof.agent.service import TrustAgentService
+        from payoutproof.agent.provider import DeterministicFakeProvider
+        resolved_trust_agent_service = TrustAgentService(
+            db=resolved_db,
+            object_store=resolved_object_store,
+            provider=DeterministicFakeProvider(),
+            clock=clock,
+        )
+
     app_instance.state.config = config
     app_instance.state.db = resolved_db
     app_instance.state.adapter = resolved_adapter
@@ -1907,6 +2009,7 @@ def create_app(
     app_instance.state.oidc_client = resolved_oidc_client
     app_instance.state.object_store = resolved_object_store
     app_instance.state.admission_service = resolved_admission_service
+    app_instance.state.trust_agent_service = resolved_trust_agent_service
 
     app_instance.include_router(public_router)
     app_instance.include_router(auth_routes.router)

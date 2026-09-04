@@ -1010,6 +1010,27 @@ class Database:
                     );""",
                     "CREATE INDEX IF NOT EXISTS idx_admitted_evidence_case ON admitted_evidence(case_id);",
                     "CREATE INDEX IF NOT EXISTS idx_admitted_evidence_org ON admitted_evidence(organization_id);",
+                    """CREATE TABLE IF NOT EXISTS extraction_jobs (
+                        job_id TEXT PRIMARY KEY,
+                        case_id TEXT NOT NULL,
+                        evidence_id TEXT NOT NULL,
+                        organization_id TEXT NOT NULL,
+                        tenant_id TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        provider_id TEXT NOT NULL,
+                        model_version TEXT NOT NULL,
+                        confidence REAL,
+                        timing_ms REAL,
+                        raw_output_ref TEXT,
+                        source_provenance_json TEXT NOT NULL,
+                        result_json TEXT,
+                        error_code TEXT,
+                        error_message TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );""",
+                    "CREATE INDEX IF NOT EXISTS idx_extraction_jobs_case ON extraction_jobs(case_id);",
+                    "CREATE INDEX IF NOT EXISTS idx_extraction_jobs_org ON extraction_jobs(organization_id);",
                 ]:
                     try:
                         conn.execute(col_stmt)
@@ -1045,6 +1066,28 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_admitted_evidence_case ON admitted_evidence(case_id);
                 CREATE INDEX IF NOT EXISTS idx_admitted_evidence_org ON admitted_evidence(organization_id);
+
+                CREATE TABLE IF NOT EXISTS extraction_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    case_id TEXT NOT NULL,
+                    evidence_id TEXT NOT NULL,
+                    organization_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    provider_id TEXT NOT NULL,
+                    model_version TEXT NOT NULL,
+                    confidence REAL,
+                    timing_ms REAL,
+                    raw_output_ref TEXT,
+                    source_provenance_json TEXT NOT NULL,
+                    result_json TEXT,
+                    error_code TEXT,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_extraction_jobs_case ON extraction_jobs(case_id);
+                CREATE INDEX IF NOT EXISTS idx_extraction_jobs_org ON extraction_jobs(organization_id);
 
                 CREATE TABLE IF NOT EXISTS risk_cases (
                     case_id TEXT PRIMARY KEY,
@@ -6658,5 +6701,175 @@ class Database:
         """List all admitted evidence items associated with a case using a fresh connection."""
         with self.get_connection() as conn:
             return self.list_case_evidence_tx(conn, case_id, organization_id)
+
+    def save_extraction_job_tx(
+        self,
+        conn: sqlite3.Connection,
+        job_id: str,
+        case_id: str,
+        evidence_id: str,
+        organization_id: str,
+        tenant_id: str,
+        status: str,
+        provider_id: str,
+        model_version: str,
+        confidence: Optional[float],
+        timing_ms: Optional[float],
+        raw_output_ref: Optional[str],
+        source_provenance_json: str,
+        result_json: Optional[str],
+        error_code: Optional[str],
+        error_message: Optional[str],
+        created_at: str,
+        updated_at: str,
+    ) -> None:
+        """Persist or update an extraction job record."""
+        existing = conn.execute(
+            "SELECT job_id FROM extraction_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE extraction_jobs SET
+                    case_id = ?,
+                    evidence_id = ?,
+                    organization_id = ?,
+                    tenant_id = ?,
+                    status = ?,
+                    provider_id = ?,
+                    model_version = ?,
+                    confidence = ?,
+                    timing_ms = ?,
+                    raw_output_ref = ?,
+                    source_provenance_json = ?,
+                    result_json = ?,
+                    error_code = ?,
+                    error_message = ?,
+                    updated_at = ?
+                WHERE job_id = ?
+                """,
+                (
+                    case_id,
+                    evidence_id,
+                    organization_id,
+                    tenant_id,
+                    status,
+                    provider_id,
+                    model_version,
+                    confidence,
+                    timing_ms,
+                    raw_output_ref,
+                    source_provenance_json,
+                    result_json,
+                    error_code,
+                    error_message,
+                    updated_at,
+                    job_id,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO extraction_jobs (
+                    job_id,
+                    case_id,
+                    evidence_id,
+                    organization_id,
+                    tenant_id,
+                    status,
+                    provider_id,
+                    model_version,
+                    confidence,
+                    timing_ms,
+                    raw_output_ref,
+                    source_provenance_json,
+                    result_json,
+                    error_code,
+                    error_message,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    case_id,
+                    evidence_id,
+                    organization_id,
+                    tenant_id,
+                    status,
+                    provider_id,
+                    model_version,
+                    confidence,
+                    timing_ms,
+                    raw_output_ref,
+                    source_provenance_json,
+                    result_json,
+                    error_code,
+                    error_message,
+                    created_at,
+                    updated_at,
+                ),
+            )
+
+    def save_extraction_job(self, **kwargs: Any) -> None:
+        """Persist an extraction job using a fresh connection."""
+        with self.get_connection() as conn:
+            self.save_extraction_job_tx(conn, **kwargs)
+
+    def load_extraction_job_tx(
+        self,
+        conn: sqlite3.Connection,
+        job_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Load an extraction job by primary key within transaction."""
+        row = conn.execute(
+            "SELECT * FROM extraction_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return dict(row)
+
+    def load_extraction_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Load an extraction job by primary key using a fresh connection."""
+        with self.get_connection() as conn:
+            return self.load_extraction_job_tx(conn, job_id)
+
+    def list_case_extraction_jobs_tx(
+        self,
+        conn: sqlite3.Connection,
+        case_id: str,
+        organization_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List all extraction jobs for a case (newest first)."""
+        if organization_id is not None:
+            rows = conn.execute(
+                """
+                SELECT * FROM extraction_jobs
+                WHERE case_id = ? AND organization_id = ?
+                ORDER BY created_at DESC
+                """,
+                (case_id, organization_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM extraction_jobs
+                WHERE case_id = ?
+                ORDER BY created_at DESC
+                """,
+                (case_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_case_extraction_jobs(
+        self,
+        case_id: str,
+        organization_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List all extraction jobs for a case using a fresh connection."""
+        with self.get_connection() as conn:
+            return self.list_case_extraction_jobs_tx(conn, case_id, organization_id)
 
 
