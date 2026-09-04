@@ -85,7 +85,9 @@ from payoutproof.auth.roles import (
     CAPABILITY_READ_CASES,
     CAPABILITY_VERIFY_AUDIT,
     CAPABILITY_RUN_EVALUATION,
+    CAPABILITY_EXPORT_CASE_AUDIT,
 )
+
 from payoutproof.auth.session import SessionRecord, SessionStore
 
 
@@ -746,7 +748,39 @@ def get_case(
     return state
 
 
+@protected_router.get("/api/cases/{case_id}/audit-export")
+def export_case_audit(
+    case_id: str,
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Export complete verifiable audit trail for a Risk Case.
+
+    Zero-existence oracle: missing case and cross-organization case return strictly 404
+    before role check.
+    Restricted strictly to AUDITOR role (or CAPABILITY_EXPORT_CASE_AUDIT).
+    """
+    active_db = _resolve_db(request)
+    organization_id = active_organization(request, session)
+
+    scope = active_db.get_case_scope(case_id)
+    if scope is None or scope["organization_id"] != organization_id:
+        raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
+
+    if not CAPABILITY_EXPORT_CASE_AUDIT.get(session.role.value, False):
+        raise HTTPException(status_code=403, detail="Forbidden: audit export is restricted to the Auditor role")
+
+    try:
+        from payoutproof.audit.export import build_case_export, CaseExportError
+        return build_case_export(active_db, case_id, organization_id=organization_id)
+    except AuditLedgerIntegrityError as e:
+        raise HTTPException(status_code=409, detail=f"Audit ledger integrity failure: {e}")
+    except CaseExportError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @protected_router.post("/api/cases/{case_id}/dispatch")
+
 def dispatch_action(
     case_id: str,
     req: ActionRequest,

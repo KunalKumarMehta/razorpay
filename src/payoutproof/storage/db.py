@@ -80,6 +80,7 @@ from payoutproof.core.crypto import (
     sha256_hex,
 )
 from payoutproof.audit.chain import GENESIS_HASH
+from payoutproof.core.keys import KeyRing
 
 # Typing-only imports: policy.config is imported lazily inside the Issue #9
 # methods to keep the storage layer importable even while policy modules are
@@ -888,7 +889,7 @@ class Database:
     def __init__(
         self,
         db_path: Optional[str | Path] = None,
-        audit_checkpoint_secret: Optional[str] = None,
+        audit_checkpoint_secret: Optional[str | KeyRing] = None,
         database_url: Optional[str] = None,
     ):
         if database_url:
@@ -908,14 +909,56 @@ class Database:
             else:
                 self.db_path = str(db_path)
 
-        if not audit_checkpoint_secret or not str(audit_checkpoint_secret).strip():
+        if not audit_checkpoint_secret:
             raise ValueError("audit_checkpoint_secret is required and cannot be empty")
-        if len(str(audit_checkpoint_secret).strip()) < 32:
-            raise ValueError("audit_checkpoint_secret must be at least 32 characters")
 
-        self.audit_checkpoint_secret = str(audit_checkpoint_secret)
+        if isinstance(audit_checkpoint_secret, KeyRing):
+            self.audit_ring = audit_checkpoint_secret
+            self.audit_checkpoint_secret = audit_checkpoint_secret.active_secret
+        else:
+            sec_str = str(audit_checkpoint_secret).strip()
+            if not sec_str:
+                raise ValueError("audit_checkpoint_secret is required and cannot be empty")
+            if len(sec_str) < 32:
+                raise ValueError("audit_checkpoint_secret must be at least 32 characters")
+            self.audit_checkpoint_secret = sec_str
+            self.audit_ring = KeyRing.from_single_key(sec_str, key_id="v1")
+
         self._test_fail_after_audit_insert = False
         self._init_db()
+
+    def _verify_checkpoint_row(self, cp_row: Any, case_id: str) -> Tuple[bool, Optional[str]]:
+        """Verify checkpoint MAC against KeyRing (active or retained keys)."""
+        kid = cp_row["key_id"] if "key_id" in cp_row.keys() else None
+        if kid:
+            sec = self.audit_ring.get_secret(kid)
+            if not sec:
+                return False, f"Audit checkpoint references unknown or retired key '{kid}'"
+            ok = verify_checkpoint_mac(
+                secret=sec,
+                case_id=case_id,
+                event_count=cp_row["event_count"],
+                tip_hash=cp_row["tip_hash"],
+                trust_state=cp_row["trust_state"],
+                checkpoint_mac=cp_row["checkpoint_mac"],
+                key_id=kid,
+            )
+            if not ok:
+                return False, "Audit checkpoint MAC verification failed (tampered checkpoint or wrong audit secret)"
+            return True, None
+        else:
+            for s in self.audit_ring.all_secrets:
+                if verify_checkpoint_mac(
+                    secret=s,
+                    case_id=case_id,
+                    event_count=cp_row["event_count"],
+                    tip_hash=cp_row["tip_hash"],
+                    trust_state=cp_row["trust_state"],
+                    checkpoint_mac=cp_row["checkpoint_mac"],
+                    key_id=None,
+                ):
+                    return True, None
+            return False, "Audit checkpoint MAC verification failed (tampered checkpoint or wrong audit secret)"
 
     def __repr__(self) -> str:
         if self.dialect == DIALECT_POSTGRESQL:
@@ -939,7 +982,17 @@ class Database:
             with self.get_connection() as conn:
                 runner = MigrationRunner(conn, dialect=DIALECT_POSTGRESQL)
                 runner.apply_pending()
+                for col_stmt in [
+                    "ALTER TABLE case_audit_checkpoints ADD COLUMN IF NOT EXISTS key_id TEXT;",
+                    "ALTER TABLE handoff_grants ADD COLUMN IF NOT EXISTS key_id TEXT;",
+                ]:
+                    try:
+                        conn.execute(col_stmt)
+                        conn.commit()
+                    except Exception:
+                        pass
             return
+
         with self.get_connection() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS risk_cases (
@@ -959,7 +1012,8 @@ class Database:
                     tip_hash TEXT NOT NULL,
                     trust_state TEXT NOT NULL,
                     checkpoint_mac TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    key_id TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS audit_events (
@@ -990,7 +1044,8 @@ class Database:
                     expires_at TEXT NOT NULL,
                     signature TEXT NOT NULL,
                     status TEXT NOT NULL,
-                    used INTEGER NOT NULL DEFAULT 0
+                    used INTEGER NOT NULL DEFAULT 0,
+                    key_id TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS adapter_attempts_quarantine (
@@ -1417,6 +1472,16 @@ class Database:
             runner = MigrationRunner(conn, dialect=DIALECT_SQLITE)
             runner.baseline_existing()
             runner.apply_pending()
+            for col_stmt in [
+                "ALTER TABLE case_audit_checkpoints ADD COLUMN key_id TEXT;",
+                "ALTER TABLE handoff_grants ADD COLUMN key_id TEXT;",
+            ]:
+                try:
+                    conn.execute(col_stmt)
+                    conn.commit()
+                except Exception:
+                    pass
+
 
     def _migrate_db(self, conn: sqlite3.Connection):
         """Idempotently migrate older schemas to required columns and constraints with duplicate quarantine."""
@@ -2005,11 +2070,19 @@ class Database:
             # Insert initial TRUSTED authenticated checkpoint
             count = len(events_to_persist)
             tip = events_to_persist[-1].current_hash
-            mac = compute_checkpoint_mac(self.audit_checkpoint_secret, state.case_id, count, tip, AuditTrustState.TRUSTED.value)
+            kid = self.audit_ring.active_key_id
+            mac = compute_checkpoint_mac(
+                self.audit_ring.active_secret,
+                state.case_id,
+                count,
+                tip,
+                AuditTrustState.TRUSTED.value,
+                key_id=kid,
+            )
             cp_cur = conn.execute("""
-                INSERT INTO case_audit_checkpoints (case_id, event_count, tip_hash, trust_state, checkpoint_mac, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?);
-            """, (state.case_id, count, tip, AuditTrustState.TRUSTED.value, mac, now_iso))
+                INSERT INTO case_audit_checkpoints (case_id, event_count, tip_hash, trust_state, checkpoint_mac, updated_at, key_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?);
+            """, (state.case_id, count, tip, AuditTrustState.TRUSTED.value, mac, now_iso, kid))
             if cp_cur.rowcount != 1:
                 raise AuditLedgerIntegrityError(f"Failed to insert case_audit_checkpoints row for case '{state.case_id}': expected 1 row affected, got {cp_cur.rowcount}")
 
@@ -2022,16 +2095,9 @@ class Database:
             if not isinstance(cp_row["event_count"], int) or isinstance(cp_row["event_count"], bool):
                 raise AuditLedgerIntegrityError(f"Checkpoint event_count is not an integer for case '{state.case_id}'")
 
-            is_mac_valid = verify_checkpoint_mac(
-                secret=self.audit_checkpoint_secret,
-                case_id=state.case_id,
-                event_count=cp_row["event_count"],
-                tip_hash=cp_row["tip_hash"],
-                trust_state=cp_row["trust_state"],
-                checkpoint_mac=cp_row["checkpoint_mac"],
-            )
+            is_mac_valid, mac_err = self._verify_checkpoint_row(cp_row, state.case_id)
             if not is_mac_valid:
-                raise AuditLedgerIntegrityError(f"Audit checkpoint MAC verification failed for case '{state.case_id}'")
+                raise AuditLedgerIntegrityError(f"Audit checkpoint MAC verification failed for case '{state.case_id}': {mac_err}")
 
             # Verify authoritative ledger against checkpoint
             count_auth = len(auth_rows)
@@ -2134,12 +2200,20 @@ class Database:
                     raise RuntimeError("Deterministic failure injection: crash after audit insert before checkpoint update")
 
                 new_tip = state.audit[-1].current_hash
-                new_mac = compute_checkpoint_mac(self.audit_checkpoint_secret, state.case_id, M, new_tip, AuditTrustState.TRUSTED.value)
+                kid = self.audit_ring.active_key_id
+                new_mac = compute_checkpoint_mac(
+                    self.audit_ring.active_secret,
+                    state.case_id,
+                    M,
+                    new_tip,
+                    AuditTrustState.TRUSTED.value,
+                    key_id=kid,
+                )
                 cp_cur = conn.execute("""
                     UPDATE case_audit_checkpoints
-                    SET event_count = ?, tip_hash = ?, trust_state = ?, checkpoint_mac = ?, updated_at = ?
+                    SET event_count = ?, tip_hash = ?, trust_state = ?, checkpoint_mac = ?, updated_at = ?, key_id = ?
                     WHERE case_id = ?;
-                """, (M, new_tip, AuditTrustState.TRUSTED.value, new_mac, now_iso, state.case_id))
+                """, (M, new_tip, AuditTrustState.TRUSTED.value, new_mac, now_iso, kid, state.case_id))
                 if cp_cur.rowcount != 1:
                     raise AuditLedgerIntegrityError(f"Failed to update case_audit_checkpoints row for case '{state.case_id}': expected 1 row affected, got {cp_cur.rowcount}")
             else:
@@ -2157,10 +2231,11 @@ class Database:
             conn.execute("""
                 INSERT INTO handoff_grants (
                     grant_id, tenant_id, organization_id, case_id, bound_intent_hash, bound_snapshot_hash,
-                    policy_version, outcome, nonce, issued_at, expires_at, signature, status, used
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    policy_version, outcome, nonce, issued_at, expires_at, signature, status, used, key_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(grant_id) DO UPDATE SET
                     organization_id = excluded.organization_id,
+                    key_id = excluded.key_id,
                     used = CASE
                         WHEN handoff_grants.used = 1 THEN 1
                         ELSE excluded.used
@@ -2178,8 +2253,9 @@ class Database:
                 g.grant_id, g.tenant_id, g.organization_id, g.case_id, g.bound_intent_hash,
                 g.bound_snapshot_hash, g.policy_version, g.outcome.value,
                 g.nonce, g.issued_at, g.expires_at, g.signature,
-                g.status.value, 1 if g.used else 0
+                g.status.value, 1 if g.used else 0, g.key_id
             ))
+
 
     def save_case(self, state: RiskCaseState):
         """Save or update a Risk Case within a BEGIN IMMEDIATE transaction."""
@@ -2216,16 +2292,10 @@ class Database:
         if not isinstance(cp_row["event_count"], int) or isinstance(cp_row["event_count"], bool):
             raise AuditLedgerIntegrityError(f"Checkpoint event_count is not an integer for case '{case_id}'")
 
-        is_mac_valid = verify_checkpoint_mac(
-            secret=self.audit_checkpoint_secret,
-            case_id=case_id,
-            event_count=cp_row["event_count"],
-            tip_hash=cp_row["tip_hash"],
-            trust_state=cp_row["trust_state"],
-            checkpoint_mac=cp_row["checkpoint_mac"],
-        )
+        is_mac_valid, mac_err = self._verify_checkpoint_row(cp_row, case_id)
         if not is_mac_valid:
-            raise AuditLedgerIntegrityError(f"Audit checkpoint MAC verification failed for case '{case_id}'")
+            raise AuditLedgerIntegrityError(f"Audit checkpoint MAC verification failed for case '{case_id}': {mac_err}")
+
 
         auth_rows = conn.execute("SELECT * FROM audit_events WHERE case_id = ? ORDER BY seq ASC", (case_id,)).fetchall()
         if len(auth_rows) != cp_row["event_count"]:
@@ -2304,7 +2374,20 @@ class Database:
     def load_case(self, case_id: str) -> Optional[RiskCaseState]:
         """Load a Risk Case by ID (non-mutating read)."""
         with self.get_connection() as conn:
-            return self.load_case_tx(conn, case_id)
+            if self.dialect == DIALECT_SQLITE:
+                conn.execute("BEGIN DEFERRED;")
+            try:
+                res = self.load_case_tx(conn, case_id)
+                if self.dialect == DIALECT_SQLITE:
+                    conn.commit()
+                return res
+            except Exception:
+                if self.dialect == DIALECT_SQLITE:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                raise
 
     def get_case_scope(self, case_id: str) -> Optional[Dict[str, Any]]:
         """Return existence and organization scope of a case row, or None when absent.
@@ -2373,14 +2456,7 @@ class Database:
                 "reason": "Checkpoint event_count is not an integer",
             }
 
-        is_mac_valid = verify_checkpoint_mac(
-            secret=self.audit_checkpoint_secret,
-            case_id=case_id,
-            event_count=cp_row["event_count"],
-            tip_hash=cp_row["tip_hash"],
-            trust_state=cp_row["trust_state"],
-            checkpoint_mac=cp_row["checkpoint_mac"],
-        )
+        is_mac_valid, mac_err = self._verify_checkpoint_row(cp_row, case_id)
         if not is_mac_valid:
             return {
                 "case_id": case_id,
@@ -2388,8 +2464,9 @@ class Database:
                 "trust_state": "CORRUPTED",
                 "event_count": cp_row["event_count"],
                 "broken_at_seq": None,
-                "reason": "Audit checkpoint MAC verification failed (tampered checkpoint or wrong audit secret)",
+                "reason": mac_err or "Audit checkpoint MAC verification failed (tampered checkpoint or wrong audit secret)",
             }
+
 
         rows = conn.execute("SELECT * FROM audit_events WHERE case_id = ? ORDER BY seq ASC", (case_id,)).fetchall()
         if len(rows) != cp_row["event_count"]:
@@ -2842,7 +2919,7 @@ class Database:
         idempotency_key: str,
         simulate_ambiguity: bool = False,
         *,
-        grant_secret: str,
+        grant_secret: str | KeyRing,
     ) -> Tuple[AdapterDecision, Optional[PendingApprovalItem], Optional[str]]:
         """Submit handoff within an existing transaction connection.
 
@@ -2850,8 +2927,9 @@ class Database:
         conditionally with rowcount == 1, and writes adapter_attempts and pending_approval_items.
         NEVER inserts missing grants.
         """
-        if not grant_secret or not str(grant_secret).strip():
+        if not grant_secret:
             raise ValueError("grant_secret is required and cannot be empty")
+
         from payoutproof.core.crypto import compute_intent_hash, derive_idempotency_key
 
         # 1. Authoritative Case record check & full state_json validation
@@ -2931,6 +3009,7 @@ class Database:
             return AdapterDecision.GRANT_INVALID_OR_EXPIRED, None, "Authoritative grant record not found"
 
         outcome_val = grant.outcome.value if hasattr(grant.outcome, "value") else str(grant.outcome)
+        row_kid = grant_row["key_id"] if "key_id" in grant_row.keys() else None
         if (
             grant_row["tenant_id"] != grant.tenant_id
             or grant_row["case_id"] != grant.case_id
@@ -2942,8 +3021,10 @@ class Database:
             or grant_row["issued_at"] != grant.issued_at
             or grant_row["expires_at"] != grant.expires_at
             or grant_row["signature"] != grant.signature
+            or (row_kid or None) != (grant.key_id or None)
         ):
             return AdapterDecision.GRANT_INVALID_OR_EXPIRED, None, "Authoritative grant record mismatch"
+
 
         if grant_row["used"] == 1 or grant_row["status"] != "ACTIVE":
             return AdapterDecision.REPLAY_REJECTED, None, "Replay detected: Handoff Grant has already been consumed"

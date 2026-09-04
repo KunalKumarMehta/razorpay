@@ -13,6 +13,8 @@ import hmac
 from dataclasses import dataclass, field
 from typing import ClassVar, Mapping, Optional, Dict, Any
 
+from payoutproof.core.keys import KeyRing, KeyRingError
+
 
 _DEV_SECRETS_WARNED = False
 
@@ -52,6 +54,8 @@ class AppConfig:
     grant_secret: str = field(repr=False)
     audit_checkpoint_secret: str = field(repr=False)
     membership_secret: str = field(repr=False, default=DEFAULT_TEST_MEMBERSHIP_SECRET)
+    grant_key_ring: Optional[KeyRing] = field(default=None, repr=False)
+    audit_key_ring: Optional[KeyRing] = field(default=None, repr=False)
     environment: str = "production"
     db_path: str = "payoutproof.db"
     enable_demo_adapter_modes: bool = False
@@ -77,14 +81,34 @@ class AppConfig:
     database_url: Optional[str] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
-        if not self.grant_secret or len(self.grant_secret.strip()) < 32:
-            raise ConfigurationError(
-                "grant_secret is missing or too weak (must be at least 32 characters)."
+        if self.grant_key_ring is not None:
+            object.__setattr__(self, "grant_secret", self.grant_key_ring.active_secret)
+        else:
+            if not self.grant_secret or len(self.grant_secret.strip()) < 32:
+                raise ConfigurationError(
+                    "grant_secret is missing or too weak (must be at least 32 characters)."
+                )
+            object.__setattr__(
+                self,
+                "grant_key_ring",
+                KeyRing.from_single_key(self.grant_secret, key_id="v1"),
             )
-        if not self.audit_checkpoint_secret or len(self.audit_checkpoint_secret.strip()) < 32:
-            raise ConfigurationError(
-                "audit_checkpoint_secret is missing or too weak (must be at least 32 characters)."
+
+        if self.audit_key_ring is not None:
+            object.__setattr__(
+                self, "audit_checkpoint_secret", self.audit_key_ring.active_secret
             )
+        else:
+            if not self.audit_checkpoint_secret or len(self.audit_checkpoint_secret.strip()) < 32:
+                raise ConfigurationError(
+                    "audit_checkpoint_secret is missing or too weak (must be at least 32 characters)."
+                )
+            object.__setattr__(
+                self,
+                "audit_key_ring",
+                KeyRing.from_single_key(self.audit_checkpoint_secret, key_id="v1"),
+            )
+
         if not self.membership_secret or len(self.membership_secret.strip()) < 32:
             raise ConfigurationError(
                 "membership_secret is missing or too weak (must be at least 32 characters)."
@@ -93,18 +117,25 @@ class AppConfig:
             raise ConfigurationError(
                 "grant_secret and audit_checkpoint_secret must be distinct secrets."
             )
-        # Membership key disjointness: the membership bearer-token secret must
-        # be distinct from both the grant secret and the audit checkpoint
-        # secret, so administration and the Money Action surface are separated
-        # cryptographically, not merely by convention (Issue #8, pre-mortem R7).
-        if hmac.compare_digest(self.membership_secret, self.grant_secret):
+        if not self.grant_key_ring.are_disjoint(self.audit_key_ring):
+            raise ConfigurationError(
+                "grant_secret and audit_checkpoint_secret must be distinct secrets."
+            )
+        if (
+            hmac.compare_digest(self.membership_secret, self.grant_secret)
+            or self.grant_key_ring.contains_secret(self.membership_secret)
+        ):
             raise ConfigurationError(
                 "membership_secret and grant_secret must be distinct secrets."
             )
-        if hmac.compare_digest(self.membership_secret, self.audit_checkpoint_secret):
+        if (
+            hmac.compare_digest(self.membership_secret, self.audit_checkpoint_secret)
+            or self.audit_key_ring.contains_secret(self.membership_secret)
+        ):
             raise ConfigurationError(
                 "membership_secret and audit_checkpoint_secret must be distinct secrets."
             )
+
         self._validate_oidc_block()
         if self.session_ttl_seconds <= 0:
             raise ConfigurationError("session_ttl_seconds must be a positive number of seconds.")
@@ -188,6 +219,10 @@ class AppConfig:
             "grant_secret": "[REDACTED]",
             "audit_checkpoint_secret": "[REDACTED]",
             "membership_secret": "[REDACTED]",
+            "grant_active_key_id": self.grant_key_ring.active_key_id if self.grant_key_ring else None,
+            "audit_active_key_id": self.audit_key_ring.active_key_id if self.audit_key_ring else None,
+            "grant_retained_key_ids": list(self.grant_key_ring.retained_keys.keys()) if self.grant_key_ring else [],
+            "audit_retained_key_ids": list(self.audit_key_ring.retained_keys.keys()) if self.audit_key_ring else [],
             "db_path": self.db_path,
             "enable_demo_adapter_modes": self.enable_demo_adapter_modes,
             "oidc_issuer": self.oidc_issuer,
@@ -251,8 +286,12 @@ class AppConfig:
         is_dev = raw_env == "development"
         environment = "development" if is_dev else (raw_env if raw_env else "production")
 
-        grant_secret = environ.get("PAYOUTPROOF_GRANT_SECRET")
-        audit_secret = environ.get("PAYOUTPROOF_AUDIT_CHECKPOINT_SECRET")
+        grant_secret = environ.get("PAYOUTPROOF_GRANT_ACTIVE_SECRET") or environ.get("PAYOUTPROOF_GRANT_SECRET")
+        audit_secret = environ.get("PAYOUTPROOF_AUDIT_CHECKPOINT_ACTIVE_SECRET") or environ.get("PAYOUTPROOF_AUDIT_CHECKPOINT_SECRET")
+        grant_active_kid = environ.get("PAYOUTPROOF_GRANT_ACTIVE_KEY_ID", "").strip() or "v1"
+        audit_active_kid = environ.get("PAYOUTPROOF_AUDIT_CHECKPOINT_ACTIVE_KEY_ID", "").strip() or "v1"
+        grant_retained = environ.get("PAYOUTPROOF_GRANT_RETAINED_SECRETS", "").strip()
+        audit_retained = environ.get("PAYOUTPROOF_AUDIT_CHECKPOINT_RETAINED_SECRETS", "").strip()
         membership_secret = environ.get("PAYOUTPROOF_MEMBERSHIP_SECRET")
 
         if is_dev:
@@ -349,10 +388,41 @@ class AppConfig:
         if settings_admin_token is not None:
             settings_admin_token = settings_admin_token.strip() or None
 
+        if grant_secret is not None and len(grant_secret.strip()) < 32:
+            raise ConfigurationError(
+                "grant_secret is missing or too weak (must be at least 32 characters)."
+            )
+        if audit_secret is not None and len(audit_secret.strip()) < 32:
+            raise ConfigurationError(
+                "audit_checkpoint_secret is missing or too weak (must be at least 32 characters)."
+            )
+
+        grant_key_ring = None
+        if grant_secret:
+            try:
+                keys = {grant_active_kid: grant_secret}
+                if grant_retained:
+                    keys.update(KeyRing.parse_retained_string(grant_retained))
+                grant_key_ring = KeyRing(active_key_id=grant_active_kid, keys=keys)
+            except KeyRingError as exc:
+                raise ConfigurationError(f"Invalid grant_secret key ring: {exc}") from exc
+
+        audit_key_ring = None
+        if audit_secret:
+            try:
+                keys = {audit_active_kid: audit_secret}
+                if audit_retained:
+                    keys.update(KeyRing.parse_retained_string(audit_retained))
+                audit_key_ring = KeyRing(active_key_id=audit_active_kid, keys=keys)
+            except KeyRingError as exc:
+                raise ConfigurationError(f"Invalid audit_checkpoint_secret key ring: {exc}") from exc
+
         return cls(
             grant_secret=grant_secret,
             audit_checkpoint_secret=audit_secret,
             membership_secret=membership_secret,
+            grant_key_ring=grant_key_ring,
+            audit_key_ring=audit_key_ring,
             environment=environment,
             db_path=db_path,
             enable_demo_adapter_modes=enable_demo,
@@ -376,9 +446,11 @@ class AppConfig:
     @classmethod
     def for_tests(
         cls,
-        grant_secret: str,
-        audit_checkpoint_secret: str,
+        grant_secret: Optional[str] = None,
+        audit_checkpoint_secret: Optional[str] = None,
         membership_secret: Optional[str] = None,
+        grant_key_ring: Optional[KeyRing] = None,
+        audit_key_ring: Optional[KeyRing] = None,
         environment: str = "test",
         db_path: str = ":memory:",
         enable_demo_adapter_modes: bool = False,
@@ -405,10 +477,16 @@ class AppConfig:
         pre-existing test corpus stays source-compatible; production and staging always
         resolve a real value via `from_env` (there is no default there).
         """
+        if grant_key_ring is not None and not grant_secret:
+            grant_secret = grant_key_ring.active_secret
+        if audit_key_ring is not None and not audit_checkpoint_secret:
+            audit_checkpoint_secret = audit_key_ring.active_secret
+
         if not grant_secret:
             raise ConfigurationError("grant_secret is required for tests.")
         if not audit_checkpoint_secret:
             raise ConfigurationError("audit_checkpoint_secret is required for tests.")
+
         if membership_secret is None:
             membership_secret = DEFAULT_TEST_MEMBERSHIP_SECRET
         if not membership_secret:
@@ -433,6 +511,8 @@ class AppConfig:
             grant_secret=grant_secret,
             audit_checkpoint_secret=audit_checkpoint_secret,
             membership_secret=membership_secret,
+            grant_key_ring=grant_key_ring,
+            audit_key_ring=audit_key_ring,
             environment=environment,
             db_path=db_path,
             enable_demo_adapter_modes=enable_demo_adapter_modes,

@@ -147,6 +147,7 @@ def create_grant_signature(
     issued_at: str,
     expires_at: str,
     organization_id: Optional[str] = None,
+    key_id: Optional[str] = None,
 ) -> str:
     """Create HMAC-SHA256 signature for a Handoff Grant."""
     message = f"{grant_id}|{tenant_id}|{case_id}|{bound_intent_hash}|{bound_snapshot_hash}|{policy_version}|{outcome}|{nonce}|{issued_at}|{expires_at}"
@@ -154,6 +155,8 @@ def create_grant_signature(
     # only when present so legacy un-scoped grants keep byte-identical signatures.
     if organization_id is not None:
         message = f"{message}|ORG[{organization_id}]"
+    if key_id is not None:
+        message = f"{message}|KID[{key_id}]"
     return hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -171,6 +174,7 @@ def verify_grant_signature(
     expires_at: str,
     signature: str,
     organization_id: Optional[str] = None,
+    key_id: Optional[str] = None,
 ) -> bool:
     """Verify HMAC-SHA256 signature of a Handoff Grant using constant-time comparison."""
     expected_sig = create_grant_signature(
@@ -186,8 +190,44 @@ def verify_grant_signature(
         issued_at=issued_at,
         expires_at=expires_at,
         organization_id=organization_id,
+        key_id=key_id,
     )
-    return hmac.compare_digest(expected_sig, signature)
+    if hmac.compare_digest(expected_sig, signature):
+        return True
+    if key_id is not None:
+        expected_v1 = create_grant_signature(
+            secret=secret,
+            grant_id=grant_id,
+            tenant_id=tenant_id,
+            case_id=case_id,
+            bound_intent_hash=bound_intent_hash,
+            bound_snapshot_hash=bound_snapshot_hash,
+            policy_version=policy_version,
+            outcome=outcome,
+            nonce=nonce,
+            issued_at=issued_at,
+            expires_at=expires_at,
+            organization_id=organization_id,
+            key_id=None,
+        )
+        return hmac.compare_digest(expected_v1, signature)
+    else:
+        expected_v2_v1 = create_grant_signature(
+            secret=secret,
+            grant_id=grant_id,
+            tenant_id=tenant_id,
+            case_id=case_id,
+            bound_intent_hash=bound_intent_hash,
+            bound_snapshot_hash=bound_snapshot_hash,
+            policy_version=policy_version,
+            outcome=outcome,
+            nonce=nonce,
+            issued_at=issued_at,
+            expires_at=expires_at,
+            organization_id=organization_id,
+            key_id="v1",
+        )
+        return hmac.compare_digest(expected_v2_v1, signature)
 
 
 def derive_idempotency_key(
@@ -208,15 +248,23 @@ def derive_idempotency_key(
     return f"IDEM::{tenant_id}::ORG[{organization_id}]::{case_id}::V{case_version}::{grant_id}"
 
 
+AUDIT_CHECKPOINT_V1 = "PAYOUTPROOF_AUDIT_CHECKPOINT_V1"
+AUDIT_CHECKPOINT_V2 = "PAYOUTPROOF_AUDIT_CHECKPOINT_V2"
+
+
 def compute_checkpoint_mac(
     secret: str,
     case_id: str,
     event_count: int,
     tip_hash: str,
     trust_state: str,
+    key_id: Optional[str] = None,
 ) -> str:
     """Compute HMAC-SHA256 MAC for a case audit checkpoint with explicit domain separation."""
-    message = f"PAYOUTPROOF_AUDIT_CHECKPOINT_V1|{case_id}|{event_count}|{tip_hash}|{trust_state}"
+    if key_id is not None:
+        message = f"PAYOUTPROOF_AUDIT_CHECKPOINT_V2|{key_id}|{case_id}|{event_count}|{tip_hash}|{trust_state}"
+    else:
+        message = f"PAYOUTPROOF_AUDIT_CHECKPOINT_V1|{case_id}|{event_count}|{tip_hash}|{trust_state}"
     return hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -227,6 +275,7 @@ def verify_checkpoint_mac(
     tip_hash: Any,
     trust_state: Any,
     checkpoint_mac: Any,
+    key_id: Optional[str] = None,
 ) -> bool:
     """Verify HMAC-SHA256 MAC for a case audit checkpoint using constant-time comparison.
 
@@ -246,13 +295,46 @@ def verify_checkpoint_mac(
         if not isinstance(checkpoint_mac, str) or not checkpoint_mac:
             return False
 
-        expected_mac = compute_checkpoint_mac(
-            secret=secret,
-            case_id=case_id,
-            event_count=event_count,
-            tip_hash=tip_hash,
-            trust_state=trust_state,
-        )
-        return hmac.compare_digest(expected_mac, checkpoint_mac)
+        if key_id is not None:
+            expected_mac = compute_checkpoint_mac(
+                secret=secret,
+                case_id=case_id,
+                event_count=event_count,
+                tip_hash=tip_hash,
+                trust_state=trust_state,
+                key_id=key_id,
+            )
+            if hmac.compare_digest(expected_mac, checkpoint_mac):
+                return True
+            # Fallback to V1 if stamped with key_id but MACed under legacy domain
+            expected_v1 = compute_checkpoint_mac(
+                secret=secret,
+                case_id=case_id,
+                event_count=event_count,
+                tip_hash=tip_hash,
+                trust_state=trust_state,
+                key_id=None,
+            )
+            return hmac.compare_digest(expected_v1, checkpoint_mac)
+        else:
+            expected_v1 = compute_checkpoint_mac(
+                secret=secret,
+                case_id=case_id,
+                event_count=event_count,
+                tip_hash=tip_hash,
+                trust_state=trust_state,
+                key_id=None,
+            )
+            if hmac.compare_digest(expected_v1, checkpoint_mac):
+                return True
+            expected_v2_v1 = compute_checkpoint_mac(
+                secret=secret,
+                case_id=case_id,
+                event_count=event_count,
+                tip_hash=tip_hash,
+                trust_state=trust_state,
+                key_id="v1",
+            )
+            return hmac.compare_digest(expected_v2_v1, checkpoint_mac)
     except Exception:
         return False

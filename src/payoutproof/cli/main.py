@@ -135,6 +135,103 @@ def verify_case_audit(case_id: str, config: Any = None):
 
 
 
+def verify_case_export_command(
+    file_path: str,
+    audit_key_id: Optional[str] = None,
+    audit_secret: Optional[str] = None,
+    audit_keys: Optional[str] = None,
+    grant_key_id: Optional[str] = None,
+    grant_secret: Optional[str] = None,
+    grant_keys: Optional[str] = None,
+):
+    """Verify Risk Case audit export pure offline with zero database or network access."""
+    import json
+    import os
+    from pathlib import Path
+    from payoutproof.core.keys import KeyRing, KeyRingError
+    from payoutproof.audit.export import verify_case_export
+
+    p = Path(file_path)
+    if not p.exists() or not p.is_file():
+        console.print(f"[bold red]Export file not found:[/bold red] '{file_path}'")
+        sys.exit(1)
+
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        console.print(f"[bold red]Failed to parse export JSON:[/bold red] {e}")
+        sys.exit(1)
+
+    # Resolve audit key ring
+    a_sec = (
+        audit_secret
+        or os.environ.get("PAYOUTPROOF_AUDIT_CHECKPOINT_ACTIVE_SECRET")
+        or os.environ.get("PAYOUTPROOF_AUDIT_CHECKPOINT_SECRET")
+    )
+    a_kid = (
+        audit_key_id
+        or os.environ.get("PAYOUTPROOF_AUDIT_CHECKPOINT_ACTIVE_KEY_ID", "").strip()
+        or "v1"
+    )
+    a_retained = (
+        audit_keys
+        or os.environ.get("PAYOUTPROOF_AUDIT_CHECKPOINT_RETAINED_SECRETS", "")
+    )
+
+    if not a_sec:
+        console.print(
+            "[bold red]Configuration error:[/bold red] Missing audit checkpoint secret.\n"
+            "[yellow]Setup guidance:[/yellow] Provide via --audit-secret or environment:\n"
+            "  export PAYOUTPROOF_AUDIT_CHECKPOINT_SECRET='<32+ chars>'\n"
+            "  export PAYOUTPROOF_AUDIT_CHECKPOINT_RETAINED_SECRETS='<key_id:secret,...>'"
+        )
+        sys.exit(1)
+
+    try:
+        a_keys_map = {a_kid: a_sec}
+        if a_retained:
+            a_keys_map.update(KeyRing.parse_retained_string(a_retained))
+        audit_ring = KeyRing(active_key_id=a_kid, keys=a_keys_map)
+    except KeyRingError as e:
+        console.print(f"[bold red]Audit KeyRing error:[/bold red] {e}")
+        sys.exit(1)
+
+    # Resolve optional grant key ring
+    grant_ring = None
+    g_sec = (
+        grant_secret
+        or os.environ.get("PAYOUTPROOF_GRANT_ACTIVE_SECRET")
+        or os.environ.get("PAYOUTPROOF_GRANT_SECRET")
+    )
+    g_kid = (
+        grant_key_id
+        or os.environ.get("PAYOUTPROOF_GRANT_ACTIVE_KEY_ID", "").strip()
+        or "v1"
+    )
+    g_retained = (
+        grant_keys
+        or os.environ.get("PAYOUTPROOF_GRANT_RETAINED_SECRETS", "")
+    )
+
+    if g_sec:
+        try:
+            g_keys_map = {g_kid: g_sec}
+            if g_retained:
+                g_keys_map.update(KeyRing.parse_retained_string(g_retained))
+            grant_ring = KeyRing(active_key_id=g_kid, keys=g_keys_map)
+        except KeyRingError as e:
+            console.print(f"[bold red]Grant KeyRing error:[/bold red] {e}")
+            sys.exit(1)
+
+    is_valid, reason = verify_case_export(data, audit_ring=audit_ring, grant_ring=grant_ring)
+    if is_valid:
+        console.print(f"[bold green]Case audit export verified successfully:[/bold green] {reason}")
+        sys.exit(0)
+    else:
+        console.print(f"[bold red]Case audit export verification FAILED:[/bold red] {reason}")
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(prog="payoutproof", description="PayoutProof CLI")
     subparsers = parser.add_subparsers(dest="command")
@@ -151,6 +248,16 @@ def main():
     # verify-audit command
     audit_parser = subparsers.add_parser("verify-audit", help="Verify case audit chain")
     audit_parser.add_argument("--case-id", required=True, help="Risk Case ID")
+
+    # verify-case-export command
+    export_parser = subparsers.add_parser("verify-case-export", help="Verify offline Risk Case audit export")
+    export_parser.add_argument("--file", required=True, help="Path to exported audit JSON file")
+    export_parser.add_argument("--audit-key-id", help="Active audit checkpoint key ID (default: v1)")
+    export_parser.add_argument("--audit-secret", help="Active audit checkpoint secret")
+    export_parser.add_argument("--audit-keys", help="Retained audit keys ('kid:sec,kid:sec')")
+    export_parser.add_argument("--grant-key-id", help="Active grant signing key ID (default: v1)")
+    export_parser.add_argument("--grant-secret", help="Active grant signing secret")
+    export_parser.add_argument("--grant-keys", help="Retained grant keys ('kid:sec,kid:sec')")
 
     args = parser.parse_args()
 
@@ -190,9 +297,20 @@ def main():
             sys.exit(1)
 
         verify_case_audit(args.case_id, config=config)
+    elif args.command == "verify-case-export":
+        verify_case_export_command(
+            file_path=args.file,
+            audit_key_id=args.audit_key_id,
+            audit_secret=args.audit_secret,
+            audit_keys=args.audit_keys,
+            grant_key_id=args.grant_key_id,
+            grant_secret=args.grant_secret,
+            grant_keys=args.grant_keys,
+        )
     else:
         parser.print_help()
 
 
 if __name__ == "__main__":
     main()
+

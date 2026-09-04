@@ -22,6 +22,7 @@ from payoutproof.core.providers import (
     SystemClock,
     SystemNonce,
 )
+from payoutproof.core.keys import KeyRing
 
 GRANT_VALIDITY_SECONDS = 300  # 5 minutes
 
@@ -46,14 +47,22 @@ class GrantIssuer:
         cls,
         state: RiskCaseState,
         *,
-        secret: str,
+        secret: str | KeyRing,
         validity_seconds: int = GRANT_VALIDITY_SECONDS,
         clock: Optional[ClockProvider] = None,
         nonce_provider: Optional[NonceProvider] = None,
+        key_id: Optional[str] = None,
     ) -> HandoffGrant:
         """Issue a fresh Handoff Grant bound to case, intent hash, and snapshot hash."""
-        if not secret or not str(secret).strip():
-            raise ValueError("secret is required and cannot be empty to issue Handoff Grant")
+        if isinstance(secret, KeyRing):
+            signing_secret = secret.active_secret
+            signing_key_id = secret.active_key_id
+        else:
+            if not secret or not str(secret).strip():
+                raise ValueError("secret is required and cannot be empty to issue Handoff Grant")
+            signing_secret = str(secret)
+            signing_key_id = key_id
+
         resolved_clock = clock if clock is not None else SystemClock()
         resolved_nonce_provider = nonce_provider if nonce_provider is not None else SystemNonce()
 
@@ -110,7 +119,7 @@ class GrantIssuer:
         snapshot_hash = recomputed_snapshot_hash
 
         signature = create_grant_signature(
-            secret=secret,
+            secret=signing_secret,
             grant_id=grant_id,
             tenant_id=state.tenant_id,
             case_id=state.case_id,
@@ -122,6 +131,7 @@ class GrantIssuer:
             issued_at=issued_at,
             expires_at=expires_at,
             organization_id=state.organization_id,
+            key_id=signing_key_id,
         )
 
         return HandoffGrant(
@@ -139,6 +149,7 @@ class GrantIssuer:
             signature=signature,
             status=GrantStatus.ACTIVE,
             used=False,
+            key_id=signing_key_id,
         )
 
 
@@ -151,7 +162,7 @@ class GrantVerifier:
         grant: HandoffGrant,
         current_intent_hash: str,
         *,
-        secret: str,
+        secret: str | KeyRing,
         clock: Optional[ClockProvider] = None,
         expected_organization_id: Optional[str] = None,
     ) -> Tuple[bool, Optional[str]]:
@@ -162,7 +173,7 @@ class GrantVerifier:
         "no expected scope asserted" (legacy call sites); use verify_for_case to
         enforce the authoritative case scope.
         """
-        if not secret or not str(secret).strip():
+        if not secret:
             return False, "secret is required and cannot be empty to verify Handoff Grant"
         resolved_clock = clock if clock is not None else SystemClock()
 
@@ -181,21 +192,65 @@ class GrantVerifier:
             return False, "Invalid grant expiration timestamp"
 
         # Verify HMAC signature (binds organization scope when the grant carries one)
-        is_sig_valid = verify_grant_signature(
-            secret=secret,
-            grant_id=grant.grant_id,
-            tenant_id=grant.tenant_id,
-            case_id=grant.case_id,
-            bound_intent_hash=grant.bound_intent_hash,
-            bound_snapshot_hash=grant.bound_snapshot_hash,
-            policy_version=grant.policy_version,
-            outcome=grant.outcome.value,
-            nonce=grant.nonce,
-            issued_at=grant.issued_at,
-            expires_at=grant.expires_at,
-            signature=grant.signature,
-            organization_id=grant.organization_id,
-        )
+        if isinstance(secret, KeyRing):
+            if grant.key_id:
+                s = secret.get_secret(grant.key_id)
+                if not s:
+                    return False, f"Grant signed with unknown or retired key '{grant.key_id}'"
+                is_sig_valid = verify_grant_signature(
+                    secret=s,
+                    grant_id=grant.grant_id,
+                    tenant_id=grant.tenant_id,
+                    case_id=grant.case_id,
+                    bound_intent_hash=grant.bound_intent_hash,
+                    bound_snapshot_hash=grant.bound_snapshot_hash,
+                    policy_version=grant.policy_version,
+                    outcome=grant.outcome.value,
+                    nonce=grant.nonce,
+                    issued_at=grant.issued_at,
+                    expires_at=grant.expires_at,
+                    signature=grant.signature,
+                    organization_id=grant.organization_id,
+                    key_id=grant.key_id,
+                )
+            else:
+                is_sig_valid = False
+                for s in secret.all_secrets:
+                    if verify_grant_signature(
+                        secret=s,
+                        grant_id=grant.grant_id,
+                        tenant_id=grant.tenant_id,
+                        case_id=grant.case_id,
+                        bound_intent_hash=grant.bound_intent_hash,
+                        bound_snapshot_hash=grant.bound_snapshot_hash,
+                        policy_version=grant.policy_version,
+                        outcome=grant.outcome.value,
+                        nonce=grant.nonce,
+                        issued_at=grant.issued_at,
+                        expires_at=grant.expires_at,
+                        signature=grant.signature,
+                        organization_id=grant.organization_id,
+                        key_id=None,
+                    ):
+                        is_sig_valid = True
+                        break
+        else:
+            is_sig_valid = verify_grant_signature(
+                secret=str(secret),
+                grant_id=grant.grant_id,
+                tenant_id=grant.tenant_id,
+                case_id=grant.case_id,
+                bound_intent_hash=grant.bound_intent_hash,
+                bound_snapshot_hash=grant.bound_snapshot_hash,
+                policy_version=grant.policy_version,
+                outcome=grant.outcome.value,
+                nonce=grant.nonce,
+                issued_at=grant.issued_at,
+                expires_at=grant.expires_at,
+                signature=grant.signature,
+                organization_id=grant.organization_id,
+                key_id=grant.key_id,
+            )
         if not is_sig_valid:
             return False, "Cryptographic grant signature verification failed"
 
@@ -219,7 +274,7 @@ class GrantVerifier:
         grant: HandoffGrant,
         state: RiskCaseState,
         *,
-        secret: str,
+        secret: str | KeyRing,
         clock: Optional[ClockProvider] = None,
     ) -> None:
         """Verify a grant against an authoritative RiskCaseState, raising on any failure.
@@ -248,3 +303,4 @@ class GrantVerifier:
         )
         if not is_valid:
             raise GrantVerificationError(err or "Grant verification failed")
+

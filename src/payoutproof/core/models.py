@@ -274,6 +274,7 @@ class HandoffGrant(BaseModel):
     signature: str
     status: GrantStatus = GrantStatus.ACTIVE
     used: bool = False
+    key_id: Optional[str] = None
 
 
 class HandoffRecord(BaseModel):
@@ -359,3 +360,4 @@ class CaseAuditCheckpoint(BaseModel):
     trust_state: AuditTrustState = AuditTrustState.TRUSTED
     checkpoint_mac: str
     updated_at: str
+    key_id: Optional[str] = None

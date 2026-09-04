@@ -57,6 +57,13 @@ CAPABILITY_VERIFY_AUDIT: Dict[str, bool] = {
     Role.TENANT_ADMINISTRATOR.value: True,
     Role.PLATFORM_OPERATOR.value: False,
 }
+CAPABILITY_EXPORT_CASE_AUDIT: Dict[str, bool] = {
+    Role.PAYMENT_OPERATOR.value: False,
+    Role.FINANCE_CONTROL_OWNER.value: False,
+    Role.AUDITOR.value: True,
+    Role.TENANT_ADMINISTRATOR.value: False,
+    Role.PLATFORM_OPERATOR.value: False,
+}
 CAPABILITY_RUN_EVALUATION: Dict[str, bool] = {
     Role.PAYMENT_OPERATOR.value: False,
     Role.FINANCE_CONTROL_OWNER.value: True,

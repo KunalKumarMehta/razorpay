@@ -95,6 +95,7 @@ class HandoffService:
                     if hasattr(persisted_state.grant.outcome, "value")
                     else str(persisted_state.grant.outcome)
                 )
+                row_kid = grant_row["key_id"] if "key_id" in grant_row.keys() else None
                 if (
                     grant_row["tenant_id"] != persisted_state.grant.tenant_id
                     or grant_row["case_id"] != persisted_state.grant.case_id
@@ -107,7 +108,9 @@ class HandoffService:
                     or grant_row["expires_at"] != persisted_state.grant.expires_at
                     or grant_row["signature"] != persisted_state.grant.signature
                     or _row_organization(grant_row) != persisted_state.grant.organization_id
+                    or (row_kid or None) != (persisted_state.grant.key_id or None)
                 ):
+
                     conn.rollback()
                     msg = "Refused “initiate human handoff”: authoritative grant record mismatch."
                     return persisted_state.model_copy(update={
