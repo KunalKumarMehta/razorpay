@@ -27,6 +27,14 @@ class SimulationMode(str, Enum):
     MISSING_SIGNAL = "MISSING_SIGNAL"
     PROVIDER_OUTAGE = "PROVIDER_OUTAGE"
     SECURITY_QUARANTINE = "SECURITY_QUARANTINE"
+    # Audio-specific simulation modes (Issue #15)
+    AUDIO_SUCCESS_EN_IN = "AUDIO_SUCCESS_EN_IN"
+    AUDIO_SUCCESS_HI_IN = "AUDIO_SUCCESS_HI_IN"
+    AUDIO_MATERIAL_AMBIGUITY = "AUDIO_MATERIAL_AMBIGUITY"
+    AUDIO_SPOOF_DETECTED = "AUDIO_SPOOF_DETECTED"
+    AUDIO_LOW_CONFIDENCE = "AUDIO_LOW_CONFIDENCE"
+    AUDIO_CORRUPTED = "AUDIO_CORRUPTED"
+    AUDIO_UNCERTAIN_SPOOF = "AUDIO_UNCERTAIN_SPOOF"
 
 
 @runtime_checkable
@@ -226,6 +234,129 @@ class DeterministicFakeProvider:
                         organization_id=provenance.organization_id,
                     )
                 ],
+            )
+
+        # Check if payload is audio evidence or audio simulation mode
+        is_audio = (
+            evidence_meta.get("data_class") in ("VOICE_RECORDING", "AUDIO")
+            or str(evidence_meta.get("detected_mime_type", "")).startswith("audio/")
+            or str(evidence_meta.get("claimed_mime_type", "")).startswith("audio/")
+            or (len(evidence_bytes) >= 12 and evidence_bytes.startswith(b"RIFF") and evidence_bytes[8:12] == b"WAVE")
+            or evidence_bytes.startswith(b"OggS")
+            or evidence_bytes.startswith(b"ID3")
+            or mode in (
+                SimulationMode.AUDIO_SUCCESS_EN_IN,
+                SimulationMode.AUDIO_SUCCESS_HI_IN,
+                SimulationMode.AUDIO_MATERIAL_AMBIGUITY,
+                SimulationMode.AUDIO_SPOOF_DETECTED,
+                SimulationMode.AUDIO_LOW_CONFIDENCE,
+                SimulationMode.AUDIO_CORRUPTED,
+                SimulationMode.AUDIO_UNCERTAIN_SPOOF,
+            )
+        )
+
+        if is_audio:
+            if mode == SimulationMode.AUDIO_CORRUPTED:
+                return ProviderResult(
+                    provider_id=self.provider_id,
+                    model_version=self.model_version,
+                    confidence=0.0,
+                    timing_ms=25.0,
+                    raw_output_ref=None,
+                    source_provenance=provenance,
+                    status=JobStatus.FAILED,
+                    failure_reason=ExtractionFailureReason.AUDIO_CORRUPTED,
+                    error_message="Audio header corrupted: invalid frame count or truncated RIFF/WAVE chunk",
+                    raw_output=None,
+                    extracted_intent=None,
+                    findings=[
+                        Finding(
+                            name=FindingName.INSTRUCTION_CONSISTENCY.value,
+                            truth_state=TruthState.INSUFFICIENT_QUALITY,
+                            detail="Corrupted audio payload cannot be decoded",
+                            evidence_ref=provenance.evidence_hash,
+                            organization_id=provenance.organization_id,
+                        )
+                    ],
+                )
+
+            from payoutproof.agent.audio import extract_audio_evidence, AudioFormatError, AudioCorruptedError
+
+            try:
+                intent, diag, status, fail_reason, err_msg, findings = extract_audio_evidence(
+                    audio_bytes=evidence_bytes,
+                    evidence_meta=evidence_meta,
+                    simulation_mode=mode.value if mode else None,
+                )
+            except AudioCorruptedError as e:
+                return ProviderResult(
+                    provider_id=self.provider_id,
+                    model_version=self.model_version,
+                    confidence=0.0,
+                    timing_ms=25.0,
+                    raw_output_ref=None,
+                    source_provenance=provenance,
+                    status=JobStatus.FAILED,
+                    failure_reason=ExtractionFailureReason.AUDIO_CORRUPTED,
+                    error_message=str(e),
+                    raw_output=None,
+                    extracted_intent=None,
+                    findings=[
+                        Finding(
+                            name=FindingName.INSTRUCTION_CONSISTENCY.value,
+                            truth_state=TruthState.INSUFFICIENT_QUALITY,
+                            detail=f"Audio corrupted: {e}",
+                            evidence_ref=provenance.evidence_hash,
+                            organization_id=provenance.organization_id,
+                        )
+                    ],
+                )
+            except AudioFormatError as e:
+                return ProviderResult(
+                    provider_id=self.provider_id,
+                    model_version=self.model_version,
+                    confidence=0.0,
+                    timing_ms=25.0,
+                    raw_output_ref=None,
+                    source_provenance=provenance,
+                    status=JobStatus.FAILED,
+                    failure_reason=ExtractionFailureReason.UNSUPPORTED_AUDIO_FORMAT,
+                    error_message=str(e),
+                    raw_output=None,
+                    extracted_intent=None,
+                    findings=[
+                        Finding(
+                            name=FindingName.INSTRUCTION_CONSISTENCY.value,
+                            truth_state=TruthState.NOT_EVALUATED,
+                            detail=f"Unsupported audio format: {e}",
+                            evidence_ref=provenance.evidence_hash,
+                            organization_id=provenance.organization_id,
+                        )
+                    ],
+                )
+
+            raw_out = {
+                "audio_diagnostics": diag.model_dump(mode="json"),
+                "confidence": diag.asr_confidence,
+                "language_stratum": diag.language_stratum,
+                "transcript": diag.transcript,
+            }
+            raw_bytes = json.dumps(raw_out, sort_keys=True).encode("utf-8")
+            raw_ref = f"raw-ref://{sha256_hex(raw_bytes)[:16]}"
+
+            return ProviderResult(
+                provider_id=self.provider_id,
+                model_version=self.model_version,
+                confidence=diag.asr_confidence,
+                timing_ms=165.0,
+                raw_output_ref=raw_ref,
+                source_provenance=provenance,
+                status=status,
+                failure_reason=fail_reason,
+                error_message=err_msg,
+                raw_output=raw_out,
+                extracted_intent=intent,
+                findings=findings,
             )
 
         # Mode SUCCESS
