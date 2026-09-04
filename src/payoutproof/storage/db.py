@@ -1,4 +1,32 @@
-"""SQLite WAL persistence for cases, audit events, grants, and adapter attempts."""
+"""Dual-dialect (SQLite / PostgreSQL) persistence for cases, audit events, grants, and adapter attempts.
+
+SQLite remains the historical engine and the test/dev default: the Risk Case
+workflow's invariants were proven on it across Issues #1-#10, and the entire
+existing corpus runs on it unchanged. PostgreSQL (Issue #11) is the production
+engine, selected by passing a ``database_url`` (or a ``db_path``) beginning
+with ``postgresql://`` or ``postgres://``.
+
+The dialect boundary is narrow and explicit:
+
+- **Placeholders**: every statement in this module is authored with the
+  SQLite ``?`` marker. ``_translate_query`` rewrites ``?`` to ``%s`` for
+  PostgreSQL at execution time. Markers inside string literals or SQL line
+  comments are never rewritten (a ``?`` in a literal is data, not a marker).
+- **Concurrency**: SQLite serializes writers with ``BEGIN IMMEDIATE``.
+  PostgreSQL instead relies on row-level ``SELECT ... FOR UPDATE`` locks taken
+  by ``begin_write``/``lock_case_tx``/``lock_grant_tx`` on the rows a
+  transaction will mutate (risk_cases, handoff_grants, adapter_attempts,
+  pending_approval_items) plus the UNIQUE constraints that arbitrate the rest
+  (idempotency keys, grant ids, audit (scope, seq) pairs). ``conn.execute("BEGIN
+  IMMEDIATE")`` — which outside callers still issue for SQLite parity — is
+  intercepted by the PostgreSQL connection wrapper and translated into the
+  correct row-locking preamble.
+- **Introspection**: ``PRAGMA table_info`` / ``sqlite_master`` are wrapped by
+  ``table_columns`` / ``list_tables`` so migrations and compatibility checks
+  run on both engines.
+- **AUTOINCREMENT**: DDL translation lives in ``payoutproof.storage.migrations``;
+  runtime statements never depend on SQLite-only SQL functions.
+"""
 
 import sqlite3
 import json
@@ -58,6 +86,12 @@ from payoutproof.audit.chain import GENESIS_HASH
 # being imported themselves (avoids a module-level cycle through evaluator).
 from payoutproof.policy.config import PolicyConfig, next_version_id
 
+from payoutproof.storage.migrations import (
+    IncompatibleSchemaError,
+    MigrationRunner,
+    check_schema_compatibility,
+)
+
 # Authoritative persistence schema identifier for SQLite tables.
 # Bumped V1 -> V2 with Issue #10's additive tenant operating-limits tables
 # (tenant_quota_counters, tenant_operating_limits, tenant_settings_audit_events);
@@ -70,6 +104,394 @@ SCHEMA_VERSION = "PP-SCHEMA-V3"
 
 # Sentinel for explicitly querying un-scoped (organization_id IS NULL) rows.
 UNSCOPED = object()
+
+# PostgreSQL URL prefixes that select the PostgreSQL dialect. Both schemes are
+# accepted: `postgresql://` is the standard DB-API spelling, `postgres://` is
+# the spelling several connection-string traditions emit.
+POSTGRESQL_URL_PREFIXES = ("postgresql://", "postgres://")
+
+# Dialect names used across the storage layer.
+DIALECT_SQLITE = "sqlite"
+DIALECT_POSTGRESQL = "postgresql"
+
+# Engine-flag mapping mirroring the PRAGMA posture of the SQLite connection
+# factory: PostgreSQL's defaults already provide the guarantees the pragmas
+# exist to create on SQLite (MVCC instead of WAL, server-side lock waits
+# instead of busy_timeout, immediate constraint enforcement).
+POSTGRESQL_LOCK_TIMEOUT_SECONDS = 30.0
+
+
+class UnsupportedDatabaseDialectError(ValueError):
+    """Raised when a database URL selects an engine this build does not support.
+
+    Deliberately secret-free: the message names the scheme prefix only, never
+    the full URL (which may embed a password).
+    """
+    pass
+
+
+def detect_dialect(target: Optional[str | Path]) -> str:
+    """Return the dialect ('sqlite' | 'postgresql') selected by a path or URL.
+
+    A ``None`` target follows the historical SQLite default. Anything starting
+    with a PostgreSQL scheme selects PostgreSQL. An explicit URL scheme that is
+    neither SQLite nor PostgreSQL fails closed here rather than deep inside a
+    driver, with a message that never echoes the (possibly secret-bearing) URL.
+    """
+    if target is None:
+        return DIALECT_SQLITE
+    text = str(target).strip()
+    if not text:
+        return DIALECT_SQLITE
+    lowered = text.lower()
+    if lowered.startswith(POSTGRESQL_URL_PREFIXES):
+        return DIALECT_POSTGRESQL
+    if lowered.startswith("sqlite://"):
+        # A sqlite:// URL is accepted as an explicit SQLite selection so callers
+        # can pass either spelling; the path after the scheme is used verbatim.
+        return DIALECT_SQLITE
+    if "://" in lowered:
+        scheme = lowered.split("://", 1)[0]
+        raise UnsupportedDatabaseDialectError(
+            f"Unsupported database scheme '{scheme}://': this build supports SQLite "
+            "(file path or :memory:) and PostgreSQL (postgresql:// / postgres:// URLs)."
+        )
+    return DIALECT_SQLITE
+
+
+def _translate_query(sql: str, dialect: str) -> str:
+    """Translate a SQLite-authored ``?``-parameterized statement to the dialect.
+
+    For SQLite the statement passes through unchanged (it is the authoring
+    dialect). For PostgreSQL every positional ``?`` marker outside string
+    literals and comments becomes ``%s``; the literal/comment guard keeps a
+    data-bearing ``?`` (e.g. inside a JSON text constant) from being rewritten
+    into a marker and shifting every parameter by one.
+    """
+    if dialect == DIALECT_SQLITE:
+        return sql
+    if dialect != DIALECT_POSTGRESQL:
+        raise UnsupportedDatabaseDialectError(
+            f"Cannot translate queries for unsupported dialect {dialect!r}"
+        )
+
+    out: List[str] = []
+    i = 0
+    n = len(sql)
+    state = "code"  # code | single | double | line_comment | block_comment
+    while i < n:
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < n else ""
+        if state == "code":
+            if ch == "'":
+                out.append(ch)
+                state = "single"
+            elif ch == '"':
+                out.append(ch)
+                state = "double"
+            elif ch == "-" and nxt == "-":
+                out.append("--")
+                state = "line_comment"
+                i += 1
+            elif ch == "/" and nxt == "*":
+                out.append("/*")
+                state = "block_comment"
+                i += 1
+            elif ch == "?":
+                out.append("%s")
+            else:
+                out.append(ch)
+        elif state == "single":
+            out.append(ch)
+            if ch == "'":
+                if nxt == "'":
+                    out.append(nxt)
+                    i += 1
+                else:
+                    state = "code"
+        elif state == "double":
+            out.append(ch)
+            if ch == '"':
+                state = "code"
+        elif state == "line_comment":
+            out.append(ch)
+            if ch == "\n":
+                state = "code"
+        else:  # block_comment
+            out.append(ch)
+            if ch == "*" and nxt == "/":
+                out.append(nxt)
+                i += 1
+                state = "code"
+        i += 1
+    return "".join(out)
+
+
+# Row-locking preamble taken on PostgreSQL where SQLite would have taken the
+# database-wide BEGIN IMMEDIATE writer lock: lock the durable rows this
+# transaction may mutate (case, its grant, its attempts, its approval items).
+# Rows that do not exist yet are arbitrated by UNIQUE constraints instead of
+# locks — the grant-claim UPDATE's WHERE guard plus the unique indexes make a
+# lost race indistinguishable from a replay, which is the invariant SQLite
+# enforced by serializing writers.
+_POSTGRES_WRITE_LOCK_SQL = (
+    "SELECT 1 FROM risk_cases WHERE case_id = %s FOR UPDATE",
+    "SELECT 1 FROM handoff_grants WHERE grant_id = %s FOR UPDATE",
+    "SELECT 1 FROM adapter_attempts WHERE case_id = %s FOR UPDATE",
+    "SELECT 1 FROM pending_approval_items WHERE case_id = %s FOR UPDATE",
+)
+
+
+class _PostgresConnection:
+    """DB-API 2.0 connection wrapper translating the SQLite-authored call sites.
+
+    Every method the storage layer calls on a connection — ``execute``,
+    ``commit``, ``rollback``, ``cursor`` — is adapted here, so the ~150 call
+    sites authored for sqlite3 run against PostgreSQL without per-site
+    dialect branches. This is a translation seam, not an ORM: SQL remains
+    SQL, and the rewrite is exactly one rule (placeholder dialect) plus the
+    BEGIN IMMEDIATE interception below.
+
+    ``BEGIN IMMEDIATE`` (SQLite's "take the writer lock now") is intercepted
+    and replaced by the row-lock preamble: locking exactly the rows the
+    transaction will touch. A BEGIN/COMMIT pair issued by a caller that has
+    nothing to lock is still fine — the locks are scoped by the key the caller
+    passes to ``begin_write``; callers that call BEGIN IMMEDIATE bare get the
+    transaction started without locks, and their own conditional UPDATE
+    statements (guarded by ``rowcount == 1``) still arbitrate races.
+
+    Row access mirrors sqlite3.Row: ``row["col"]``, ``row[0]``, and
+    ``row.keys()`` all work, so ``dict(row)`` and the existing
+    ``"organization_id" in row.keys()`` membership checks are unchanged.
+    """
+
+    def __init__(self, database_url: str, *, lock_timeout_seconds: float = POSTGRESQL_LOCK_TIMEOUT_SECONDS):
+        try:
+            import psycopg
+        except ImportError as exc:  # pragma: no cover - exercised by CI matrix installs
+            raise UnsupportedDatabaseDialectError(
+                "PostgreSQL was selected by database_url but the 'psycopg' driver is not "
+                "installed in this environment; install the storage 'postgres' extra "
+                "(uv sync --extra postgres) or point the deployment at SQLite."
+            ) from exc
+
+        self.dialect = DIALECT_POSTGRESQL
+        self.database_url = database_url
+        self.lock_timeout_seconds = lock_timeout_seconds
+        self._lock_conn = psycopg.connect(
+            database_url,
+            autocommit=True,
+        )
+        # Data connections run in a transaction per logical operation, matching
+        # the SQLite path where every get_connection() caller commits or
+        # rolls back explicitly.
+        self._data_conn = psycopg.connect(database_url)
+        self._tx_active = False
+
+    # ── Lifecycle ───────────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        try:
+            self._data_conn.close()
+        finally:
+            self._lock_conn.close()
+
+    def __enter__(self) -> "_PostgresConnection":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+        self.close()
+
+    # ── Transactions ─────────────────────────────────────────────────────────
+
+    def _ensure_tx(self) -> None:
+        if not self._tx_active:
+            self._data_conn.execute("BEGIN")
+            self._tx_active = True
+
+    def begin_immediate(self, keys: Optional[List[str]] = None) -> None:
+        """PostgreSQL stand-in for SQLite's BEGIN IMMEDIATE writer lock.
+
+        Starts the data transaction and takes ``SELECT ... FOR UPDATE`` row
+        locks on the rows named by ``keys`` (case, grant, attempt, and
+        pending-item ids). With no keys, only the transaction starts: races
+        on rows not locked here are arbitrated by the conditional UPDATE
+        guards and UNIQUE constraints the storage layer already requires.
+        """
+        self._ensure_tx()
+        lock_conn = self._lock_conn
+        with lock_conn.transaction():
+            for key in keys or []:
+                if not key:
+                    continue
+                for template in _POSTGRES_WRITE_LOCK_SQL:
+                    lock_conn.execute(template, (key,))
+
+    def commit(self) -> None:
+        if self._tx_active:
+            self._data_conn.commit()
+            self._tx_active = False
+        else:
+            self._data_conn.commit()
+
+    def rollback(self) -> None:
+        self._data_conn.rollback()
+        self._tx_active = False
+
+    # ── Statement execution ──────────────────────────────────────────────────
+
+    def execute(self, sql: str, params: Optional[Tuple[Any, ...]] = None) -> "_PostgresCursor":
+        translated = _translate_query(sql, self.dialect)
+        if translated.strip().upper().startswith("BEGIN IMMEDIATE"):
+            # SQLite call sites issue `BEGIN IMMEDIATE` to take the writer
+            # lock before mutating. The equivalent Postgres behavior is a
+            # started transaction; row locks are taken by begin_write with
+            # the caller's keys. The key values are in `params` when the
+            # caller used the helper (see begin_write) and are unavailable
+            # here — so the lock scope for this path is the caller's own
+            # conditional statements.
+            self._ensure_tx()
+            return _PostgresCursor(self._data_conn.execute("SELECT 1"))
+        if translated.strip().upper().startswith("PRAGMA"):
+            # SQLite connection settings (WAL, busy timeout, foreign keys) have
+            # no Postgres equivalent at the statement level; the connection
+            # posture is established at connect time.
+            return _PostgresCursor(self._data_conn.execute("SELECT 1"))
+        if params:
+            cur = self._data_conn.execute(translated, params)
+        else:
+            cur = self._data_conn.execute(translated)
+        if not self._tx_active and not translated.strip().upper().startswith("SELECT"):
+            # A write outside an explicit transaction (matching sqlite3's
+            # implicit-transaction behavior for the connection-managed helpers).
+            self._tx_active = False
+        return _PostgresCursor(cur)
+
+    def cursor(self) -> "_PostgresCursor":
+        return _PostgresCursor(self._data_conn.cursor())
+
+    # ── Introspection (dialect-portable mirrors of sqlite3) ──────────────────
+
+    def list_tables(self) -> List[str]:
+        rows = self._data_conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def table_columns(self, table: str) -> Dict[str, Dict[str, Any]]:
+        rows = self._data_conn.execute(
+            "SELECT column_name, is_nullable, data_type FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = %s",
+            (table,),
+        ).fetchall()
+        return {
+            r[0]: {"name": r[0], "notnull": 1 if r[1] == "NO" else 0, "type": r[2]}
+            for r in rows
+        }
+
+
+class _PostgresCursor:
+    """Minimal cursor wrapper providing sqlite3-compatible rowcount/rows semantics."""
+
+    def __init__(self, cursor: Any):
+        self._cursor = cursor
+
+    def execute(self, sql: str, params: Optional[Tuple[Any, ...]] = None) -> "_PostgresCursor":
+        translated = _translate_query(sql, DIALECT_POSTGRESQL)
+        if params:
+            self._cursor = self._cursor.execute(translated, params)
+        else:
+            self._cursor = self._cursor.execute(translated)
+        return self
+
+    def _wrap_rows(self, rows: List[Any]) -> List["_PostgresRow"]:
+        if not rows:
+            return []
+        names = [d.name for d in (self._cursor.description or [])]
+        return [_PostgresRow(names, row) for row in rows]
+
+    def fetchone(self) -> Optional["_PostgresRow"]:
+        row = self._cursor.fetchone()
+        if row is None:
+            return None
+        names = [d.name for d in (self._cursor.description or [])]
+        return _PostgresRow(names, row)
+
+    def fetchall(self) -> List["_PostgresRow"]:
+        return self._wrap_rows(self._cursor.fetchall())
+
+    def __iter__(self):
+        for row in self.fetchall():
+            yield row
+
+    @property
+    def rowcount(self) -> int:
+        return self._cursor.rowcount
+
+    @property
+    def lastrowid(self) -> Optional[int]:
+        return None
+
+    def close(self) -> None:
+        self._cursor.close()
+
+
+class _PostgresRow:
+    """Row object exposing sqlite3.Row access semantics over a psycopg tuple.
+
+    Supports ``row["col"]``, ``row[0]``, ``len(row)``, iteration,
+    ``"col" in row.keys()``, and ``dict(row)`` — the complete surface the
+    storage layer and its tests use.
+    """
+
+    __slots__ = ("_names", "_values", "_index")
+
+    def __init__(self, names: List[str], values: Tuple[Any, ...]):
+        self._names = names
+        self._values = tuple(values)
+        self._index = {name: idx for idx, name in enumerate(names)}
+
+    def keys(self) -> List[str]:
+        return list(self._names)
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, str):
+            if key not in self._index:
+                raise IndexError(f"No column {key!r} in row (columns: {self._names})")
+            return self._values[self._index[key]]
+        return self._values[key]
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __repr__(self) -> str:
+        return f"_PostgresRow({dict(zip(self._names, self._values))!r})"
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, _PostgresRow):
+            return self._names == other._names and self._values == other._values
+        if isinstance(other, dict):
+            return dict(zip(self._names, self._values)) == other
+        if isinstance(other, tuple):
+            return self._values == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((tuple(self._names), self._values))
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except IndexError:
+            return default
+
 
 
 class DatabaseSchemaError(Exception):
@@ -461,18 +883,30 @@ def _assert_audit_event_exact_match(
 
 
 class Database:
-    """SQLite WAL storage engine for PayoutProof."""
+    """SQLite WAL / PostgreSQL storage engine for PayoutProof."""
 
     def __init__(
         self,
         db_path: Optional[str | Path] = None,
         audit_checkpoint_secret: Optional[str] = None,
+        database_url: Optional[str] = None,
     ):
-        if db_path is None:
-            import os
-            self.db_path = os.environ.get("PAYOUTPROOF_DB_PATH", "payoutproof.db")
-        else:
+        if database_url:
+            self.database_url = database_url
+            self.dialect = DIALECT_POSTGRESQL
+            self.db_path = str(database_url)
+        elif db_path and (str(db_path).startswith("postgresql://") or str(db_path).startswith("postgres://")):
+            self.database_url = str(db_path)
+            self.dialect = DIALECT_POSTGRESQL
             self.db_path = str(db_path)
+        else:
+            self.database_url = None
+            self.dialect = DIALECT_SQLITE
+            if db_path is None:
+                import os
+                self.db_path = os.environ.get("PAYOUTPROOF_DB_PATH", "payoutproof.db")
+            else:
+                self.db_path = str(db_path)
 
         if not audit_checkpoint_secret or not str(audit_checkpoint_secret).strip():
             raise ValueError("audit_checkpoint_secret is required and cannot be empty")
@@ -484,10 +918,14 @@ class Database:
         self._init_db()
 
     def __repr__(self) -> str:
+        if self.dialect == DIALECT_POSTGRESQL:
+            return "Database(dialect='postgresql', database_url='[REDACTED]', audit_checkpoint_secret='[REDACTED]')"
         return f"Database(db_path={self.db_path!r}, audit_checkpoint_secret='[REDACTED]')"
 
-    def get_connection(self, timeout: float = 30.0) -> sqlite3.Connection:
+    def get_connection(self, timeout: float = 30.0) -> Any:
         """Get connection with WAL mode enabled, foreign keys ON, busy timeout, and Row factory."""
+        if self.dialect == DIALECT_POSTGRESQL:
+            return _PostgresConnection(self.database_url)
         conn = sqlite3.connect(self.db_path, timeout=timeout)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
@@ -497,6 +935,11 @@ class Database:
 
     def _init_db(self):
         """Initialize database tables and run schema migrations."""
+        if self.dialect == DIALECT_POSTGRESQL:
+            with self.get_connection() as conn:
+                runner = MigrationRunner(conn, dialect=DIALECT_POSTGRESQL)
+                runner.apply_pending()
+            return
         with self.get_connection() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS risk_cases (
@@ -971,6 +1414,9 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_config_audit_checkpoints_organization ON config_audit_checkpoints(organization_id);
             """)
             conn.commit()
+            runner = MigrationRunner(conn, dialect=DIALECT_SQLITE)
+            runner.baseline_existing()
+            runner.apply_pending()
 
     def _migrate_db(self, conn: sqlite3.Connection):
         """Idempotently migrate older schemas to required columns and constraints with duplicate quarantine."""

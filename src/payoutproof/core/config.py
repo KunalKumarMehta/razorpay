@@ -74,6 +74,7 @@ class AppConfig:
     # than 503 for every deployment that has not deliberately opted in.
     enable_settings_admin: bool = False
     settings_admin_token: Optional[str] = field(default=None, repr=False)
+    database_url: Optional[str] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not self.grant_secret or len(self.grant_secret.strip()) < 32:
@@ -200,6 +201,7 @@ class AppConfig:
             "cors_allowed_origins": list(self.cors_allowed_origins),
             "enable_settings_admin": self.enable_settings_admin,
             "settings_admin_token": "[REDACTED]" if self.settings_admin_token else None,
+            "database_url": "[REDACTED]" if self.database_url else None,
         }
 
     def __repr__(self) -> str:
@@ -220,7 +222,8 @@ class AppConfig:
             f"session_cookie_secure={self.session_cookie_secure!r}, "
             f"cors_allowed_origins={self.cors_allowed_origins!r}, "
             f"enable_settings_admin={self.enable_settings_admin!r}, "
-            f"settings_admin_token='[REDACTED]' if self.settings_admin_token else None"
+            f"settings_admin_token='[REDACTED]' if self.settings_admin_token else None, "
+            f"database_url='[REDACTED]' if self.database_url else None"
             f")"
         )
 
@@ -289,6 +292,7 @@ class AppConfig:
                 membership_secret = DEFAULT_TEST_MEMBERSHIP_SECRET
 
         db_path = environ.get("PAYOUTPROOF_DB_PATH", "payoutproof.db")
+        database_url = environ.get("PAYOUTPROOF_DATABASE_URL", "").strip() or None
         demo_modes_raw = environ.get("PAYOUTPROOF_ENABLE_DEMO_ADAPTER_MODES", "0").strip().lower()
         enable_demo = demo_modes_raw in ("1", "true", "yes", "enabled")
 
@@ -366,6 +370,7 @@ class AppConfig:
             cors_allowed_origins=cors_origins,
             enable_settings_admin=enable_settings_admin,
             settings_admin_token=settings_admin_token,
+            database_url=database_url,
         )
 
     @classmethod
@@ -387,6 +392,7 @@ class AppConfig:
         cors_allowed_origins: tuple = (),
         enable_settings_admin: bool = False,
         settings_admin_token: Optional[str] = None,
+        database_url: Optional[str] = None,
     ) -> AppConfig:
         """Compose configuration explicitly for tests.
 
@@ -441,4 +447,5 @@ class AppConfig:
             cors_allowed_origins=cors_allowed_origins,
             enable_settings_admin=enable_settings_admin,
             settings_admin_token=settings_admin_token,
+            database_url=database_url,
         )

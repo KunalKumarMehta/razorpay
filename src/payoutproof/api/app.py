@@ -1666,6 +1666,7 @@ def create_app(
         resolved_db = Database(
             db_path=config.db_path,
             audit_checkpoint_secret=config.audit_checkpoint_secret,
+            database_url=config.database_url,
         )
 
     app_instance = FastAPI(
