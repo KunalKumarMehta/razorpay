@@ -35,6 +35,12 @@ class SimulationMode(str, Enum):
     AUDIO_LOW_CONFIDENCE = "AUDIO_LOW_CONFIDENCE"
     AUDIO_CORRUPTED = "AUDIO_CORRUPTED"
     AUDIO_UNCERTAIN_SPOOF = "AUDIO_UNCERTAIN_SPOOF"
+    # Document/Image-specific simulation modes (Issue #16)
+    DOCUMENT_SUCCESS_PDF = "DOCUMENT_SUCCESS_PDF"
+    DOCUMENT_SUCCESS_IMAGE = "DOCUMENT_SUCCESS_IMAGE"
+    DOCUMENT_CONTRADICTION = "DOCUMENT_CONTRADICTION"
+    DOCUMENT_LOW_CONFIDENCE = "DOCUMENT_LOW_CONFIDENCE"
+    DOCUMENT_CORRUPTED = "DOCUMENT_CORRUPTED"
 
 
 @runtime_checkable
@@ -349,6 +355,132 @@ class DeterministicFakeProvider:
                 model_version=self.model_version,
                 confidence=diag.asr_confidence,
                 timing_ms=165.0,
+                raw_output_ref=raw_ref,
+                source_provenance=provenance,
+                status=status,
+                failure_reason=fail_reason,
+                error_message=err_msg,
+                raw_output=raw_out,
+                extracted_intent=intent,
+                findings=findings,
+            )
+
+        # Check if payload is document/image evidence or document simulation mode
+        is_document = (
+            evidence_meta.get("data_class") in ("FINANCIAL_DOCUMENT", "DOCUMENT", "IMAGE")
+            or str(evidence_meta.get("detected_mime_type", "")).startswith("image/")
+            or str(evidence_meta.get("detected_mime_type", "")) == "application/pdf"
+            or str(evidence_meta.get("claimed_mime_type", "")).startswith("image/")
+            or str(evidence_meta.get("claimed_mime_type", "")) == "application/pdf"
+            or evidence_bytes.startswith(b"%PDF-")
+            or evidence_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+            or (len(evidence_bytes) >= 3 and evidence_bytes[:3] == b"\xff\xd8\xff")
+            or mode in (
+                SimulationMode.DOCUMENT_SUCCESS_PDF,
+                SimulationMode.DOCUMENT_SUCCESS_IMAGE,
+                SimulationMode.DOCUMENT_CONTRADICTION,
+                SimulationMode.DOCUMENT_LOW_CONFIDENCE,
+                SimulationMode.DOCUMENT_CORRUPTED,
+            )
+        )
+
+        if is_document:
+            if mode == SimulationMode.DOCUMENT_CORRUPTED:
+                return ProviderResult(
+                    provider_id=self.provider_id,
+                    model_version=self.model_version,
+                    confidence=0.0,
+                    timing_ms=20.0,
+                    raw_output_ref=None,
+                    source_provenance=provenance,
+                    status=JobStatus.FAILED,
+                    failure_reason=ExtractionFailureReason.DOCUMENT_CORRUPTED,
+                    error_message="Document payload truncated or corrupted header bytes",
+                    raw_output=None,
+                    extracted_intent=None,
+                    findings=[
+                        Finding(
+                            name=FindingName.INSTRUCTION_CONSISTENCY.value,
+                            truth_state=TruthState.INSUFFICIENT_QUALITY,
+                            detail="Corrupted document/image payload cannot be parsed by OCR engine",
+                            evidence_ref=provenance.evidence_hash,
+                            organization_id=provenance.organization_id,
+                        )
+                    ],
+                )
+
+            from payoutproof.agent.document import (
+                extract_document_evidence,
+                DocumentFormatError,
+                DocumentCorruptedError,
+            )
+
+            try:
+                intent, diag, status, fail_reason, err_msg, findings = extract_document_evidence(
+                    document_bytes=evidence_bytes,
+                    evidence_meta=evidence_meta,
+                    simulation_mode=mode.value if mode else None,
+                )
+            except DocumentCorruptedError as e:
+                return ProviderResult(
+                    provider_id=self.provider_id,
+                    model_version=self.model_version,
+                    confidence=0.0,
+                    timing_ms=20.0,
+                    raw_output_ref=None,
+                    source_provenance=provenance,
+                    status=JobStatus.FAILED,
+                    failure_reason=ExtractionFailureReason.DOCUMENT_CORRUPTED,
+                    error_message=str(e),
+                    raw_output=None,
+                    extracted_intent=None,
+                    findings=[
+                        Finding(
+                            name=FindingName.INSTRUCTION_CONSISTENCY.value,
+                            truth_state=TruthState.INSUFFICIENT_QUALITY,
+                            detail=f"Document corrupted: {e}",
+                            evidence_ref=provenance.evidence_hash,
+                            organization_id=provenance.organization_id,
+                        )
+                    ],
+                )
+            except DocumentFormatError as e:
+                return ProviderResult(
+                    provider_id=self.provider_id,
+                    model_version=self.model_version,
+                    confidence=0.0,
+                    timing_ms=20.0,
+                    raw_output_ref=None,
+                    source_provenance=provenance,
+                    status=JobStatus.FAILED,
+                    failure_reason=ExtractionFailureReason.UNSUPPORTED_DOCUMENT_FORMAT,
+                    error_message=str(e),
+                    raw_output=None,
+                    extracted_intent=None,
+                    findings=[
+                        Finding(
+                            name=FindingName.INSTRUCTION_CONSISTENCY.value,
+                            truth_state=TruthState.NOT_EVALUATED,
+                            detail=f"Unsupported document format: {e}",
+                            evidence_ref=provenance.evidence_hash,
+                            organization_id=provenance.organization_id,
+                        )
+                    ],
+                )
+
+            raw_out = {
+                "document_diagnostics": diag.model_dump(mode="json"),
+                "confidence": diag.ocr_confidence,
+                "extracted_text": diag.extracted_text,
+            }
+            raw_bytes = json.dumps(raw_out, sort_keys=True).encode("utf-8")
+            raw_ref = f"raw-ref://{sha256_hex(raw_bytes)[:16]}"
+
+            return ProviderResult(
+                provider_id=self.provider_id,
+                model_version=self.model_version,
+                confidence=diag.ocr_confidence,
+                timing_ms=135.0,
                 raw_output_ref=raw_ref,
                 source_provenance=provenance,
                 status=status,

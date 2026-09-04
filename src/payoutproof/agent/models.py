@@ -35,6 +35,9 @@ class ExtractionFailureReason(str, Enum):
     MATERIAL_AMBIGUITY = "MATERIAL_AMBIGUITY"
     SPOOF_DETECTED = "SPOOF_DETECTED"
     ACOUSTIC_QUALITY_UNCERTAIN = "ACOUSTIC_QUALITY_UNCERTAIN"
+    # Document/Image-specific failure and uncertainty states (Issue #16)
+    UNSUPPORTED_DOCUMENT_FORMAT = "UNSUPPORTED_DOCUMENT_FORMAT"
+    DOCUMENT_CORRUPTED = "DOCUMENT_CORRUPTED"
 
 
 class ProviderProvenance(BaseModel):

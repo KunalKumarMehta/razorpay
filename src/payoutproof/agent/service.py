@@ -308,6 +308,8 @@ class TrustAgentService:
         }
         if "audio_diagnostics" in raw_out:
             result_dict["audio_diagnostics"] = raw_out["audio_diagnostics"]
+        if "document_diagnostics" in raw_out:
+            result_dict["document_diagnostics"] = raw_out["document_diagnostics"]
 
         with self.db.get_connection() as conn:
             case_state = self.db.load_case_tx(conn, row["case_id"])
@@ -328,10 +330,12 @@ class TrustAgentService:
                 ):
                     updated_intent = provider_result.extracted_intent
 
-                # Update CaseInvestigation diagnostics if audio evidence was processed
+                # Update CaseInvestigation diagnostics if audio or document evidence was processed
                 updated_investigation = case_state.investigation
                 raw_out = provider_result.raw_output or {}
                 audio_diag = raw_out.get("audio_diagnostics")
+                doc_diag = raw_out.get("document_diagnostics")
+
                 if audio_diag:
                     if provider_result.status == JobStatus.SUCCEEDED:
                         model_status = "COMPLETED"
@@ -351,6 +355,23 @@ class TrustAgentService:
                             "asr_confidence": audio_diag.get("asr_confidence"),
                             "extraction_latency_ms": provider_result.timing_ms,
                             "language_stratum": audio_diag.get("language_stratum"),
+                        }
+                    )
+                elif doc_diag:
+                    if provider_result.status == JobStatus.SUCCEEDED:
+                        model_status = "COMPLETED"
+                    elif provider_result.failure_reason == ExtractionFailureReason.MATERIAL_AMBIGUITY:
+                        model_status = "AMBIGUOUS"
+                    elif provider_result.status == JobStatus.TIMED_OUT:
+                        model_status = "TIMED_OUT"
+                    else:
+                        model_status = "FAILED"
+
+                    updated_investigation = case_state.investigation.model_copy(
+                        update={
+                            "model_status": model_status,
+                            "attempt": case_state.investigation.attempt + 1,
+                            "extraction_latency_ms": provider_result.timing_ms,
                         }
                     )
 
@@ -388,6 +409,13 @@ class TrustAgentService:
                     audit_details["anti_spoof_status"] = audio_diag.get("anti_spoof", {}).get("status")
                     audit_details["anti_spoof_score"] = audio_diag.get("anti_spoof", {}).get("score")
                     audit_details["has_material_ambiguity"] = audio_diag.get("has_material_ambiguity", False)
+                elif doc_diag:
+                    meta = doc_diag.get("metadata", {})
+                    audit_details["document_format"] = meta.get("format")
+                    audit_details["page_count"] = meta.get("page_count")
+                    audit_details["ocr_provider_id"] = doc_diag.get("ocr_provider_id")
+                    audit_details["ocr_model_version"] = doc_diag.get("ocr_model_version")
+                    audit_details["has_contradiction"] = doc_diag.get("has_contradiction", False)
 
                 new_event = AuditChain.create_event(
                     events=case_state.audit,
