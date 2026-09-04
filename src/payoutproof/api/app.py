@@ -19,6 +19,7 @@ per-route hand-rolled checks and not middleware added only in `create_app`
 import hmac
 import secrets
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from fastapi import Depends, FastAPI, HTTPException, Request, APIRouter
@@ -52,6 +53,12 @@ from payoutproof.storage.db import (
     StaleCaseStateError,
     GrantTransitionError,
     AuditLedgerIntegrityError,
+    DestinationRecordError,
+    DestinationTransitionError,
+    DestinationNotFoundError,
+    PolicyConfigTransitionError,
+    PolicyConfigNotFoundError,
+    PolicyConfigTamperError,
 )
 from payoutproof.adapters.fake_adapter import FakeApprovalRailAdapter
 from payoutproof.audit.chain import AuditChain
@@ -90,6 +97,35 @@ class ActionRequest(BaseModel):
 class CreateCaseRequest(BaseModel):
     case_id: Optional[str] = None
     tenant_id: Optional[str] = None
+
+
+class CreateDestinationRequest(BaseModel):
+    """Create an Approved Destination record (CREATED status) in the caller's organization.
+
+    Authority is server-owned: organization comes from the session, the bound
+    policy config is resolved server-side from the caller's organization, and
+    the client names only the destination facts and the effective window.
+    """
+    destination_id: Optional[str] = None
+    counterparty: str = Field(min_length=1)
+    destination: str = Field(min_length=1)
+    destination_type: str = Field(min_length=1)
+    valid_from: str = Field(min_length=1)
+    valid_to: Optional[str] = None
+    policy_config_id: Optional[str] = None
+
+
+class CreatePolicyConfigRequest(BaseModel):
+    """Mint a DRAFT policy configuration version for the caller's organization.
+
+    The content hash is always derived server-side from the submitted
+    thresholds; a client-asserted content_hash would be a lie about content.
+    """
+    config_id: Optional[str] = None
+    version_id: Optional[str] = None
+    grant_ttl_seconds: Optional[int] = None
+    step_up_rules: Optional[Dict[str, Any]] = None
+    block_conditions: Optional[Dict[str, Any]] = None
 
 
 # Public, session-exempt surface: liveness, secret-free release identity, and
@@ -987,6 +1023,591 @@ def verify_audit(
     }
 
 
+# ── Versioned policy configuration & Approved Destinations (Issue #9) ────────
+#
+# Ordering discipline mirrors dispatch_action's fail-safe ladder:
+#
+#   session (401, router dependency)
+#     -> request shape (400/422, body model)
+#     -> organization scope (active_organization: 400/403 on header conflict)
+#     -> target scope (404 zero-existence: absent and cross-org look identical)
+#     -> role (403, Finance Control Owner for every mutation)
+#     -> storage transition guards (409 conflict / 400 malformed)
+#
+# The role check runs AFTER the zero-existence 404 for the same reason as
+# dispatch: a 403 must never reveal that an out-of-scope destination or
+# config exists. require_action_role is enforced against the frozen dispatch
+# matrix using the two Finance-Control-Owner-gated decision actions
+# (ADD_DESTINATION_APPROVAL for destination decisions, EVALUATE_POLICY for
+# policy-config decisions) — these surfaces ARE those decisions, lifted
+# from per-case evidence into durable, versioned records.
+
+# Lifecycle/decision actions whose frozen role decisions govern these
+# surfaces. Both are FINANCE_CONTROL_OWNER-only in ACTION_ROLE_MATRIX.
+_DESTINATION_DECISION_ACTION = "ADD_DESTINATION_APPROVAL"
+_POLICY_DECISION_ACTION = "EVALUATE_POLICY"
+
+
+def _destination_record_to_dict(record) -> Dict[str, Any]:
+    """Serialize an ApprovedDestinationRecord with the human-effective window."""
+    return {
+        **record.model_dump(),
+        "effective_at": _request_clock_now(_resolve_current_request()).isoformat(),
+    }
+
+
+def _resolve_current_request() -> Request:
+    """Resolve the ambient request for clock-derived response fields.
+
+    Response enrichment is presentation-only: the durable record never
+    stores a computed "is approved" value, so effectiveness can be
+    recomputed against any instant from the raw window fields alone.
+    """
+    import inspect
+    from fastapi import Request as _Request
+
+    frame = inspect.currentframe()
+    try:
+        while frame is not None:
+            request = frame.f_locals.get("request")
+            if isinstance(request, _Request):
+                return request
+            frame = frame.f_back
+    finally:
+        del frame
+    raise HTTPException(status_code=500, detail="Request context not available")
+
+
+# Storage exception -> HTTP status for both surfaces. Transition conflicts
+# (invalid lifecycle moves, single-ACTIVE violations, lost races) are 409;
+# malformed payloads (naive/unparseable windows, inverted windows) are 400;
+# absent/cross-org targets are 404; tamper detections quarantine with 409.
+DESTINATION_EXCEPTION_MAP: List[tuple] = [
+    (DestinationNotFoundError, 404),
+    (PolicyConfigNotFoundError, 404),
+    (DestinationTransitionError, 409),
+    (PolicyConfigTransitionError, 409),
+    (PolicyConfigTamperError, 409),
+    (DestinationRecordError, 400),
+    (AuditLedgerIntegrityError, 409),
+]
+
+
+def _raise_mapped_destination(exc: Exception) -> None:
+    """Map a storage exception to its contracted HTTP status (or 500)."""
+    for exc_type, code in DESTINATION_EXCEPTION_MAP:
+        if isinstance(exc, exc_type):
+            raise HTTPException(status_code=code, detail=str(exc)) from exc
+    raise HTTPException(
+        status_code=500,
+        detail="Internal error during policy/destination administration; operation aborted safely fail-closed.",
+    ) from exc
+
+
+def _mint_destination_config(
+    active_db: Database,
+    request: Request,
+    session: SessionRecord,
+    organization_id: str,
+    policy_config_id: Optional[str],
+):
+    """Resolve the policy config a new destination record binds to.
+
+    Precedence: the caller's named config (must be the org's own), else the
+    organization's ACTIVE config. An org with neither gets a precise 400 —
+    there is no implicit cross-org or code-level default for a *durable*
+    approval: the record must cite the exact policy version it was approved
+    under, and that citation must be verifiable in the org's own rows.
+    """
+    from payoutproof.policy.config import PolicyConfig  # noqa: F401  (type authority)
+
+    if policy_config_id:
+        named = active_db.get_policy_config(
+            config_id=policy_config_id,
+            organization_id=organization_id,
+        )
+        if named is None:
+            # Zero-existence: a missing and a cross-org config are identical.
+            raise HTTPException(
+                status_code=404,
+                detail=f"Policy config '{policy_config_id}' not found in organization '{organization_id}'",
+            )
+        return named
+    active = active_db.get_active_policy_config(organization_id=organization_id)
+    if active is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Organization '{organization_id}' has no ACTIVE policy config; create and "
+                "activate one before approving destinations"
+            ),
+        )
+    return active
+
+
+def _require_fco_destination_authority(session: SessionRecord) -> None:
+    """Require Finance Control Owner authority for a destination decision (403)."""
+    require_action_role(_DESTINATION_DECISION_ACTION, session)
+
+
+def _require_fco_policy_authority(session: SessionRecord) -> None:
+    """Require Finance Control Owner authority for a policy-config decision (403)."""
+    require_action_role(_POLICY_DECISION_ACTION, session)
+
+
+def _resolve_destination_or_404(
+    active_db: Database,
+    destination_id: str,
+    organization_id: str,
+):
+    """Load one destination record in scope, or raise the uniform zero-existence 404.
+
+    Tampered destination content (a record_hash that disagrees with the row)
+    fails closed as 409 quarantine, mirroring PolicyConfigTamperError.
+    """
+    record = active_db.get_destination_record(
+        destination_id=destination_id,
+        organization_id=organization_id,
+    )
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Destination '{destination_id}' not found",
+        )
+    return record
+
+
+@protected_router.post("/api/destinations")
+def create_destination(
+    req: CreateDestinationRequest,
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Create an Approved Destination record (CREATED) in the caller's organization.
+
+    The record is effective-dated: [valid_from, valid_to) is half-open and
+    stored as canonical UTC. Overlapping an ACTIVE window for the same
+    counterparty/destination is refused (409) so exactly one approval is
+    effective at any instant. The record binds the immutable policy config
+    it was approved under — by id and content hash, verifiable forever.
+    """
+    active_db = _resolve_db(request)
+    organization_id = active_organization(request, session)
+    _require_fco_destination_authority(session)
+
+    try:
+        policy_config = _mint_destination_config(
+            active_db, request, session, organization_id, req.policy_config_id
+        )
+        record = active_db.create_destination_record(
+            organization_id=organization_id,
+            tenant_id=session.tenant_id,
+            counterparty=req.counterparty,
+            destination=req.destination,
+            destination_type=req.destination_type,
+            valid_from=req.valid_from,
+            valid_to=req.valid_to,
+            policy_config=policy_config,
+            actor=session.subject,
+            destination_id=req.destination_id,
+            now=_now_iso(request),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_mapped_destination(exc)
+
+    now = _request_clock_now(request)
+    return {
+        **record.model_dump(),
+        "is_effective_now": record.is_effective_at(now),
+        "evaluated_at": now.isoformat(),
+    }
+
+
+@protected_router.get("/api/destinations")
+def list_destinations(
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+    counterparty: Optional[str] = None,
+    destination: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """List the caller's organization's destination records (read-only, newest first)."""
+    active_db = _resolve_db(request)
+    organization_id = active_organization(request, session)
+
+    records = active_db.list_destination_records(
+        organization_id=organization_id,
+        counterparty=counterparty,
+        destination=destination,
+    )
+    now = _request_clock_now(request)
+    return [
+        {**r.model_dump(), "is_effective_now": r.is_effective_at(now)} for r in records
+    ]
+
+
+@protected_router.get("/api/destinations/{destination_id}")
+def get_destination(
+    destination_id: str,
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Get one destination record (zero-existence 404 when absent or cross-org)."""
+    active_db = _resolve_db(request)
+    organization_id = active_organization(request, session)
+
+    record = _resolve_destination_or_404(active_db, destination_id, organization_id)
+    now = _request_clock_now(request)
+    return {**record.model_dump(), "is_effective_now": record.is_effective_at(now)}
+
+
+@protected_router.post("/api/destinations/{destination_id}/activate")
+def activate_destination(
+    destination_id: str,
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Transition a destination record CREATED -> ACTIVE (approval goes live)."""
+    active_db = _resolve_db(request)
+    organization_id = active_organization(request, session)
+
+    # Zero-existence precedes the role check: a 403 must never reveal an
+    # out-of-scope destination's existence.
+    _resolve_destination_or_404(active_db, destination_id, organization_id)
+    _require_fco_destination_authority(session)
+
+    try:
+        record = active_db.activate_destination_record(
+            destination_id=destination_id,
+            organization_id=organization_id,
+            actor=session.subject,
+            now=_now_iso(request),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_mapped_destination(exc)
+
+    now = _request_clock_now(request)
+    return {**record.model_dump(), "is_effective_now": record.is_effective_at(now)}
+
+
+@protected_router.post("/api/destinations/{destination_id}/retire")
+def retire_destination(
+    destination_id: str,
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Transition a destination record ACTIVE (or CREATED) -> RETIRED (terminal).
+
+    CREATED -> RETIRED is the one documented deviation from the grant lattice:
+    a scheduled approval may be cancelled before its valid_from goes live.
+    RETIRED is terminal — re-approving the destination creates a new record.
+    """
+    active_db = _resolve_db(request)
+    organization_id = active_organization(request, session)
+
+    _resolve_destination_or_404(active_db, destination_id, organization_id)
+    _require_fco_destination_authority(session)
+
+    try:
+        record = active_db.retire_destination_record(
+            destination_id=destination_id,
+            organization_id=organization_id,
+            actor=session.subject,
+            now=_now_iso(request),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_mapped_destination(exc)
+
+    now = _request_clock_now(request)
+    return {**record.model_dump(), "is_effective_now": record.is_effective_at(now)}
+
+
+# ── Policy configuration endpoints ───────────────────────────────────────────
+
+
+def _resolve_config_or_404(active_db: Database, config_id: str, organization_id: str):
+    """Load one policy config in scope, or raise the uniform zero-existence 404."""
+    config = active_db.get_policy_config(
+        config_id=config_id,
+        organization_id=organization_id,
+    )
+    if config is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Policy config '{config_id}' not found",
+        )
+    return config
+
+
+@protected_router.post("/api/policy/configs")
+def create_policy_config(
+    req: CreatePolicyConfigRequest,
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Mint a DRAFT policy configuration version for the caller's organization.
+
+    The content hash is derived server-side (never client-asserted), the
+    version must be the next monotonic version for the organization, and
+    the config is insert-only: once ACTIVE its content can never be edited
+    — a change mints a new version row.
+    """
+    active_db = _resolve_db(request)
+    organization_id = active_organization(request, session)
+    _require_fco_policy_authority(session)
+
+    from payoutproof.policy.config import (
+        BlockConditions,
+        StepUpRules,
+        mint_policy_config,
+    )
+    from payoutproof.policy.evaluator import GRANT_TTL_SECONDS
+
+    try:
+        resolved_rules = StepUpRules.model_validate(req.step_up_rules) if req.step_up_rules else None
+        resolved_conditions = (
+            BlockConditions.model_validate(req.block_conditions) if req.block_conditions else None
+        )
+        config = mint_policy_config(
+            organization_id=organization_id,
+            config_id=req.config_id or f"PP-POLCFG-{uuid.uuid4().hex[:12].upper()}",
+            created_by=session.subject,
+            created_at=_now_iso(request),
+            version_id=req.version_id,
+            grant_ttl_seconds=(
+                req.grant_ttl_seconds if req.grant_ttl_seconds is not None else GRANT_TTL_SECONDS
+            ),
+            step_up_rules=resolved_rules,
+            block_conditions=resolved_conditions,
+        )
+        created = active_db.create_policy_config(
+            policy_config=config,
+            actor=session.subject,
+            now=_now_iso(request),
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        # Pydantic rule/condition validation failures are malformed input.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        _raise_mapped_destination(exc)
+
+    return created.to_audit_details() | {
+        "config_id": created.config_id,
+        "grant_ttl_seconds": created.grant_ttl_seconds,
+        "step_up_rules": created.step_up_rules.model_dump(),
+        "block_conditions": created.block_conditions.model_dump(),
+        "created_by": created.created_by,
+        "created_at": created.created_at,
+        "activated_by": created.activated_by,
+        "activated_at": created.activated_at,
+        "retired_by": created.retired_by,
+        "retired_at": created.retired_at,
+    }
+
+
+@protected_router.post("/api/policy/configs/{config_id}/activate")
+def activate_policy_config(
+    config_id: str,
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Transition a policy config DRAFT -> ACTIVE (the point of no return).
+
+    Enforces the single-ACTIVE-per-organization invariant: activating while
+    another config is ACTIVE fails with 409 (retire it first).
+    """
+    active_db = _resolve_db(request)
+    organization_id = active_organization(request, session)
+
+    _resolve_config_or_404(active_db, config_id, organization_id)
+    _require_fco_policy_authority(session)
+
+    try:
+        config = active_db.activate_policy_config(
+            config_id=config_id,
+            organization_id=organization_id,
+            actor=session.subject,
+            now=_now_iso(request),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_mapped_destination(exc)
+
+    return _policy_config_response(config)
+
+
+@protected_router.post("/api/policy/configs/{config_id}/retire")
+def retire_policy_config(
+    config_id: str,
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Transition a policy config ACTIVE (or DRAFT) -> RETIRED (terminal)."""
+    active_db = _resolve_db(request)
+    organization_id = active_organization(request, session)
+
+    _resolve_config_or_404(active_db, config_id, organization_id)
+    _require_fco_policy_authority(session)
+
+    try:
+        config = active_db.retire_policy_config(
+            config_id=config_id,
+            organization_id=organization_id,
+            actor=session.subject,
+            now=_now_iso(request),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_mapped_destination(exc)
+
+    return _policy_config_response(config)
+
+
+def _policy_config_response(config) -> Dict[str, Any]:
+    """Full config view: provenance block plus lifecycle attribution."""
+    status_val = config.status.value if hasattr(config.status, "value") else str(config.status)
+    return config.to_audit_details() | {
+        "config_id": config.config_id,
+        "status": status_val,
+        "grant_ttl_seconds": config.grant_ttl_seconds,
+        "step_up_rules": config.step_up_rules.model_dump(),
+        "block_conditions": config.block_conditions.model_dump(),
+        "created_by": config.created_by,
+        "created_at": config.created_at,
+        "activated_by": config.activated_by,
+        "activated_at": config.activated_at,
+        "retired_by": config.retired_by,
+        "retired_at": config.retired_at,
+    }
+
+
+@protected_router.get("/api/policy/configs/active")
+def get_active_policy_config(
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Resolve the caller's organization's ACTIVE policy config.
+
+    Returns the code-level default's shape with an explicit
+    ``is_default: true`` marker when the organization has never minted a
+    config — the resolved default is exactly today's in-code gate behavior,
+    and callers must be able to see which one governed a case.
+    """
+    active_db = _resolve_db(request)
+    organization_id = active_organization(request, session)
+
+    try:
+        config = active_db.get_active_policy_config(organization_id=organization_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_mapped_destination(exc)
+
+    if config is None:
+        from payoutproof.policy.config import default_active_config
+
+        resolved = default_active_config(organization_id)
+        return _policy_config_response(resolved) | {"is_default": True}
+
+    return _policy_config_response(config) | {"is_default": False}
+
+
+@protected_router.get("/api/policy/configs/audit/verify")
+def verify_policy_config_audit(
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Verify the organization-keyed config audit chain and checkpoint MAC (read-only).
+
+    Covers every policy-version lifecycle event and the org-level mirror of
+    every destination-approval lifecycle event. Tampering with any
+    config_audit_events row makes verification fail and every further
+    config/destination mutation refuses with 409.
+    """
+    active_db = _resolve_db(request)
+    organization_id = active_organization(request, session)
+
+    if not CAPABILITY_VERIFY_AUDIT.get(session.role.value, False):
+        raise HTTPException(status_code=403, detail="Forbidden: this role may not verify audit chains")
+
+    try:
+        result = active_db.verify_config_audit(organization_id=organization_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_mapped_destination(exc)
+
+    if result is None:
+        return {
+            "organization_id": organization_id,
+            "total_events": 0,
+            "event_count": 0,
+            "is_valid": True,
+            "trust_state": "TRUSTED",
+            "broken_at_seq": None,
+            "reason": "No policy configuration activity recorded for this organization",
+        }
+    return {
+        "organization_id": result["organization_id"],
+        "total_events": result["event_count"],
+        "event_count": result["event_count"],
+        "is_valid": result["is_valid"],
+        "trust_state": result["trust_state"],
+        "broken_at_seq": result.get("broken_at_seq"),
+        "reason": result.get("reason"),
+    }
+
+
+@protected_router.get("/api/policy/configs/{config_id}")
+def get_policy_config(
+    config_id: str,
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Get one policy config (zero-existence 404 when absent or cross-org).
+
+    Tampered content fails closed: a row whose stored content_hash disagrees
+    with the canonical recomputation is quarantined with 409, never served.
+    """
+    active_db = _resolve_db(request)
+    organization_id = active_organization(request, session)
+
+    try:
+        config = _resolve_config_or_404(active_db, config_id, organization_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_mapped_destination(exc)
+
+    return _policy_config_response(config)
+
+
+@protected_router.get("/api/policy/configs")
+def list_policy_configs(
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> List[Dict[str, Any]]:
+    """List every policy config version for the caller's organization (newest first)."""
+    active_db = _resolve_db(request)
+    organization_id = active_organization(request, session)
+
+    try:
+        configs = active_db.list_policy_configs(organization_id=organization_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_mapped_destination(exc)
+
+    return [_policy_config_response(c) for c in configs]
 @protected_router.post("/api/evaluate/run", dependencies=[Depends(require_evaluation_runner)])
 def run_evaluation(
     suite: str = "dev",

@@ -17,6 +17,7 @@ from payoutproof.core.enums import (
     AdapterDecision,
     ReasonCode,
     AuditTrustState,
+    DestinationRecordStatus,
 )
 
 
@@ -123,6 +124,117 @@ class Finding(BaseModel):
     organization_id: Optional[str] = None
 
 
+class DestinationApprovalSnapshot(BaseModel):
+    """Frozen hydrated view of one Approved Destination record bound into a case.
+
+    Captured at hydration time from the destination registry — before Policy
+    Gate evaluation — and never mutated afterwards. It stores the *raw* window
+    fields (status, valid_from, valid_to), never a precomputed "is approved"
+    boolean: effectiveness is computed by the Policy Gate against its own
+    evaluation_time, so replaying the same snapshot at the same instant yields
+    the same outcome regardless of when hydration happened.
+    """
+    model_config = ConfigDict(frozen=True)
+
+    destination_id: str
+    organization_id: str
+    tenant_id: str
+    counterparty: str
+    destination: str
+    destination_type: str
+    status: DestinationRecordStatus = DestinationRecordStatus.CREATED
+    valid_from: str
+    valid_to: Optional[str] = None
+    policy_config_id: str
+    policy_config_hash: str
+    record_hash: str
+    snapshot_captured_at: str
+
+    def is_effective_at(self, at: datetime) -> bool:
+        """Half-open [valid_from, valid_to) effectiveness at an aware instant.
+
+        Effectiveness = status ACTIVE AND valid_from <= at AND (valid_to IS
+        NULL OR at < valid_to). Timestamps are parsed as datetimes, never
+        string-compared; a naive `at` is treated as UTC. A naive or malformed
+        stored window is fail-closed (not effective), never an exception.
+        """
+        if self.status != DestinationRecordStatus.ACTIVE:
+            return False
+        try:
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            start = datetime.fromisoformat(self.valid_from)
+            if start.tzinfo is None:
+                return False
+            if at < start:
+                return False
+            if self.valid_to is not None:
+                end = datetime.fromisoformat(self.valid_to)
+                if end.tzinfo is None:
+                    return False
+                if at >= end:
+                    return False
+            return True
+        except (ValueError, TypeError):
+            return False
+
+
+class ApprovedDestinationRecord(BaseModel):
+    """Durable effective-dated Approved Destination record (Issue #9).
+
+    The registry row model: one counterparty/destination approval accepted
+    under the organization's finance policy, with an explicit approval window
+    and the immutable policy configuration it was approved under. `status` is
+    the operator-driven lifecycle; effectiveness at a time is computed by
+    ``is_effective_at`` (an ACTIVE-but-expired window is simply non-effective
+    — no scheduler mutates rows on window expiry, preserving the audit chain).
+    """
+    model_config = ConfigDict(frozen=True)
+
+    destination_id: str
+    tenant_id: str
+    organization_id: str
+    counterparty: str
+    destination: str
+    destination_type: str
+    status: DestinationRecordStatus = DestinationRecordStatus.CREATED
+    valid_from: str
+    valid_to: Optional[str] = None
+    policy_config_id: str
+    policy_config_hash: str
+    record_hash: str
+    created_at: str
+    updated_at: str
+    retired_at: Optional[str] = None
+
+    def is_effective_at(self, at: datetime) -> bool:
+        """Half-open [valid_from, valid_to) effectiveness at an aware instant.
+
+        Same semantics as ``DestinationApprovalSnapshot.is_effective_at``:
+        timestamps are parsed (never string-compared), naive stored values are
+        fail-closed, and a naive `at` is treated as UTC.
+        """
+        if self.status != DestinationRecordStatus.ACTIVE:
+            return False
+        try:
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            start = datetime.fromisoformat(self.valid_from)
+            if start.tzinfo is None:
+                return False
+            if at < start:
+                return False
+            if self.valid_to is not None:
+                end = datetime.fromisoformat(self.valid_to)
+                if end.tzinfo is None:
+                    return False
+                if at >= end:
+                    return False
+            return True
+        except (ValueError, TypeError):
+            return False
+
+
 class PolicyEvaluationResult(BaseModel):
     """Deterministic result produced by the Policy Gate."""
     model_config = ConfigDict(frozen=True)
@@ -136,6 +248,12 @@ class PolicyEvaluationResult(BaseModel):
     organization_id: Optional[str] = None
     evaluated_at: Optional[str] = None
     expires_at: Optional[str] = None
+    # Issue #9 provenance (additive, optional): the exact immutable policy
+    # configuration and effective destination approval state used. Absent on
+    # legacy evaluations, which keeps every persisted state_json loadable.
+    policy_config_id: Optional[str] = None
+    policy_config_hash: Optional[str] = None
+    destination_snapshot: Optional[Dict[str, Any]] = None
 
 
 class HandoffGrant(BaseModel):
@@ -216,6 +334,12 @@ class RiskCaseState(BaseModel):
     policy: PolicyEvaluationResult = Field(default_factory=PolicyEvaluationResult)
     grant: Optional[HandoffGrant] = None
     handoff: HandoffRecord = Field(default_factory=HandoffRecord)
+    # Issue #9: frozen hydrated destination approval snapshot. Optional with a
+    # None default — legacy state_json without this key must stay loadable and
+    # re-savable, so the field can never be required. Excluded from
+    # compute_snapshot_hash (an explicit canonical projection) so in-flight
+    # grant bindings stay byte-identical; provenance is additive only.
+    destination_approval: Optional[DestinationApprovalSnapshot] = None
     last_change: str = "Case initialized; awaiting processing authority check."
     audit: List[AuditEvent] = Field(default_factory=list)
 

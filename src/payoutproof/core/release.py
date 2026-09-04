@@ -32,8 +32,11 @@ POLICY_VERSION = "PP-POLICY-V1"
 # adapter_attempts, pending_approval_items, case_audit_checkpoints). Bumped
 # V1 -> V2 with Issue #10's additive tenant operating-limits tables
 # (tenant_quota_counters, tenant_operating_limits,
-# tenant_settings_audit_events); mirrored at payoutproof.storage.db.SCHEMA_VERSION.
-SCHEMA_VERSION = "PP-SCHEMA-V2"
+# tenant_settings_audit_events); bumped V2 -> V3 with Issue #9's additive
+# versioned-policy and approved-destination tables (policy_configs,
+# destination_records, destination_audit_events, config_audit_events,
+# config_audit_checkpoints); mirrored at payoutproof.storage.db.SCHEMA_VERSION.
+SCHEMA_VERSION = "PP-SCHEMA-V3"
 
 # Audit checkpoint MAC domain-separation identifier, mirrored by
 # payoutproof.core.crypto.compute_checkpoint_mac.

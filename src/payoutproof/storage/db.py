@@ -17,6 +17,8 @@ from payoutproof.core.models import (
     PaymentIntent,
     PendingApprovalItem,
     CaseAuditCheckpoint,
+    ApprovedDestinationRecord,
+    DestinationApprovalSnapshot,
 )
 from payoutproof.core.enums import (
     CasePhase,
@@ -30,6 +32,10 @@ from payoutproof.core.enums import (
     MembershipAuditEventType,
     MembershipRole,
     MembershipStatus,
+    DestinationRecordStatus,
+    DestinationAuditEventType,
+    PolicyConfigStatus,
+    PolicyConfigAuditEventType,
 )
 from payoutproof.grants.issuer import GrantVerifier
 from payoutproof.core.limits import (
@@ -47,12 +53,20 @@ from payoutproof.core.crypto import (
 )
 from payoutproof.audit.chain import GENESIS_HASH
 
+# Typing-only imports: policy.config is imported lazily inside the Issue #9
+# methods to keep the storage layer importable even while policy modules are
+# being imported themselves (avoids a module-level cycle through evaluator).
+from payoutproof.policy.config import PolicyConfig, next_version_id
+
 # Authoritative persistence schema identifier for SQLite tables.
 # Bumped V1 -> V2 with Issue #10's additive tenant operating-limits tables
 # (tenant_quota_counters, tenant_operating_limits, tenant_settings_audit_events);
+# bumped V2 -> V3 with Issue #9's additive versioned-policy and approved-
+# destination tables (policy_configs, destination_records,
+# destination_audit_events, config_audit_events, config_audit_checkpoints);
 # mirrored at payoutproof.core.release.SCHEMA_VERSION and pinned by an
 # equality-asserting test (tests/test_release_metadata.py).
-SCHEMA_VERSION = "PP-SCHEMA-V2"
+SCHEMA_VERSION = "PP-SCHEMA-V3"
 
 # Sentinel for explicitly querying un-scoped (organization_id IS NULL) rows.
 UNSCOPED = object()
@@ -122,6 +136,48 @@ class SelfMutationError(ValueError):
 class LastAdministratorError(ValueError):
     """Raised when an operation would leave the organization with zero ACTIVE
     Tenant Administrators (R3)."""
+    pass
+
+
+class DestinationTransitionError(ValueError):
+    """Raised when a destination approval status transition violates the
+    irreversible lifecycle lattice (CREATED -> ACTIVE -> RETIRED)."""
+    pass
+
+
+class DestinationNotFoundError(ValueError):
+    """Raised when an Approved Destination record is absent, already retired,
+    or belongs to a different organization (cross-org is indistinguishable
+    from absent, mirroring MembershipNotFoundError)."""
+    pass
+
+
+class DestinationRecordError(ValueError):
+    """Raised when a destination record payload is malformed: naive or
+    unparseable effective dates, an inverted window, an unsupported status,
+    or an incoherent scope."""
+    pass
+
+
+class PolicyConfigTransitionError(ValueError):
+    """Raised when a policy configuration status transition violates the
+    irreversible lifecycle lattice (DRAFT -> ACTIVE -> RETIRED) or the
+    version-monotonicity / single-ACTIVE-per-organization invariants."""
+    pass
+
+
+class PolicyConfigNotFoundError(ValueError):
+    """Raised when a policy configuration version is absent, retired, or
+    belongs to a different organization (cross-org is indistinguishable
+    from absent)."""
+    pass
+
+
+class PolicyConfigTamperError(Exception):
+    """Raised when a persisted policy config row fails verify-on-read: the
+    stored content hash disagrees with the canonical recomputation. The row
+    is quarantined (never silently used, never deleted) and a tamper audit
+    event records the detection."""
     pass
 
 
@@ -212,6 +268,113 @@ def validate_grant_transition(
         raise StaleCaseStateError(f"Terminal grant status {c_status.value} cannot transition to {n_status.value}")
 
     raise GrantTransitionError(f"Disallowed grant transition from {c_status.value} to {n_status.value}")
+
+
+def validate_destination_transition(
+    current_status: Optional[DestinationRecordStatus | str],
+    new_status: DestinationRecordStatus | str,
+) -> None:
+    """Validate an Approved Destination approval-lifecycle transition.
+
+    Allowed durable transitions:
+    - CREATED -> ACTIVE (activation of an approval)
+    - CREATED -> RETIRED (the one documented deviation from the grant
+      lattice: effective-dated approvals may be scheduled with a future
+      valid_from, and an operator must be able to cancel before it goes
+      live. Grants have no scheduling, so the analogy stops here.)
+    - ACTIVE -> RETIRED (normal retirement)
+    - Same-state idempotent writes (activation/retirement retried)
+    - No RETIRED -> anything: RETIRED is terminal. Re-approving a retired
+      destination means creating a NEW destination_records row, which keeps
+      the history append-only and auditable.
+    """
+    c_status = (
+        DestinationRecordStatus(current_status)
+        if current_status is not None and str(current_status).strip()
+        else None
+    )
+    n_status = DestinationRecordStatus(new_status)
+
+    if c_status == n_status:
+        return  # idempotent same-state write
+
+    if c_status is None:
+        if n_status == DestinationRecordStatus.CREATED:
+            return  # initial creation
+        raise DestinationTransitionError(
+            f"Initial destination state may only be CREATED; got {n_status.value}"
+        )
+
+    if c_status == DestinationRecordStatus.CREATED:
+        if n_status in (DestinationRecordStatus.ACTIVE, DestinationRecordStatus.RETIRED):
+            return
+        raise DestinationTransitionError(
+            f"Invalid destination transition from CREATED to {n_status.value}"
+        )
+
+    if c_status == DestinationRecordStatus.ACTIVE:
+        if n_status == DestinationRecordStatus.RETIRED:
+            return
+        raise DestinationTransitionError(
+            f"Invalid destination transition from ACTIVE to {n_status.value}"
+        )
+
+    # RETIRED is terminal: no revival, no terminal-to-terminal switch.
+    raise DestinationTransitionError(
+        f"Terminal destination status {c_status.value} cannot transition to {n_status.value}; "
+        "re-approving a retired destination requires a new destination record"
+    )
+
+
+def validate_policy_version_transition(
+    current_status: Optional[PolicyConfigStatus | str],
+    new_status: PolicyConfigStatus | str,
+) -> None:
+    """Validate a policy configuration lifecycle transition.
+
+    Allowed durable transitions:
+    - DRAFT -> ACTIVE (activation is the point of no return)
+    - DRAFT -> RETIRED (retiring an unactivated draft)
+    - ACTIVE -> RETIRED
+    - Same-state idempotent writes
+    - No RETIRED -> anything and no ACTIVE -> DRAFT: an activated config's
+      content is immutable forever; a change mints a new version row.
+    """
+    c_status = (
+        PolicyConfigStatus(current_status)
+        if current_status is not None and str(current_status).strip()
+        else None
+    )
+    n_status = PolicyConfigStatus(new_status)
+
+    if c_status == n_status:
+        return  # idempotent same-state write
+
+    if c_status is None:
+        if n_status == PolicyConfigStatus.DRAFT:
+            return  # initial creation is always DRAFT
+        raise PolicyConfigTransitionError(
+            f"Initial policy config state may only be DRAFT; got {n_status.value}"
+        )
+
+    if c_status == PolicyConfigStatus.DRAFT:
+        if n_status in (PolicyConfigStatus.ACTIVE, PolicyConfigStatus.RETIRED):
+            return
+        raise PolicyConfigTransitionError(
+            f"Invalid policy config transition from DRAFT to {n_status.value}"
+        )
+
+    if c_status == PolicyConfigStatus.ACTIVE:
+        if n_status == PolicyConfigStatus.RETIRED:
+            return
+        raise PolicyConfigTransitionError(
+            f"Invalid policy config transition from ACTIVE to {n_status.value}; "
+            "activated policy content is immutable — mint a new version instead"
+        )
+
+    raise PolicyConfigTransitionError(
+        f"Terminal policy config status {c_status.value} cannot transition to {n_status.value}"
+    )
 
 
 def _assert_audit_event_exact_match(
@@ -576,6 +739,114 @@ class Database:
                     recorded_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_tenant_settings_audit_org ON tenant_settings_audit_events(organization_id);
+
+                -- Versioned policy configurations (Issue #9). Insert-only:
+                -- there is deliberately NO content UPDATE path; a content
+                -- change mints a new row with the next version_id. Lifecycle
+                -- moves (DRAFT -> ACTIVE -> RETIRED) touch only the status
+                -- and attribution columns. The partial unique index enforces
+                -- at most one ACTIVE config per organization at the storage
+                -- layer, in addition to the application-level check that runs
+                -- inside the activation transaction.
+                CREATE TABLE IF NOT EXISTS policy_configs (
+                    config_id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    version_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    grant_ttl_seconds INTEGER NOT NULL,
+                    require_independent_callback INTEGER NOT NULL,
+                    require_approved_destination INTEGER NOT NULL,
+                    block_on_snapshot_integrity_failure INTEGER NOT NULL,
+                    block_on_policy_config_tamper INTEGER NOT NULL,
+                    hold_on_model_failure INTEGER NOT NULL,
+                    hold_on_evidence_contradiction INTEGER NOT NULL,
+                    hold_on_material_intent_change INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    activated_by TEXT,
+                    activated_at TEXT,
+                    retired_by TEXT,
+                    retired_at TEXT,
+                    UNIQUE(organization_id, version_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_policy_configs_organization ON policy_configs(organization_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_configs_single_active
+                    ON policy_configs(organization_id) WHERE status = 'ACTIVE';
+
+                -- Effective-dated Approved Destinations (Issue #9).
+                -- organization_id is NOT NULL: this is a new table with no
+                -- legacy rows, so an un-scoped destination cannot exist and
+                -- cannot satisfy an org-filtered query incorrectly. No
+                -- FOREIGN KEYs, consistent with every existing table.
+                CREATE TABLE IF NOT EXISTS destination_records (
+                    destination_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    organization_id TEXT NOT NULL,
+                    counterparty TEXT NOT NULL,
+                    destination TEXT NOT NULL,
+                    destination_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    valid_from TEXT NOT NULL,
+                    valid_to TEXT,
+                    policy_config_id TEXT NOT NULL,
+                    policy_config_hash TEXT NOT NULL,
+                    record_hash TEXT NOT NULL,
+                    retired_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_destination_records_organization ON destination_records(organization_id);
+                CREATE INDEX IF NOT EXISTS idx_destination_records_lookup
+                    ON destination_records(organization_id, counterparty, destination);
+
+                -- Per-destination hash-chained audit events (Issue #9):
+                -- SHA-256 chain rooted at GENESIS_HASH, contiguous per-
+                -- destination seq from 1, reusing compute_audit_hash.
+                CREATE TABLE IF NOT EXISTS destination_audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    destination_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    prev_hash TEXT NOT NULL,
+                    current_hash TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    UNIQUE(destination_id, seq)
+                );
+                CREATE INDEX IF NOT EXISTS idx_destination_audit_events_destination ON destination_audit_events(destination_id);
+
+                -- Org-scoped policy/destination configuration audit chain
+                -- (Issue #9), mirroring membership_audit_events: per-org seq,
+                -- hash-chained from GENESIS_HASH, with an authenticated
+                -- (HMAC) checkpoint. Deliberately NOT the case-scoped
+                -- audit_events table: config events have no case_id.
+                CREATE TABLE IF NOT EXISTS config_audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    organization_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    prev_hash TEXT NOT NULL,
+                    current_hash TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    UNIQUE(organization_id, seq)
+                );
+                CREATE INDEX IF NOT EXISTS idx_config_audit_events_organization ON config_audit_events(organization_id);
+
+                CREATE TABLE IF NOT EXISTS config_audit_checkpoints (
+                    organization_id TEXT PRIMARY KEY,
+                    event_count INTEGER NOT NULL,
+                    tip_hash TEXT NOT NULL,
+                    trust_state TEXT NOT NULL,
+                    checkpoint_mac TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_config_audit_checkpoints_organization ON config_audit_checkpoints(organization_id);
             """)
             conn.commit()
             self._migrate_db(conn)
@@ -611,6 +882,93 @@ class Database:
                     recorded_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_tenant_settings_audit_org ON tenant_settings_audit_events(organization_id);
+
+                CREATE TABLE IF NOT EXISTS policy_configs (
+                    config_id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    version_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    grant_ttl_seconds INTEGER NOT NULL,
+                    require_independent_callback INTEGER NOT NULL,
+                    require_approved_destination INTEGER NOT NULL,
+                    block_on_snapshot_integrity_failure INTEGER NOT NULL,
+                    block_on_policy_config_tamper INTEGER NOT NULL,
+                    hold_on_model_failure INTEGER NOT NULL,
+                    hold_on_evidence_contradiction INTEGER NOT NULL,
+                    hold_on_material_intent_change INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    activated_by TEXT,
+                    activated_at TEXT,
+                    retired_by TEXT,
+                    retired_at TEXT,
+                    UNIQUE(organization_id, version_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_policy_configs_organization ON policy_configs(organization_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_configs_single_active
+                    ON policy_configs(organization_id) WHERE status = 'ACTIVE';
+
+                CREATE TABLE IF NOT EXISTS destination_records (
+                    destination_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    organization_id TEXT NOT NULL,
+                    counterparty TEXT NOT NULL,
+                    destination TEXT NOT NULL,
+                    destination_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    valid_from TEXT NOT NULL,
+                    valid_to TEXT,
+                    policy_config_id TEXT NOT NULL,
+                    policy_config_hash TEXT NOT NULL,
+                    record_hash TEXT NOT NULL,
+                    retired_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_destination_records_organization ON destination_records(organization_id);
+                CREATE INDEX IF NOT EXISTS idx_destination_records_lookup
+                    ON destination_records(organization_id, counterparty, destination);
+
+                CREATE TABLE IF NOT EXISTS destination_audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    destination_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    prev_hash TEXT NOT NULL,
+                    current_hash TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    UNIQUE(destination_id, seq)
+                );
+                CREATE INDEX IF NOT EXISTS idx_destination_audit_events_destination ON destination_audit_events(destination_id);
+
+                CREATE TABLE IF NOT EXISTS config_audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    organization_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    prev_hash TEXT NOT NULL,
+                    current_hash TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    UNIQUE(organization_id, seq)
+                );
+                CREATE INDEX IF NOT EXISTS idx_config_audit_events_organization ON config_audit_events(organization_id);
+
+                CREATE TABLE IF NOT EXISTS config_audit_checkpoints (
+                    organization_id TEXT PRIMARY KEY,
+                    event_count INTEGER NOT NULL,
+                    tip_hash TEXT NOT NULL,
+                    trust_state TEXT NOT NULL,
+                    checkpoint_mac TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_config_audit_checkpoints_organization ON config_audit_checkpoints(organization_id);
             """)
             conn.commit()
 
@@ -3479,6 +3837,1685 @@ class Database:
             "broken_at_seq": None,
             "reason": None,
         }
+
+    # ==========================================================================
+    # Versioned policy configurations and Approved Destinations (Issue #9)
+    #
+    # Two audit chains, mirroring the two existing precedents:
+    #   - destination_audit_events: keyed by destination_id (like audit_events
+    #     keyed by case_id), contiguous per-destination seq from 1, hash-chained
+    #     from GENESIS_HASH via compute_audit_hash. No checkpoint MAC table —
+    #     that is a named follow-up in the issue, not silent scope creep.
+    #   - config_audit_events + config_audit_checkpoints: keyed by
+    #     organization_id (like membership_audit_events/checkpoints), per-org
+    #     seq, hash chain plus authenticated checkpoint MAC over the injected
+    #     audit_checkpoint_secret.
+    # Every mutating *_tx method runs inside the caller's BEGIN IMMEDIATE
+    # transaction, enforces its lifecycle via the module-level validators, and
+    # transitions conditionally (UPDATE ... WHERE status = ?) requiring
+    # rowcount == 1 so two concurrent operators cannot double-transition.
+    # ==========================================================================
+
+    DESTINATION_TAMPER_EVENT = DestinationAuditEventType.DESTINATION_CONFIG_TAMPER_DETECTED
+
+    @staticmethod
+    def _require_destination_scope(organization_id: Optional[str]) -> str:
+        """Return the stripped destination scope or raise UnscopedMembershipError.
+
+        Reuses the membership blank-scope guard deliberately: destination and
+        policy-config rows have exactly the same no-default-organization
+        posture (organization_id is NOT NULL from birth — there are no legacy
+        un-scoped rows and there is no caller mode that could create one).
+        """
+        if organization_id is None or not isinstance(organization_id, str) or not organization_id.strip():
+            raise UnscopedMembershipError(
+                "Destination and policy-config operations require an explicit non-blank "
+                "organization_id; there is no un-scoped mode."
+            )
+        return organization_id.strip()
+
+    @staticmethod
+    def _parse_effective_timestamp(raw: Any, *, field: str) -> datetime:
+        """Parse a tz-aware ISO-8601 effective-window timestamp (fail-closed).
+
+        Window arithmetic always compares datetimes, never ISO strings: naive
+        values and unparseable values are rejected at write time, because the
+        lexical order of offset-carrying ISO strings is not the order of the
+        instants they denote.
+        """
+        if not isinstance(raw, str) or not raw.strip():
+            raise DestinationRecordError(f"{field} must be a non-blank ISO-8601 timestamp string")
+        try:
+            dt = datetime.fromisoformat(raw.strip())
+        except (ValueError, TypeError):
+            raise DestinationRecordError(f"{field} is not a parseable ISO-8601 timestamp: {raw!r}")
+        if dt.tzinfo is None or dt.utcoffset() is None:
+            raise DestinationRecordError(
+                f"{field} must be timezone-aware (naive effective windows are ambiguous and rejected)"
+            )
+        return dt.astimezone(timezone.utc)
+
+    @staticmethod
+    def _normalize_effective_window(
+        valid_from: Any,
+        valid_to: Any,
+    ) -> Tuple[str, Optional[str]]:
+        """Validate window coherence and return canonical UTC ISO strings.
+
+        valid_to is optional (None = open-ended). When present it must be
+        strictly after valid_from: [valid_from, valid_to) is half-open, so an
+        empty or inverted window is incoherent. valid_to may legitimately lie
+        in the future or the past at write time — validation constrains
+        coherence, never wall-clock relation to now.
+        """
+        start_dt = Database._parse_effective_timestamp(valid_from, field="valid_from")
+        end_str: Optional[str] = None
+        if valid_to is not None:
+            end_dt = Database._parse_effective_timestamp(valid_to, field="valid_to")
+            if end_dt <= start_dt:
+                raise DestinationRecordError(
+                    f"valid_to ({valid_to!r}) must be strictly after valid_from ({valid_from!r}); "
+                    "the effective window is half-open [valid_from, valid_to)"
+                )
+            end_str = end_dt.isoformat()
+        return start_dt.isoformat(), end_str
+
+    @staticmethod
+    def _row_to_destination_record(row: sqlite3.Row) -> ApprovedDestinationRecord:
+        """Materialize one destination_records row as the frozen registry model."""
+        return ApprovedDestinationRecord(
+            destination_id=row["destination_id"],
+            tenant_id=row["tenant_id"],
+            organization_id=row["organization_id"],
+            counterparty=row["counterparty"],
+            destination=row["destination"],
+            destination_type=row["destination_type"],
+            status=DestinationRecordStatus(row["status"]),
+            valid_from=row["valid_from"],
+            valid_to=row["valid_to"],
+            policy_config_id=row["policy_config_id"],
+            policy_config_hash=row["policy_config_hash"],
+            record_hash=row["record_hash"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            retired_at=row["retired_at"],
+        )
+
+    @staticmethod
+    def _row_to_policy_config(row: sqlite3.Row) -> PolicyConfig:
+        """Materialize one policy_configs row as the frozen config model.
+
+        Verify-on-read happens here: a row whose stored content_hash disagrees
+        with the canonical recomputation of its own content columns is
+        unrepresentable (the model validator raises), which is the fail-closed
+        quarantine path — the row itself is never deleted and the caller
+        records a tamper audit event.
+        """
+        from payoutproof.policy.config import BlockConditions, StepUpRules
+
+        return PolicyConfig.model_validate({
+            "config_id": row["config_id"],
+            "version_id": row["version_id"],
+            "organization_id": row["organization_id"],
+            "status": PolicyConfigStatus(row["status"]),
+            "grant_ttl_seconds": int(row["grant_ttl_seconds"]),
+            "step_up_rules": StepUpRules(
+                require_independent_callback=bool(row["require_independent_callback"]),
+                require_approved_destination=bool(row["require_approved_destination"]),
+            ),
+            "block_conditions": BlockConditions(
+                block_on_snapshot_integrity_failure=bool(row["block_on_snapshot_integrity_failure"]),
+                block_on_policy_config_tamper=bool(row["block_on_policy_config_tamper"]),
+                hold_on_model_failure=bool(row["hold_on_model_failure"]),
+                hold_on_evidence_contradiction=bool(row["hold_on_evidence_contradiction"]),
+                hold_on_material_intent_change=bool(row["hold_on_material_intent_change"]),
+            ),
+            "content_hash": row["content_hash"],
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+            "activated_by": row["activated_by"],
+            "activated_at": row["activated_at"],
+            "retired_by": row["retired_by"],
+            "retired_at": row["retired_at"],
+        })
+
+    def get_destination_scope(self, destination_id: str) -> Optional[Dict[str, Any]]:
+        """Return existence and organization scope of a destination row, or None when absent.
+
+        Read-only and unverified by design, mirroring get_case_scope: lets the
+        API layer enforce a zero-existence oracle (a cross-organization
+        destination is indistinguishable from a missing one) without leaking
+        integrity diagnostics for rows outside the caller's scope.
+        """
+        if not destination_id or not str(destination_id).strip():
+            return None
+        with self.get_connection() as conn:
+            row = conn.execute(
+                "SELECT destination_id, tenant_id, organization_id, status FROM destination_records WHERE destination_id = ?",
+                (str(destination_id).strip(),),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "destination_id": row["destination_id"],
+                "tenant_id": row["tenant_id"],
+                "organization_id": row["organization_id"],
+                "status": row["status"],
+            }
+
+    def _append_destination_audit_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        destination_id: str,
+        event_type: DestinationAuditEventType,
+        summary: str,
+        actor: str,
+        details: Dict[str, Any],
+        timestamp: str,
+    ) -> str:
+        """Append one hash-chained event to the destination's audit chain; returns the new tip hash.
+
+        The chain is contiguous per-destination from seq 1 and rooted at
+        GENESIS_HASH, exactly like the case-scoped audit_events chain.
+        """
+        last_row = conn.execute(
+            "SELECT seq, current_hash FROM destination_audit_events WHERE destination_id = ? ORDER BY seq DESC LIMIT 1",
+            (destination_id,),
+        ).fetchone()
+        if last_row is None:
+            seq = 1
+            prev_hash = GENESIS_HASH
+        else:
+            seq = int(last_row["seq"]) + 1
+            prev_hash = last_row["current_hash"]
+
+        current_hash = compute_audit_hash(
+            prev_hash=prev_hash,
+            seq=seq,
+            event_type=event_type.value,
+            summary=summary,
+            actor=actor,
+            timestamp=timestamp,
+            details=details,
+        )
+        details_json = json.dumps(details, sort_keys=True, separators=(",", ":"))
+        cur = conn.execute(
+            """
+            INSERT INTO destination_audit_events (
+                destination_id, seq, event_type, summary, actor, prev_hash, current_hash, timestamp, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (destination_id, seq, event_type.value, summary, actor, prev_hash, current_hash, timestamp, details_json),
+        )
+        if cur.rowcount != 1:
+            raise AuditLedgerIntegrityError(
+                f"Failed to insert destination audit event at seq {seq} for '{destination_id}'"
+            )
+        return current_hash
+
+    def _append_config_audit_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+        event_type: PolicyConfigAuditEventType,
+        summary: str,
+        actor: str,
+        details: Dict[str, Any],
+        timestamp: str,
+    ) -> str:
+        """Append one event and advance the org-keyed config checkpoint inside the caller's transaction.
+
+        Mirrors _append_membership_audit_tx: the checkpoint is read inside the
+        same BEGIN IMMEDIATE, trust_state must be TRUSTED and its MAC must
+        verify (mutations are refused otherwise), and both the event insert
+        and the checkpoint advance require rowcount == 1.
+        """
+        cp_row = conn.execute(
+            """
+            SELECT event_count, tip_hash, trust_state, checkpoint_mac
+            FROM config_audit_checkpoints
+            WHERE organization_id = ?;
+            """,
+            (organization_id,),
+        ).fetchone()
+
+        if cp_row is None:
+            seq = 1
+            prev_hash = GENESIS_HASH
+        else:
+            if cp_row["trust_state"] != AuditTrustState.TRUSTED.value:
+                raise AuditLedgerIntegrityError(
+                    f"Config audit for organization '{organization_id}' is in untrusted state "
+                    f"'{cp_row['trust_state']}'; mutations refused"
+                )
+            if not isinstance(cp_row["event_count"], int) or isinstance(cp_row["event_count"], bool):
+                raise AuditLedgerIntegrityError(
+                    f"Config audit checkpoint event_count is not an integer for '{organization_id}'"
+                )
+            if not verify_checkpoint_mac(
+                secret=self.audit_checkpoint_secret,
+                case_id=organization_id,
+                event_count=cp_row["event_count"],
+                tip_hash=cp_row["tip_hash"],
+                trust_state=cp_row["trust_state"],
+                checkpoint_mac=cp_row["checkpoint_mac"],
+            ):
+                raise AuditLedgerIntegrityError(
+                    f"Config audit checkpoint MAC verification failed for '{organization_id}'"
+                )
+            durable_count = conn.execute(
+                "SELECT COUNT(*) FROM config_audit_events WHERE organization_id = ?;",
+                (organization_id,),
+            ).fetchone()[0]
+            if durable_count != cp_row["event_count"]:
+                raise AuditLedgerIntegrityError(
+                    f"Config audit event count mismatch for '{organization_id}': "
+                    f"checkpoint records {cp_row['event_count']}, ledger has {durable_count}"
+                )
+            seq = cp_row["event_count"] + 1
+            prev_hash = cp_row["tip_hash"]
+
+        details_json = json.dumps(details, sort_keys=True, separators=(",", ":"))
+        current_hash = compute_audit_hash(
+            prev_hash=prev_hash,
+            seq=seq,
+            event_type=event_type.value,
+            summary=summary,
+            actor=actor,
+            timestamp=timestamp,
+            details=details,
+        )
+
+        cur = conn.execute(
+            """
+            INSERT INTO config_audit_events (
+                organization_id, seq, event_type, summary, actor, prev_hash, current_hash, timestamp, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                organization_id,
+                seq,
+                event_type.value,
+                summary,
+                actor,
+                prev_hash,
+                current_hash,
+                timestamp,
+                details_json,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise AuditLedgerIntegrityError(
+                f"Failed to insert config audit event at seq {seq} for '{organization_id}'"
+            )
+
+        new_mac = compute_checkpoint_mac(
+            self.audit_checkpoint_secret,
+            organization_id,
+            seq,
+            current_hash,
+            AuditTrustState.TRUSTED.value,
+        )
+        cp_cur = conn.execute(
+            """
+            INSERT INTO config_audit_checkpoints (
+                organization_id, event_count, tip_hash, trust_state, checkpoint_mac, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(organization_id) DO UPDATE SET
+                event_count = excluded.event_count,
+                tip_hash = excluded.tip_hash,
+                trust_state = 'TRUSTED',
+                checkpoint_mac = excluded.checkpoint_mac,
+                updated_at = excluded.updated_at;
+            """,
+            (organization_id, seq, current_hash, AuditTrustState.TRUSTED.value, new_mac, timestamp),
+        )
+        if cp_cur.rowcount != 1:
+            raise AuditLedgerIntegrityError(
+                f"Failed to advance config audit checkpoint for '{organization_id}'"
+            )
+        return current_hash
+
+    def record_destination_audit_event_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        destination_id: str,
+        event_type: DestinationAuditEventType,
+        summary: str,
+        actor: str,
+        details: Dict[str, Any],
+        timestamp: Optional[str] = None,
+    ) -> str:
+        """Append one destination audit event inside the caller's transaction (public seam).
+
+        Used for lifecycle events (which ride the create/activate/retire
+        transactions) and for tamper detections, which commit on their own
+        after refusing to serve the quarantined row.
+        """
+        return self._append_destination_audit_tx(
+            conn,
+            destination_id=destination_id,
+            event_type=event_type,
+            summary=summary,
+            actor=actor,
+            details=details,
+            timestamp=timestamp or datetime.now(timezone.utc).isoformat(),
+        )
+
+    def record_config_audit_event_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+        event_type: PolicyConfigAuditEventType,
+        summary: str,
+        actor: str,
+        details: Dict[str, Any],
+        timestamp: Optional[str] = None,
+    ) -> str:
+        """Append one org-keyed config audit event inside the caller's transaction (public seam)."""
+        return self._append_config_audit_tx(
+            conn,
+            organization_id=organization_id,
+            event_type=event_type,
+            summary=summary,
+            actor=actor,
+            details=details,
+            timestamp=timestamp or datetime.now(timezone.utc).isoformat(),
+        )
+
+    def record_destination_audit_event(
+        self,
+        *,
+        destination_id: str,
+        event_type: DestinationAuditEventType,
+        summary: str,
+        actor: str,
+        details: Dict[str, Any],
+        timestamp: Optional[str] = None,
+    ) -> str:
+        """Append one destination audit event within a BEGIN IMMEDIATE transaction."""
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                tip = self.record_destination_audit_event_tx(
+                    conn,
+                    destination_id=destination_id,
+                    event_type=event_type,
+                    summary=summary,
+                    actor=actor,
+                    details=details,
+                    timestamp=timestamp,
+                )
+                conn.commit()
+                return tip
+            except Exception:
+                conn.rollback()
+                raise
+
+    def record_config_audit_event(
+        self,
+        *,
+        organization_id: str,
+        event_type: PolicyConfigAuditEventType,
+        summary: str,
+        actor: str,
+        details: Dict[str, Any],
+        timestamp: Optional[str] = None,
+    ) -> str:
+        """Append one org-keyed config audit event within a BEGIN IMMEDIATE transaction."""
+        scope = self._require_destination_scope(organization_id)
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                tip = self.record_config_audit_event_tx(
+                    conn,
+                    organization_id=scope,
+                    event_type=event_type,
+                    summary=summary,
+                    actor=actor,
+                    details=details,
+                    timestamp=timestamp,
+                )
+                conn.commit()
+                return tip
+            except Exception:
+                conn.rollback()
+                raise
+
+    # -- Destination records: create / activate / retire / read ----------------
+
+    @staticmethod
+    def _effective_windows_overlap(
+        start_a: datetime,
+        end_a: Optional[datetime],
+        start_b: datetime,
+        end_b: Optional[datetime],
+    ) -> bool:
+        """Half-open interval overlap test for two effective windows ([start, end)).
+
+        A None end is open-ended (+inf). Adjacent windows that merely touch —
+        [A, B) followed by [B, C) — do NOT overlap: B is excluded from the
+        first and included in the second, so exactly one window covers every
+        instant. The instants are datetimes, never ISO strings.
+        """
+        a_ends_before_b = end_a is not None and end_a <= start_b
+        b_ends_before_a = end_b is not None and end_b <= start_a
+        return not (a_ends_before_b or b_ends_before_a)
+
+    def _assert_no_active_window_overlap_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+        counterparty: str,
+        destination: str,
+        candidate_start: str,
+        candidate_end: Optional[str],
+        excluding_destination_id: Optional[str] = None,
+    ) -> None:
+        """Refuse an approval window that overlaps an ACTIVE window for the same key.
+
+        Overlap enforcement lives here at the application level inside the
+        write transaction because SQLite cannot express interval-overlap
+        constraints; the residual risk (a concurrent writer bypassing this
+        module) is accepted and documented in ADR 0009. Only status ACTIVE
+        rows count — a RETIRED row's window is inert history and may freely
+        overlap a successor's.
+        """
+        rows = conn.execute(
+            """
+            SELECT destination_id, valid_from, valid_to FROM destination_records
+            WHERE organization_id = ? AND counterparty = ? AND destination = ? AND status = ?
+            """,
+            (organization_id, counterparty, destination, DestinationRecordStatus.ACTIVE.value),
+        ).fetchall()
+        candidate_start_dt = Database._parse_effective_timestamp(candidate_start, field="valid_from")
+        candidate_end_dt = (
+            Database._parse_effective_timestamp(candidate_end, field="valid_to")
+            if candidate_end is not None
+            else None
+        )
+        for r in rows:
+            if excluding_destination_id is not None and r["destination_id"] == excluding_destination_id:
+                continue
+            other_start_dt = Database._parse_effective_timestamp(r["valid_from"], field="valid_from")
+            other_end_dt = (
+                Database._parse_effective_timestamp(r["valid_to"], field="valid_to")
+                if r["valid_to"] is not None
+                else None
+            )
+            if Database._effective_windows_overlap(
+                candidate_start_dt, candidate_end_dt, other_start_dt, other_end_dt
+            ):
+                raise DestinationRecordError(
+                    f"Approval window [{candidate_start}, {candidate_end}) overlaps the ACTIVE window "
+                    f"[{r['valid_from']}, {r['valid_to']}) of destination record '{r['destination_id']}' "
+                    "for the same counterparty and destination"
+                )
+
+    def create_destination_record_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+        tenant_id: str,
+        counterparty: str,
+        destination: str,
+        destination_type: str,
+        valid_from: str,
+        valid_to: Optional[str],
+        policy_config: PolicyConfig,
+        actor: str,
+        destination_id: Optional[str] = None,
+        now: Optional[str] = None,
+    ) -> ApprovedDestinationRecord:
+        """Insert one CREATED destination record inside the caller's BEGIN IMMEDIATE transaction.
+
+        The record binds the immutable policy configuration it was approved
+        under (config id + content hash) and a canonical UTC effective window.
+        Overlap is refused here at the application level — SQLite cannot
+        express interval-overlap constraints — by checking only status ACTIVE
+        rows for the same (organization, counterparty, destination), so a
+        successor row may never resurrect a window a retired row still
+        describes.
+        """
+        scope = self._require_destination_scope(organization_id)
+        if not isinstance(policy_config, PolicyConfig):
+            raise DestinationRecordError("policy_config must be a PolicyConfig")
+        if policy_config.organization_id != scope:
+            raise DestinationRecordError(
+                f"policy_config organization '{policy_config.organization_id}' does not match the "
+                f"destination scope '{scope}'; a cross-org config can never approve a destination"
+            )
+        if not counterparty or not str(counterparty).strip():
+            raise DestinationRecordError("counterparty is required")
+        if not destination or not str(destination).strip():
+            raise DestinationRecordError("destination is required")
+        if not destination_type or not str(destination_type).strip():
+            raise DestinationRecordError("destination_type is required (bank account / VPA / equivalent endpoint)")
+        if not actor or not str(actor).strip():
+            raise DestinationRecordError("actor is required (Finance Control Owner session subject)")
+
+        norm_from, norm_to = self._normalize_effective_window(valid_from, valid_to)
+        now_iso = now or datetime.now(timezone.utc).isoformat()
+        resolved_id = destination_id or f"PP-DEST-{uuid.uuid4().hex[:12].upper()}"
+
+        existing = conn.execute(
+            "SELECT destination_id FROM destination_records WHERE destination_id = ?",
+            (resolved_id,),
+        ).fetchone()
+        if existing is not None:
+            raise DestinationRecordError(f"Destination '{resolved_id}' already exists")
+
+        # Overlap guard (application level, inside the write transaction):
+        # only ACTIVE rows count — a RETIRED row's window is inert history.
+        self._assert_no_active_window_overlap_tx(
+            conn,
+            organization_id=scope,
+            counterparty=counterparty,
+            destination=destination,
+            candidate_start=norm_from,
+            candidate_end=norm_to,
+        )
+
+        record_hash = sha256_hex(
+            "|".join([
+                scope,
+                counterparty,
+                destination,
+                destination_type,
+                norm_from,
+                norm_to or "",
+                policy_config.config_id,
+                policy_config.content_hash,
+            ])
+        )
+
+        cur = conn.execute(
+            """
+            INSERT INTO destination_records (
+                destination_id, tenant_id, organization_id, counterparty, destination, destination_type,
+                status, valid_from, valid_to, policy_config_id, policy_config_hash, record_hash,
+                retired_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?);
+            """,
+            (
+                resolved_id,
+                tenant_id,
+                scope,
+                counterparty,
+                destination,
+                destination_type,
+                DestinationRecordStatus.CREATED.value,
+                norm_from,
+                norm_to,
+                policy_config.config_id,
+                policy_config.content_hash,
+                record_hash,
+                now_iso,
+                now_iso,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise AuditLedgerIntegrityError(f"Failed to insert destination record '{resolved_id}'")
+
+        self._append_destination_audit_tx(
+            conn,
+            destination_id=resolved_id,
+            event_type=DestinationAuditEventType.DESTINATION_CREATED,
+            summary=f"Destination approval created for {counterparty} / {destination}",
+            actor=str(actor).strip(),
+            details={
+                "organization_id": scope,
+                "counterparty": counterparty,
+                "destination": destination,
+                "destination_type": destination_type,
+                "valid_from": norm_from,
+                "valid_to": norm_to,
+                "policy_config_id": policy_config.config_id,
+                "policy_config_hash": policy_config.content_hash,
+                "record_hash": record_hash,
+            },
+            timestamp=now_iso,
+        )
+        self._append_config_audit_tx(
+            conn,
+            organization_id=scope,
+            event_type=PolicyConfigAuditEventType.DESTINATION_APPROVAL_CREATED,
+            summary=f"Destination approval created for {counterparty} / {destination}",
+            actor=str(actor).strip(),
+            details={
+                "destination_id": resolved_id,
+                "counterparty": counterparty,
+                "destination": destination,
+                "policy_config_id": policy_config.config_id,
+                "policy_config_hash": policy_config.content_hash,
+            },
+            timestamp=now_iso,
+        )
+        return ApprovedDestinationRecord(
+            destination_id=resolved_id,
+            tenant_id=tenant_id,
+            organization_id=scope,
+            counterparty=counterparty,
+            destination=destination,
+            destination_type=destination_type,
+            status=DestinationRecordStatus.CREATED,
+            valid_from=norm_from,
+            valid_to=norm_to,
+            policy_config_id=policy_config.config_id,
+            policy_config_hash=policy_config.content_hash,
+            record_hash=record_hash,
+            created_at=now_iso,
+            updated_at=now_iso,
+            retired_at=None,
+        )
+
+    def create_destination_record(
+        self,
+        *,
+        organization_id: str,
+        tenant_id: str,
+        counterparty: str,
+        destination: str,
+        destination_type: str,
+        valid_from: str,
+        valid_to: Optional[str],
+        policy_config: PolicyConfig,
+        actor: str,
+        destination_id: Optional[str] = None,
+        now: Optional[str] = None,
+    ) -> ApprovedDestinationRecord:
+        """Create a destination record within a BEGIN IMMEDIATE transaction."""
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                record = self.create_destination_record_tx(
+                    conn,
+                    organization_id=organization_id,
+                    tenant_id=tenant_id,
+                    counterparty=counterparty,
+                    destination=destination,
+                    destination_type=destination_type,
+                    valid_from=valid_from,
+                    valid_to=valid_to,
+                    policy_config=policy_config,
+                    actor=actor,
+                    destination_id=destination_id,
+                    now=now,
+                )
+                conn.commit()
+                return record
+            except Exception:
+                conn.rollback()
+                raise
+
+    def _transition_destination_record_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        destination_id: str,
+        organization_id: str,
+        new_status: DestinationRecordStatus,
+        actor: str,
+        event_type: DestinationAuditEventType,
+        summary: str,
+        now: Optional[str] = None,
+    ) -> ApprovedDestinationRecord:
+        """Shared conditional lifecycle transition for destination records.
+
+        The UPDATE is conditional on the current status and requires
+        rowcount == 1, so two concurrent operators cannot double-transition:
+        exactly one wins and the other sees the stale status. validate_
+        destination_transition runs first inside the same BEGIN IMMEDIATE.
+        """
+        scope = self._require_destination_scope(organization_id)
+        if not destination_id or not str(destination_id).strip():
+            raise DestinationNotFoundError("destination_id is required")
+        if not actor or not str(actor).strip():
+            raise DestinationRecordError("actor is required (Finance Control Owner session subject)")
+        normalized_id = str(destination_id).strip()
+        now_iso = now or datetime.now(timezone.utc).isoformat()
+
+        row = conn.execute(
+            "SELECT * FROM destination_records WHERE destination_id = ?",
+            (normalized_id,),
+        ).fetchone()
+        if row is None or row["organization_id"] != scope:
+            # Cross-org is indistinguishable from absent.
+            raise DestinationNotFoundError(
+                f"Destination '{normalized_id}' not found in organization '{scope}'"
+            )
+
+        validate_destination_transition(row["status"], new_status)
+
+        if DestinationRecordStatus(new_status) == DestinationRecordStatus(row["status"]):
+            # Idempotent same-state write: return the row unchanged (the
+            # lattice allows re-dispatching an already-completed transition).
+            return self._row_to_destination_record(row)
+
+        cur = conn.execute(
+            """
+            UPDATE destination_records
+            SET status = ?, retired_at = CASE WHEN ? = 'RETIRED' THEN ? ELSE retired_at END, updated_at = ?
+            WHERE destination_id = ? AND organization_id = ? AND status = ?;
+            """,
+            (
+                new_status.value,
+                new_status.value,
+                now_iso,
+                now_iso,
+                normalized_id,
+                scope,
+                row["status"],
+            ),
+        )
+        if cur.rowcount != 1:
+            # Lost the race inside BEGIN IMMEDIATE, or the row was concurrently
+            # transitioned: the durable status is authoritative.
+            raise DestinationTransitionError(
+                f"Destination '{normalized_id}' transition to {new_status.value} lost the race against "
+                f"its current durable status; re-read the record and retry"
+            )
+
+        self._append_destination_audit_tx(
+            conn,
+            destination_id=normalized_id,
+            event_type=event_type,
+            summary=summary,
+            actor=str(actor).strip(),
+            details={
+                "organization_id": scope,
+                "from_status": row["status"],
+                "to_status": new_status.value,
+                "policy_config_id": row["policy_config_id"],
+                "policy_config_hash": row["policy_config_hash"],
+            },
+            timestamp=now_iso,
+        )
+        # Destination lifecycle events go to the destination-keyed chain
+        # (above); the org-keyed config chain records the organization-level
+        # mirror of the same transition so each org has one contiguous
+        # ledger of everything decided under its finance policy.
+        self._append_config_audit_tx(
+            conn,
+            organization_id=scope,
+            event_type=PolicyConfigAuditEventType(
+                "DESTINATION_APPROVAL_RETIRED"
+                if new_status == DestinationRecordStatus.RETIRED
+                else "DESTINATION_APPROVAL_ACTIVATED"
+            ),
+            summary=summary,
+            actor=str(actor).strip(),
+            details={
+                "destination_id": normalized_id,
+                "counterparty": row["counterparty"],
+                "destination": row["destination"],
+                "from_status": row["status"],
+                "to_status": new_status.value,
+                "policy_config_id": row["policy_config_id"],
+                "policy_config_hash": row["policy_config_hash"],
+            },
+            timestamp=now_iso,
+        )
+
+        updated = conn.execute(
+            "SELECT * FROM destination_records WHERE destination_id = ?",
+            (normalized_id,),
+        ).fetchone()
+        return self._row_to_destination_record(updated)
+
+    def activate_destination_record_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        destination_id: str,
+        organization_id: str,
+        actor: str,
+        now: Optional[str] = None,
+    ) -> ApprovedDestinationRecord:
+        """Transition CREATED -> ACTIVE inside the caller's transaction (approval goes live)."""
+        record = self._transition_destination_record_tx(
+            conn,
+            destination_id=destination_id,
+            organization_id=organization_id,
+            new_status=DestinationRecordStatus.ACTIVE,
+            actor=actor,
+            event_type=DestinationAuditEventType.DESTINATION_ACTIVATED,
+            summary=f"Destination approval activated: {destination_id}",
+            now=now,
+        )
+        # Effectiveness is window-gated: an ACTIVE record with a future
+        # valid_from is live as an approval but not yet effective. Activation
+        # itself stays unconditional — no scheduler mutates rows later.
+        return record
+
+    def activate_destination_record(
+        self,
+        *,
+        destination_id: str,
+        organization_id: str,
+        actor: str,
+        now: Optional[str] = None,
+    ) -> ApprovedDestinationRecord:
+        """Activate a destination record within a BEGIN IMMEDIATE transaction."""
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                record = self.activate_destination_record_tx(
+                    conn,
+                    destination_id=destination_id,
+                    organization_id=organization_id,
+                    actor=actor,
+                    now=now,
+                )
+                conn.commit()
+                return record
+            except Exception:
+                conn.rollback()
+                raise
+
+    def retire_destination_record_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        destination_id: str,
+        organization_id: str,
+        actor: str,
+        now: Optional[str] = None,
+    ) -> ApprovedDestinationRecord:
+        """Transition ACTIVE (or CREATED) -> RETIRED inside the caller's transaction.
+
+        CREATED -> RETIRED is the one documented deviation from the grant
+        lattice: a scheduled approval may be cancelled before its valid_from
+        goes live. RETIRED is terminal — re-approving the destination means
+        creating a NEW record, which keeps the history append-only.
+        """
+        return self._transition_destination_record_tx(
+            conn,
+            destination_id=destination_id,
+            organization_id=organization_id,
+            new_status=DestinationRecordStatus.RETIRED,
+            actor=actor,
+            event_type=DestinationAuditEventType.DESTINATION_RETIRED,
+            summary=f"Destination approval retired: {destination_id}",
+            now=now,
+        )
+
+    def retire_destination_record(
+        self,
+        *,
+        destination_id: str,
+        organization_id: str,
+        actor: str,
+        now: Optional[str] = None,
+    ) -> ApprovedDestinationRecord:
+        """Retire a destination record within a BEGIN IMMEDIATE transaction."""
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                record = self.retire_destination_record_tx(
+                    conn,
+                    destination_id=destination_id,
+                    organization_id=organization_id,
+                    actor=actor,
+                    now=now,
+                )
+                conn.commit()
+                return record
+            except Exception:
+                conn.rollback()
+                raise
+
+    def get_destination_record_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        destination_id: str,
+        organization_id: str,
+    ) -> Optional[ApprovedDestinationRecord]:
+        """Fetch one destination record strictly within the organization scope, or None.
+
+        Cross-organization is indistinguishable from absent: the query filters
+        on organization_id, so an out-of-scope row reads exactly like a
+        missing one and never leaks its existence or integrity diagnostics.
+        """
+        scope = self._require_destination_scope(organization_id)
+        if not destination_id or not str(destination_id).strip():
+            return None
+        row = conn.execute(
+            "SELECT * FROM destination_records WHERE destination_id = ? AND organization_id = ?",
+            (str(destination_id).strip(), scope),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_destination_record(row)
+
+    def get_destination_record(
+        self,
+        *,
+        destination_id: str,
+        organization_id: str,
+    ) -> Optional[ApprovedDestinationRecord]:
+        """Fetch one destination record (read-only, org-scoped)."""
+        scope = self._require_destination_scope(organization_id)
+        with self.get_connection() as conn:
+            return self.get_destination_record_tx(conn, destination_id=destination_id, organization_id=scope)
+
+    def list_destination_records_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+        counterparty: Optional[str] = None,
+        destination: Optional[str] = None,
+    ) -> List[ApprovedDestinationRecord]:
+        """List destination records strictly within one organization (newest first).
+
+        There is deliberately NO organization_id=None mode and no UNSCOPED
+        sentinel: destination_records.organization_id is NOT NULL from birth,
+        so an un-scoped listing has no legitimate caller.
+        """
+        scope = self._require_destination_scope(organization_id)
+        clauses = ["organization_id = ?"]
+        params: List[Any] = [scope]
+        if counterparty is not None and str(counterparty).strip():
+            clauses.append("counterparty = ?")
+            params.append(counterparty)
+        if destination is not None and str(destination).strip():
+            clauses.append("destination = ?")
+            params.append(destination)
+        rows = conn.execute(
+            f"SELECT * FROM destination_records WHERE {' AND '.join(clauses)} ORDER BY created_at DESC, destination_id DESC",
+            params,
+        ).fetchall()
+        return [self._row_to_destination_record(r) for r in rows]
+
+    def list_destination_records(
+        self,
+        *,
+        organization_id: str,
+        counterparty: Optional[str] = None,
+        destination: Optional[str] = None,
+    ) -> List[ApprovedDestinationRecord]:
+        """List destination records within one organization (read-only)."""
+        scope = self._require_destination_scope(organization_id)
+        with self.get_connection() as conn:
+            return self.list_destination_records_tx(
+                conn,
+                organization_id=scope,
+                counterparty=counterparty,
+                destination=destination,
+            )
+
+    def get_effective_destination_snapshot_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+        counterparty: str,
+        destination: str,
+        as_of: Optional[datetime] = None,
+    ) -> Optional[DestinationApprovalSnapshot]:
+        """Resolve the effective destination approval snapshot for hydration, or None.
+
+        The lookup is filtered by the CASE's organization (never an org id
+        supplied by the caller of the evaluation): the approval was accepted
+        under that organization's finance policy, so only that organization's
+        records can satisfy it. Among the org's records for this
+        counterparty/destination, the effective one is ACTIVE with a window
+        covering `as_of` (half-open [valid_from, valid_to)). Effectiveness is
+        computed from parsed datetimes, never string comparison.
+
+        The returned snapshot freezes the raw window fields — never a
+        precomputed "is approved" boolean — so the Policy Gate can recompute
+        effectiveness against its own evaluation_time on every replay.
+        """
+        scope = self._require_destination_scope(organization_id)
+        moment = as_of if as_of is not None else datetime.now(timezone.utc)
+        records = self.list_destination_records_tx(
+            conn,
+            organization_id=scope,
+            counterparty=counterparty,
+            destination=destination,
+        )
+        for record in records:
+            if record.is_effective_at(moment):
+                return DestinationApprovalSnapshot(
+                    destination_id=record.destination_id,
+                    organization_id=record.organization_id,
+                    tenant_id=record.tenant_id,
+                    counterparty=record.counterparty,
+                    destination=record.destination,
+                    destination_type=record.destination_type,
+                    status=record.status,
+                    valid_from=record.valid_from,
+                    valid_to=record.valid_to,
+                    policy_config_id=record.policy_config_id,
+                    policy_config_hash=record.policy_config_hash,
+                    record_hash=record.record_hash,
+                    snapshot_captured_at=moment.astimezone(timezone.utc).isoformat(),
+                )
+        return None
+
+    def get_effective_destination_snapshot(
+        self,
+        *,
+        organization_id: str,
+        counterparty: str,
+        destination: str,
+        as_of: Optional[datetime] = None,
+    ) -> Optional[DestinationApprovalSnapshot]:
+        """Resolve the effective destination approval snapshot (read-only)."""
+        scope = self._require_destination_scope(organization_id)
+        with self.get_connection() as conn:
+            return self.get_effective_destination_snapshot_tx(
+                conn,
+                organization_id=scope,
+                counterparty=counterparty,
+                destination=destination,
+                as_of=as_of,
+            )
+
+    # -- Policy configurations: mint / activate / retire / read ----------------
+
+    def create_policy_config_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        policy_config: PolicyConfig,
+        actor: str,
+        now: Optional[str] = None,
+    ) -> PolicyConfig:
+        """Insert one DRAFT policy config row inside the caller's BEGIN IMMEDIATE transaction.
+
+        Insert-only storage: this is the ONLY content write path, and it never
+        updates an existing row. Version monotonicity is enforced here (the
+        next version must be strictly greater than every existing version for
+        the org) and backstopped by UNIQUE(organization_id, version_id).
+        """
+        if not isinstance(policy_config, PolicyConfig):
+            raise PolicyConfigTransitionError("policy_config must be a PolicyConfig")
+        scope = self._require_destination_scope(policy_config.organization_id)
+        if not actor or not str(actor).strip():
+            raise PolicyConfigTransitionError("actor is required (Finance Control Owner session subject)")
+        if policy_config.status != PolicyConfigStatus.DRAFT:
+            raise PolicyConfigTransitionError(
+                f"A minted policy config must be DRAFT; got {policy_config.status.value}"
+            )
+        if policy_config.content_hash != policy_config.compute_content_hash():
+            raise PolicyConfigTamperError(
+                f"Policy config '{policy_config.config_id}' content hash does not match its canonical content"
+            )
+        now_iso = now or datetime.now(timezone.utc).isoformat()
+
+        existing_by_id = conn.execute(
+            "SELECT config_id FROM policy_configs WHERE config_id = ?",
+            (policy_config.config_id,),
+        ).fetchone()
+        if existing_by_id is not None:
+            raise PolicyConfigTransitionError(f"Policy config '{policy_config.config_id}' already exists")
+
+        latest = conn.execute(
+            "SELECT version_id FROM policy_configs WHERE organization_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (scope,),
+        ).fetchone()
+        if latest is not None and policy_config.version_id != next_version_id(latest["version_id"]):
+            raise PolicyConfigTransitionError(
+                f"Policy config version '{policy_config.version_id}' is not the next version after "
+                f"'{latest['version_id']}' for organization '{scope}' (versions are monotonic)"
+            )
+
+        cur = conn.execute(
+            """
+            INSERT INTO policy_configs (
+                config_id, organization_id, version_id, status, grant_ttl_seconds,
+                require_independent_callback, require_approved_destination,
+                block_on_snapshot_integrity_failure, block_on_policy_config_tamper,
+                hold_on_model_failure, hold_on_evidence_contradiction, hold_on_material_intent_change,
+                content_hash, created_by, created_at, activated_by, activated_at, retired_by, retired_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL);
+            """,
+            (
+                policy_config.config_id,
+                scope,
+                policy_config.version_id,
+                PolicyConfigStatus.DRAFT.value,
+                policy_config.grant_ttl_seconds,
+                int(policy_config.step_up_rules.require_independent_callback),
+                int(policy_config.step_up_rules.require_approved_destination),
+                int(policy_config.block_conditions.block_on_snapshot_integrity_failure),
+                int(policy_config.block_conditions.block_on_policy_config_tamper),
+                int(policy_config.block_conditions.hold_on_model_failure),
+                int(policy_config.block_conditions.hold_on_evidence_contradiction),
+                int(policy_config.block_conditions.hold_on_material_intent_change),
+                policy_config.content_hash,
+                str(actor).strip(),
+                now_iso,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise AuditLedgerIntegrityError(f"Failed to insert policy config '{policy_config.config_id}'")
+
+        self._append_config_audit_tx(
+            conn,
+            organization_id=scope,
+            event_type=PolicyConfigAuditEventType.POLICY_VERSION_CREATED,
+            summary=f"Policy version {policy_config.version_id} created (DRAFT)",
+            actor=str(actor).strip(),
+            details={
+                "config_id": policy_config.config_id,
+                "version_id": policy_config.version_id,
+                "content_hash": policy_config.content_hash,
+                "grant_ttl_seconds": policy_config.grant_ttl_seconds,
+                "step_up_rules": policy_config.step_up_rules.model_dump(),
+                "block_conditions": policy_config.block_conditions.model_dump(),
+            },
+            timestamp=now_iso,
+        )
+        return policy_config
+
+    def create_policy_config(
+        self,
+        *,
+        policy_config: PolicyConfig,
+        actor: str,
+        now: Optional[str] = None,
+    ) -> PolicyConfig:
+        """Create a policy config within a BEGIN IMMEDIATE transaction."""
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                created = self.create_policy_config_tx(
+                    conn,
+                    policy_config=policy_config,
+                    actor=actor,
+                    now=now,
+                )
+                conn.commit()
+                return created
+            except Exception:
+                conn.rollback()
+                raise
+
+    def _transition_policy_config_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        config_id: str,
+        organization_id: str,
+        new_status: PolicyConfigStatus,
+        actor: str,
+        event_type: PolicyConfigAuditEventType,
+        attribution_column: str,
+        now: Optional[str] = None,
+    ) -> PolicyConfig:
+        """Shared conditional lifecycle transition for policy configs.
+
+        Activation enforces the single-ACTIVE-per-organization invariant here
+        (inside the same BEGIN IMMEDIATE) and the partial unique index
+        idx_policy_configs_single_active is the storage-layer backstop. The
+        conditional UPDATE requires rowcount == 1 exactly like the grant claim.
+        """
+        scope = self._require_destination_scope(organization_id)
+        if not config_id or not str(config_id).strip():
+            raise PolicyConfigNotFoundError("config_id is required")
+        if not actor or not str(actor).strip():
+            raise PolicyConfigTransitionError("actor is required (Finance Control Owner session subject)")
+        normalized_id = str(config_id).strip()
+        now_iso = now or datetime.now(timezone.utc).isoformat()
+
+        row = conn.execute(
+            "SELECT * FROM policy_configs WHERE config_id = ?",
+            (normalized_id,),
+        ).fetchone()
+        if row is None or row["organization_id"] != scope:
+            raise PolicyConfigNotFoundError(
+                f"Policy config '{normalized_id}' not found in organization '{scope}'"
+            )
+
+        validate_policy_version_transition(row["status"], new_status)
+        current = self._row_to_policy_config(row)
+
+        if new_status == current.status:
+            # Idempotent same-state write.
+            return current
+
+        if new_status == PolicyConfigStatus.ACTIVE:
+            active_row = conn.execute(
+                "SELECT config_id, version_id FROM policy_configs WHERE organization_id = ? AND status = ?",
+                (scope, PolicyConfigStatus.ACTIVE.value),
+            ).fetchone()
+            if active_row is not None and active_row["config_id"] != normalized_id:
+                raise PolicyConfigTransitionError(
+                    f"Organization '{scope}' already has an ACTIVE policy config "
+                    f"({active_row['config_id']}, {active_row['version_id']}); retire it before "
+                    "activating a new version"
+                )
+
+        attribution_sql = (
+            f", {attribution_column}_by = ?, {attribution_column}_at = ?"
+            if attribution_column
+            else ""
+        )
+        update_sql = (
+            f"UPDATE policy_configs SET status = ?{attribution_sql} "
+            f"WHERE config_id = ? AND organization_id = ? AND status = ?"
+        )
+        params: List[Any] = [new_status.value]
+        if attribution_column:
+            params.extend([str(actor).strip(), now_iso])
+        params.extend([normalized_id, scope, row["status"]])
+        cur = conn.execute(update_sql, params)
+        if cur.rowcount != 1:
+            raise PolicyConfigTransitionError(
+                f"Policy config '{normalized_id}' transition to {new_status.value} lost the race against "
+                f"its current durable status; re-read the config and retry"
+            )
+
+        self._append_config_audit_tx(
+            conn,
+            organization_id=scope,
+            event_type=event_type,
+            summary=f"Policy version {row['version_id']} -> {new_status.value}",
+            actor=str(actor).strip(),
+            details={
+                "config_id": normalized_id,
+                "version_id": row["version_id"],
+                "from_status": row["status"],
+                "to_status": new_status.value,
+                "content_hash": row["content_hash"],
+            },
+            timestamp=now_iso,
+        )
+
+        updated = conn.execute(
+            "SELECT * FROM policy_configs WHERE config_id = ?",
+            (normalized_id,),
+        ).fetchone()
+        return self._row_to_policy_config(updated)
+
+    def activate_policy_config_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        config_id: str,
+        organization_id: str,
+        actor: str,
+        now: Optional[str] = None,
+    ) -> PolicyConfig:
+        """Transition DRAFT -> ACTIVE inside the caller's transaction (point of no return)."""
+        return self._transition_policy_config_tx(
+            conn,
+            config_id=config_id,
+            organization_id=organization_id,
+            new_status=PolicyConfigStatus.ACTIVE,
+            actor=actor,
+            event_type=PolicyConfigAuditEventType.POLICY_VERSION_ACTIVATED,
+            attribution_column="activated",
+            now=now,
+        )
+
+    def activate_policy_config(
+        self,
+        *,
+        config_id: str,
+        organization_id: str,
+        actor: str,
+        now: Optional[str] = None,
+    ) -> PolicyConfig:
+        """Activate a policy config within a BEGIN IMMEDIATE transaction."""
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                config = self.activate_policy_config_tx(
+                    conn,
+                    config_id=config_id,
+                    organization_id=organization_id,
+                    actor=actor,
+                    now=now,
+                )
+                conn.commit()
+                return config
+            except Exception:
+                conn.rollback()
+                raise
+
+    def retire_policy_config_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        config_id: str,
+        organization_id: str,
+        actor: str,
+        now: Optional[str] = None,
+    ) -> PolicyConfig:
+        """Transition ACTIVE (or DRAFT) -> RETIRED inside the caller's transaction."""
+        return self._transition_policy_config_tx(
+            conn,
+            config_id=config_id,
+            organization_id=organization_id,
+            new_status=PolicyConfigStatus.RETIRED,
+            actor=actor,
+            event_type=PolicyConfigAuditEventType.POLICY_VERSION_RETIRED,
+            attribution_column="retired",
+            now=now,
+        )
+
+    def retire_policy_config(
+        self,
+        *,
+        config_id: str,
+        organization_id: str,
+        actor: str,
+        now: Optional[str] = None,
+    ) -> PolicyConfig:
+        """Retire a policy config within a BEGIN IMMEDIATE transaction."""
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                config = self.retire_policy_config_tx(
+                    conn,
+                    config_id=config_id,
+                    organization_id=organization_id,
+                    actor=actor,
+                    now=now,
+                )
+                conn.commit()
+                return config
+            except Exception:
+                conn.rollback()
+                raise
+
+    def _verify_policy_config_row(self, row: sqlite3.Row, scope: str) -> PolicyConfig:
+        """Verify-on-read a config row, quarantining tampered content fail-closed.
+
+        A row whose stored content_hash disagrees with the canonical
+        recomputation of its content columns raises PolicyConfigTamperError:
+        the row is never silently skipped and never deleted — the caller
+        records a tamper audit event and the org's active-config resolution
+        refuses to serve the row.
+        """
+        try:
+            return self._row_to_policy_config(row)
+        except ValueError:
+            raise PolicyConfigTamperError(
+                f"Policy config '{row['config_id']}' in organization '{scope}' failed content-hash "
+                f"verification (stored {row['content_hash']} != canonical recomputation); the row is "
+                "quarantined and must not be used"
+            )
+
+    def get_active_policy_config_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+    ) -> Optional[PolicyConfig]:
+        """Resolve the organization's ACTIVE policy config, or None when it has none.
+
+        Verify-on-read fail-closed: the row's content hash is recomputed
+        before the config is returned, and a tampered row raises
+        PolicyConfigTamperError instead of being silently skipped. When the
+        org has no row the caller falls back to the code-level default (the
+        equivalent of today's inline rules), which keeps every pre-existing
+        caller byte-identical.
+        """
+        scope = self._require_destination_scope(organization_id)
+        row = conn.execute(
+            "SELECT * FROM policy_configs WHERE organization_id = ? AND status = ?",
+            (scope, PolicyConfigStatus.ACTIVE.value),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._verify_policy_config_row(row, scope)
+
+    def get_active_policy_config(
+        self,
+        *,
+        organization_id: str,
+    ) -> Optional[PolicyConfig]:
+        """Resolve the organization's ACTIVE policy config (read-only)."""
+        scope = self._require_destination_scope(organization_id)
+        with self.get_connection() as conn:
+            return self.get_active_policy_config_tx(conn, organization_id=scope)
+
+    def get_policy_config_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        config_id: str,
+        organization_id: str,
+    ) -> Optional[PolicyConfig]:
+        """Fetch one policy config strictly within the organization scope, or None.
+
+        Cross-organization is indistinguishable from absent, and tampered
+        content fails closed via _verify_policy_config_row.
+        """
+        scope = self._require_destination_scope(organization_id)
+        if not config_id or not str(config_id).strip():
+            return None
+        row = conn.execute(
+            "SELECT * FROM policy_configs WHERE config_id = ? AND organization_id = ?",
+            (str(config_id).strip(), scope),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._verify_policy_config_row(row, scope)
+
+    def get_policy_config(
+        self,
+        *,
+        config_id: str,
+        organization_id: str,
+    ) -> Optional[PolicyConfig]:
+        """Fetch one policy config (read-only, org-scoped)."""
+        scope = self._require_destination_scope(organization_id)
+        with self.get_connection() as conn:
+            return self.get_policy_config_tx(conn, config_id=config_id, organization_id=scope)
+
+    def list_policy_configs_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+    ) -> List[PolicyConfig]:
+        """List every policy config version for one organization (newest first).
+
+        There is deliberately NO organization_id=None mode: policy configs are
+        always organization-scoped. Tampered rows fail closed — the listing
+        raises rather than silently omitting a row whose integrity is broken.
+        """
+        scope = self._require_destination_scope(organization_id)
+        rows = conn.execute(
+            "SELECT * FROM policy_configs WHERE organization_id = ? ORDER BY created_at DESC, rowid DESC",
+            (scope,),
+        ).fetchall()
+        return [self._verify_policy_config_row(r, scope) for r in rows]
+
+    def list_policy_configs(
+        self,
+        *,
+        organization_id: str,
+    ) -> List["PolicyConfig"]:
+        """List policy config versions for one organization (read-only)."""
+        scope = self._require_destination_scope(organization_id)
+        with self.get_connection() as conn:
+            return self.list_policy_configs_tx(conn, organization_id=scope)
+
+    def verify_config_audit_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        organization_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Verify the org-keyed config audit chain and checkpoint MAC (read-only)."""
+        scope = self._require_destination_scope(organization_id)
+
+        cp_row = conn.execute(
+            "SELECT * FROM config_audit_checkpoints WHERE organization_id = ?;",
+            (scope,),
+        ).fetchone()
+        if cp_row is None:
+            rows_count = conn.execute(
+                "SELECT COUNT(*) FROM config_audit_events WHERE organization_id = ?;",
+                (scope,),
+            ).fetchone()[0]
+            if rows_count == 0:
+                return None
+            return {
+                "organization_id": scope,
+                "is_valid": False,
+                "trust_state": "CORRUPTED",
+                "event_count": int(rows_count),
+                "broken_at_seq": None,
+                "reason": "Missing config audit checkpoint with events present",
+            }
+
+        if not isinstance(cp_row["event_count"], int) or isinstance(cp_row["event_count"], bool):
+            return {
+                "organization_id": scope,
+                "is_valid": False,
+                "trust_state": "CORRUPTED",
+                "event_count": 0,
+                "broken_at_seq": None,
+                "reason": "Config audit checkpoint event_count is not an integer",
+            }
+
+        if not verify_checkpoint_mac(
+            secret=self.audit_checkpoint_secret,
+            case_id=scope,
+            event_count=cp_row["event_count"],
+            tip_hash=cp_row["tip_hash"],
+            trust_state=cp_row["trust_state"],
+            checkpoint_mac=cp_row["checkpoint_mac"],
+        ):
+            return {
+                "organization_id": scope,
+                "is_valid": False,
+                "trust_state": "CORRUPTED",
+                "event_count": cp_row["event_count"],
+                "broken_at_seq": None,
+                "reason": "Config audit checkpoint MAC verification failed",
+            }
+
+        rows = conn.execute(
+            "SELECT * FROM config_audit_events WHERE organization_id = ? ORDER BY seq ASC;",
+            (scope,),
+        ).fetchall()
+        if len(rows) != cp_row["event_count"]:
+            return {
+                "organization_id": scope,
+                "is_valid": False,
+                "trust_state": "CORRUPTED",
+                "event_count": len(rows),
+                "broken_at_seq": None,
+                "reason": (
+                    f"Event count mismatch: checkpoint records {cp_row['event_count']} events, "
+                    f"found {len(rows)}"
+                ),
+            }
+
+        expected_tip = rows[-1]["current_hash"] if rows else GENESIS_HASH
+        if cp_row["tip_hash"] != expected_tip:
+            return {
+                "organization_id": scope,
+                "is_valid": False,
+                "trust_state": "CORRUPTED",
+                "event_count": len(rows),
+                "broken_at_seq": None,
+                "reason": "Config audit tip hash mismatch with checkpoint",
+            }
+
+        seen_seqs: set[int] = set()
+        for idx, r in enumerate(rows):
+            if r["seq"] in seen_seqs:
+                return {
+                    "organization_id": scope,
+                    "is_valid": False,
+                    "trust_state": "CORRUPTED",
+                    "event_count": len(rows),
+                    "broken_at_seq": r["seq"],
+                    "reason": f"Duplicate audit sequence at seq {r['seq']}",
+                }
+            seen_seqs.add(r["seq"])
+            expected_seq = idx + 1
+            if r["seq"] != expected_seq:
+                return {
+                    "organization_id": scope,
+                    "is_valid": False,
+                    "trust_state": "CORRUPTED",
+                    "event_count": len(rows),
+                    "broken_at_seq": r["seq"],
+                    "reason": f"Sequence gap: expected seq {expected_seq}, found {r['seq']}",
+                }
+            if r["organization_id"] != scope:
+                return {
+                    "organization_id": scope,
+                    "is_valid": False,
+                    "trust_state": "CORRUPTED",
+                    "event_count": len(rows),
+                    "broken_at_seq": r["seq"],
+                    "reason": f"Cross-organization audit ownership violation: {r['organization_id']}",
+                }
+            expected_prev = rows[idx - 1]["current_hash"] if idx > 0 else GENESIS_HASH
+            if r["prev_hash"] != expected_prev:
+                return {
+                    "organization_id": scope,
+                    "is_valid": False,
+                    "trust_state": "CORRUPTED",
+                    "event_count": len(rows),
+                    "broken_at_seq": r["seq"],
+                    "reason": f"Broken prev_hash chain at seq {r['seq']}",
+                }
+            try:
+                details = json.loads(r["details_json"])
+            except Exception:
+                return {
+                    "organization_id": scope,
+                    "is_valid": False,
+                    "trust_state": "CORRUPTED",
+                    "event_count": len(rows),
+                    "broken_at_seq": r["seq"],
+                    "reason": f"Malformed details_json at seq {r['seq']}",
+                }
+            recomputed = compute_audit_hash(
+                prev_hash=r["prev_hash"],
+                seq=r["seq"],
+                event_type=r["event_type"],
+                summary=r["summary"],
+                actor=r["actor"],
+                timestamp=r["timestamp"],
+                details=details,
+            )
+            if recomputed != r["current_hash"]:
+                return {
+                    "organization_id": scope,
+                    "is_valid": False,
+                    "trust_state": "CORRUPTED",
+                    "event_count": len(rows),
+                    "broken_at_seq": r["seq"],
+                    "reason": f"Tampered event payload at seq {r['seq']}: current_hash mismatch",
+                }
+
+        return {
+            "organization_id": scope,
+            "is_valid": True,
+            "trust_state": AuditTrustState.TRUSTED.value,
+            "event_count": cp_row["event_count"],
+            "tip_hash": cp_row["tip_hash"],
+            "broken_at_seq": None,
+            "reason": None,
+        }
+
+    def verify_config_audit(self, *, organization_id: str) -> Optional[Dict[str, Any]]:
+        """Verify the org-keyed config audit chain (read-only, connection-managed)."""
+        scope = self._require_destination_scope(organization_id)
+        with self.get_connection() as conn:
+            return self.verify_config_audit_tx(conn, organization_id=scope)
 
     # ==========================================================================
     # Tenant operating limits: quotas, settings, and settings audit (Issue #10)

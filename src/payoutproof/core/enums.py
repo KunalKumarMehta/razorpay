@@ -160,3 +160,64 @@ class MembershipAuditEventType(str, Enum):
     MEMBER_ADDED = "MEMBER_ADDED"
     MEMBER_ROLE_CHANGED = "MEMBER_ROLE_CHANGED"
     MEMBER_REMOVED = "MEMBER_REMOVED"
+
+
+class PolicyConfigStatus(str, Enum):
+    """Lifecycle status of an immutable policy configuration version.
+
+    Mirrors the grant lattice: DRAFT may only become ACTIVE, ACTIVE may only
+    become RETIRED, and RETIRED is terminal. Once ACTIVE, the config's
+    thresholds and stopping rules can never be edited — a change mints a new
+    version row (insert-only storage).
+    """
+    DRAFT = "DRAFT"
+    ACTIVE = "ACTIVE"
+    RETIRED = "RETIRED"
+
+
+class DestinationRecordStatus(str, Enum):
+    """Durable approval-lifecycle status of an Approved Destination record.
+
+    CREATED -> ACTIVE -> RETIRED, irreversible, with one documented deviation
+    from the grant lattice: CREATED -> RETIRED is allowed so an operator can
+    cancel a scheduled approval before its valid_from goes live. RETIRED is
+    terminal; re-approving a retired destination means creating a new record.
+
+    This is the operator-driven approval lifecycle, NOT effectiveness: an
+    ACTIVE record with a future valid_from or a past valid_to is not effective
+    at a given time. Nothing auto-mutates these rows on window expiry.
+    """
+    CREATED = "CREATED"
+    ACTIVE = "ACTIVE"
+    RETIRED = "RETIRED"
+
+
+class DestinationAuditEventType(str, Enum):
+    """Event types for the destination-keyed audit chain.
+
+    A tamper detection is an event, not a rejection: the row is quarantined
+    (RETIRED-like refusal to serve) rather than silently dropped, preserving
+    the append-only history for investigation.
+    """
+    DESTINATION_CREATED = "DESTINATION_CREATED"
+    DESTINATION_ACTIVATED = "DESTINATION_ACTIVATED"
+    DESTINATION_RETIRED = "DESTINATION_RETIRED"
+    DESTINATION_CONFIG_TAMPER_DETECTED = "DESTINATION_CONFIG_TAMPER_DETECTED"
+
+
+class PolicyConfigAuditEventType(str, Enum):
+    """Event types for the organization-keyed policy configuration audit chain.
+
+    Covers both policy-version lifecycle events and the organization-level
+    mirror of destination-approval lifecycle events (the destination-keyed
+    destination_audit_events chain remains the per-destination authority;
+    these org-keyed copies give an organization one contiguous ledger of
+    everything decided under its finance policy).
+    """
+    POLICY_VERSION_CREATED = "POLICY_VERSION_CREATED"
+    POLICY_VERSION_ACTIVATED = "POLICY_VERSION_ACTIVATED"
+    POLICY_VERSION_RETIRED = "POLICY_VERSION_RETIRED"
+    DESTINATION_APPROVAL_CREATED = "DESTINATION_APPROVAL_CREATED"
+    DESTINATION_APPROVAL_ACTIVATED = "DESTINATION_APPROVAL_ACTIVATED"
+    DESTINATION_APPROVAL_RETIRED = "DESTINATION_APPROVAL_RETIRED"
+    POLICY_CONFIG_TAMPER_DETECTED = "POLICY_CONFIG_TAMPER_DETECTED"

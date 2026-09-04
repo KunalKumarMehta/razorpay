@@ -1,8 +1,12 @@
 """Deterministic Policy Gate evaluator."""
 
 from datetime import datetime, timezone, timedelta
-from typing import Any, List, Optional
-from payoutproof.core.models import RiskCaseState, PolicyEvaluationResult
+from typing import Any, Dict, List, Optional
+from payoutproof.core.models import (
+    DestinationApprovalSnapshot,
+    RiskCaseState,
+    PolicyEvaluationResult,
+)
 from payoutproof.core.enums import (
     PolicyOutcome,
     ReasonCode,
@@ -27,6 +31,20 @@ class PolicyGate:
 
     Evaluates a frozen RiskCaseState against explicit deterministic rules.
     Performs no network calls, no model calls, no free-text parsing, and no data repairs.
+
+    Issue #9 provenance (both parameters optional, additive, and defaulting
+    to None so every pre-existing caller keeps byte-identical outcomes):
+
+    - ``policy_config`` — the organization's resolved immutable policy
+      configuration version. When supplied, its version label, grant TTL, and
+      step-up rules drive the evaluation and its identity is recorded on the
+      result; when absent, the in-code defaults below apply exactly as
+      before and the result carries no config provenance.
+    - ``destination_snapshot`` — the frozen hydrated Approved Destination
+      view captured before evaluation. When the resolved config requires an
+      approved destination, the snapshot must exist and be effective at the
+      evaluation instant, or the evaluation fails closed to
+      STEP_UP_REQUIRED with reason DESTINATION_NOT_APPROVED.
     """
 
     @classmethod
@@ -36,8 +54,32 @@ class PolicyGate:
         policy_version: str = POLICY_VERSION,
         evaluation_time: Optional[datetime] = None,
         clock: Optional[ClockProvider] = None,
+        policy_config: Optional[Any] = None,
+        destination_snapshot: Optional[DestinationApprovalSnapshot] = None,
     ) -> PolicyEvaluationResult:
-        """Evaluate case snapshot and return deterministic PolicyEvaluationResult."""
+        """Evaluate case snapshot and return deterministic PolicyEvaluationResult.
+
+        The optional Issue #9 parameters never change a legacy call's result:
+        a caller passing neither gets exactly the pre-existing in-code rules,
+        thresholds, reasons, and next steps. A caller supplying a
+        ``policy_config`` gets its grant TTL and step-up rules instead, with
+        the config's identity and hash (and the destination snapshot, when
+        one was resolved) recorded on the result for durable provenance.
+        """
+        # A supplied PolicyConfig carries its own version identity; an absent
+        # one keeps the caller-supplied (default PP-POLICY-V1) label so legacy
+        # grants and persisted state_json stay byte-identical.
+        resolved_version = getattr(policy_config, "version_id", None) or policy_version
+        resolved_config = policy_config
+        if resolved_config is None:
+            from payoutproof.policy.config import default_active_config
+
+            # The implicit default mirrors today's in-code rules exactly
+            # (same TTL, same require-callback/require-destination posture),
+            # so the rule application below has one code path and legacy
+            # callers are provably unaffected.
+            resolved_config = default_active_config(state.organization_id)
+
         if evaluation_time is not None:
             eval_dt = evaluation_time
         elif clock is not None:
@@ -45,12 +87,32 @@ class PolicyGate:
         else:
             eval_dt = datetime.now(timezone.utc)
         now_iso = eval_dt.isoformat()
-        expires_iso = (eval_dt + timedelta(seconds=GRANT_TTL_SECONDS)).isoformat()
+
+        ttl_seconds = getattr(resolved_config, "grant_ttl_seconds", None)
+        if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool) or ttl_seconds < 1:
+            ttl_seconds = GRANT_TTL_SECONDS
+        expires_iso = (eval_dt + timedelta(seconds=ttl_seconds)).isoformat()
+
+        step_up_rules = getattr(resolved_config, "step_up_rules", None)
+        require_callback_rule = bool(getattr(step_up_rules, "require_independent_callback", True))
+        require_destination_rule = bool(getattr(step_up_rules, "require_approved_destination", True))
+
+        # Issue #9 provenance rides every result this evaluation produces.
+        # It is None when the caller supplied no config (legacy call), so
+        # persisted legacy results remain exactly as they were.
+        config_id = getattr(policy_config, "config_id", None) if policy_config is not None else None
+        config_hash = getattr(policy_config, "content_hash", None) if policy_config is not None else None
+        snapshot_dict: Optional[Dict[str, Any]] = (
+            destination_snapshot.model_dump() if destination_snapshot is not None else None
+        )
 
         def result(**fields: Any) -> PolicyEvaluationResult:
             """Build a result stamped with the case's organization identity and policy version."""
-            fields.setdefault("policy_version", policy_version)
+            fields.setdefault("policy_version", resolved_version)
             fields.setdefault("organization_id", state.organization_id)
+            fields.setdefault("policy_config_id", config_id)
+            fields.setdefault("policy_config_hash", config_hash)
+            fields.setdefault("destination_snapshot", snapshot_dict)
             return PolicyEvaluationResult(**fields)
 
         # 1. Check for integrity failures / structural corruption (BLOCKED)
@@ -198,6 +260,38 @@ class PolicyGate:
             for f in state.findings
         ) or state.intent.destination_status == DestinationStatus.APPROVED_FOR_COUNTERPARTY
 
+        # 6.5 Issue #9 effective-dated destination approval. Only a caller
+        # that supplied a policy_config opts into the snapshot authority — a
+        # legacy call (policy_config=None) keeps the findings-based rules
+        # below byte-identical, whatever the implicit default would say.
+        # When the resolved config requires an approved destination, the
+        # frozen hydrated snapshot is the authority, not the case's own
+        # findings: it must exist and be effective at THIS evaluation instant
+        # (half-open [valid_from, valid_to), computed from parsed datetimes),
+        # or the evaluation fails closed to STEP_UP_REQUIRED — an expired,
+        # scheduled, retired, or missing approval never satisfies policy.
+        snapshot_effective = (
+            destination_snapshot is not None and destination_snapshot.is_effective_at(eval_dt)
+        )
+        if policy_config is not None and require_destination_rule and not snapshot_effective:
+            return result(
+                outcome=PolicyOutcome.STEP_UP_REQUIRED,
+                reasons=[ReasonCode.UNAPPROVED_DESTINATION],
+                next_steps=[
+                    "Complete the separate policy-governed destination-approval process: "
+                    "activate a record whose effective window covers this evaluation",
+                ],
+                evaluated_intent_hash=state.intent.intent_hash,
+                evaluated_at=now_iso,
+                expires_at=None,
+            )
+
+        # An effective registry snapshot is destination approval by
+        # definition — it overrides the case's own findings (which record
+        # observations, not registry state).
+        if snapshot_effective:
+            has_destination_approval = True
+
         if not has_callback and not has_destination_approval:
             return result(
                 outcome=PolicyOutcome.STEP_UP_REQUIRED,
@@ -211,7 +305,7 @@ class PolicyGate:
                 expires_at=None,
             )
 
-        if not has_callback:
+        if require_callback_rule and not has_callback:
             return result(
                 outcome=PolicyOutcome.STEP_UP_REQUIRED,
                 reasons=[ReasonCode.INDEPENDENT_VERIFICATION_MISSING],
