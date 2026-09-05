@@ -20,9 +20,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v2
+        uses: astral-sh/setup-uv@v5
         with:
-          version: "0.2.34"
+          enable-cache: true
 
       - name: Verify Python lockfile integrity
         run: uv lock --check

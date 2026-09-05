@@ -18,8 +18,8 @@ ENV PYTHONUNBUFFERED=1 \
     PAYOUTPROOF_ENV=production \
     PORT=8000
 
-# Install pinned uv binary from official distribution
-COPY --from=ghcr.io/astral-sh/uv:0.2.34 /uv /bin/uv
+# Install uv binary from official distribution
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
 WORKDIR /app
 
