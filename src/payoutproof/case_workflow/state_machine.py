@@ -29,7 +29,13 @@ from payoutproof.core.enums import (
 )
 from payoutproof.core.crypto import compute_intent_hash, derive_idempotency_key, compute_snapshot_hash
 from payoutproof.admission.validator import AdmissionValidator
-from payoutproof.intent.extractor import confirm_intent, modify_intent, normalize_inr_amount
+from payoutproof.intent.extractor import (
+    confirm_intent,
+    modify_intent,
+    correct_intent,
+    invalidate_intent,
+    normalize_inr_amount,
+)
 from payoutproof.policy.evaluator import PolicyGate, POLICY_VERSION
 from payoutproof.grants.issuer import GrantIssuer, GrantVerifier
 from payoutproof.audit.chain import AuditChain
@@ -391,7 +397,11 @@ class StateMachine:
             if state.intent.status not in (IntentStatus.EXTRACTED, IntentStatus.INVALIDATED):
                 return refuse(state, "confirm Payment Intent", "there is no extracted intent ready for confirmation")
 
-            confirmed = confirm_intent(state.intent)
+            try:
+                confirmed = confirm_intent(state.intent)
+            except ValueError as e:
+                return refuse(state, "confirm Payment Intent", str(e))
+
             msg = "Payment Operator confirmed the exact material fields; a frozen intent hash was created."
             s_next = state.model_copy(update={
                 "intent": confirmed,
@@ -570,12 +580,32 @@ class StateMachine:
             new_audit = with_event(s_next, "HANDOFF_GRANT_ISSUED", msg, "Policy Gate", {"grant_id": grant.grant_id})
             return s_next.model_copy(update={"audit": new_audit})
 
-        elif action_type == "EDIT_AMOUNT" or action_type == "MODIFY_INTENT":
+        elif action_type in ("EDIT_AMOUNT", "MODIFY_INTENT", "CORRECT_INTENT"):
             if state.intent.status == IntentStatus.NOT_EXTRACTED:
                 return refuse(state, "edit intent", "there is no extracted Payment Intent")
 
-            new_amount = payload.get("amount", "475000" if state.intent.amount == "425000" else "425000")
-            new_intent, is_material = modify_intent(state.intent, amount=new_amount)
+            cp = payload.get("counterparty")
+            dest = payload.get("destination")
+            amt = payload.get("amount")
+            curr = payload.get("currency")
+            purp = payload.get("purpose")
+            ref_id = payload.get("instruction_reference") or payload.get("instruction_ref")
+            reason = payload.get("reason", "Payment Operator correction")
+
+            if action_type == "EDIT_AMOUNT" and amt is None:
+                amt = "475000" if state.intent.amount == "425000" else "425000"
+
+            was_confirmed = state.intent.status == IntentStatus.CONFIRMED
+            new_intent, is_material = correct_intent(
+                state.intent,
+                counterparty=cp,
+                destination=dest,
+                amount=amt,
+                currency=curr,
+                purpose=purp,
+                instruction_reference=ref_id,
+                reason=reason,
+            )
 
             # Invalidate callback findings because intent has changed
             updated_findings = [
@@ -584,7 +614,60 @@ class StateMachine:
                 for f in state.findings
             ]
 
-            msg = "Material edit invalidated the prior evaluation and any active Handoff Grant."
+            if was_confirmed and is_material:
+                msg = f"Material edit invalidated the prior evaluation and any active Handoff Grant ({reason})."
+                s_next = state.model_copy(update={
+                    "intent": new_intent,
+                    "findings": updated_findings,
+                    "case_version": state.case_version + 1,
+                    "grant": revoke_grant(state),
+                })
+                eval_result = PolicyGate.evaluate(s_next, clock=resolved_clock)
+                s_next = s_next.model_copy(update={
+                    "policy": eval_result,
+                    "phase": CasePhase.OPERATOR_INTERVENTION,
+                    "last_change": msg,
+                })
+                audit_details = {
+                    "original_intent": state.intent.model_dump(),
+                    "corrected_intent": new_intent.model_dump(),
+                    "reason": reason,
+                    "is_material": True,
+                    "evaluation_invalidated": True,
+                }
+                new_audit = with_event(s_next, "MATERIAL_INTENT_EDITED", msg, "Payment Operator", audit_details)
+                return s_next.model_copy(update={"audit": new_audit})
+            else:
+                msg = f"Payment Operator corrected Payment Intent ({reason})."
+                s_next = state.model_copy(update={
+                    "intent": new_intent,
+                    "findings": updated_findings if is_material else state.findings,
+                    "case_version": state.case_version + 1,
+                    "last_change": msg,
+                })
+                audit_details = {
+                    "original_intent": state.intent.model_dump(),
+                    "corrected_intent": new_intent.model_dump(),
+                    "reason": reason,
+                    "is_material": is_material,
+                }
+                new_audit = with_event(s_next, "PAYMENT_INTENT_CORRECTED", msg, "Payment Operator", audit_details)
+                return s_next.model_copy(update={"audit": new_audit})
+
+        elif action_type == "INVALIDATE_INTENT":
+            if state.intent.status == IntentStatus.NOT_EXTRACTED:
+                return refuse(state, "invalidate intent", "there is no extracted Payment Intent to invalidate")
+
+            reason = payload.get("reason", "Operator manual invalidation")
+            new_intent = invalidate_intent(state.intent, reason=reason)
+
+            updated_findings = [
+                Finding(name=f.name, truth_state=TruthState.NOT_OBSERVED, detail="Prior callback invalidated by intent invalidation")
+                if f.name == FindingName.INDEPENDENT_CALLBACK.value else f
+                for f in state.findings
+            ]
+
+            msg = f"Payment Intent invalidated by operator: {reason}."
             s_next = state.model_copy(update={
                 "intent": new_intent,
                 "findings": updated_findings,
@@ -597,7 +680,7 @@ class StateMachine:
                 "phase": CasePhase.OPERATOR_INTERVENTION,
                 "last_change": msg,
             })
-            new_audit = with_event(s_next, "MATERIAL_INTENT_EDITED", msg, "Payment Operator", {"new_amount": new_amount})
+            new_audit = with_event(s_next, "PAYMENT_INTENT_INVALIDATED", msg, "Payment Operator", {"reason": reason})
             return s_next.model_copy(update={"audit": new_audit})
 
         elif action_type == "INITIATE_HANDOFF":

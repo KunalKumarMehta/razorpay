@@ -29,7 +29,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from payoutproof.core.models import RiskCaseState
-from payoutproof.core.enums import PolicyOutcome, CasePhase, IntentStatus, DemoFakeAdapterMode
+from payoutproof.core.enums import PolicyOutcome, CasePhase, IntentStatus, DemoFakeAdapterMode, TruthState, FindingName
 from payoutproof.core.config import AppConfig, ConfigurationError
 from payoutproof.core.limits import (
     PLATFORM_BACKSTOP_ORGANIZATION,
@@ -1876,6 +1876,159 @@ async def list_case_extraction_jobs_endpoint(
 
     jobs = trust_agent_service.list_case_jobs(case_id, organization_id=organization_id)
     return {"case_id": case_id, "jobs": [j.to_public_dict() for j in jobs]}
+
+
+# ── Payment Intent review, correction, confirmation, and invalidation (Issue #17) ──
+
+class CorrectIntentPayload(BaseModel):
+    counterparty: Optional[str] = None
+    destination: Optional[str] = None
+    amount: Optional[str] = None
+    currency: Optional[str] = None
+    purpose: Optional[str] = None
+    instruction_reference: Optional[str] = None
+    reason: str = "Operator manual correction"
+
+
+class InvalidateIntentPayload(BaseModel):
+    reason: str = "Operator manual invalidation"
+
+
+@protected_router.get("/api/cases/{case_id}/intent")
+def get_case_intent_review(
+    case_id: str,
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> Dict[str, Any]:
+    """Retrieve the Payment Intent review interface payload.
+
+    Provides material fields, fine-grained provenance, extraction confidence,
+    detected conflicts or contradictions, provider/model version, and unresolved state.
+    """
+    active_db = _resolve_db(request)
+    organization_id = active_organization(request, session)
+
+    scope = active_db.get_case_scope(case_id)
+    if scope is None or scope["organization_id"] != organization_id:
+        raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
+
+    if not CAPABILITY_READ_CASES.get(session.role.value, False):
+        raise HTTPException(status_code=403, detail="Forbidden: this role may not read case state")
+
+    try:
+        state = active_db.load_case(case_id)
+    except AuditLedgerIntegrityError as e:
+        raise HTTPException(status_code=409, detail=f"Audit ledger integrity failure: {e}")
+    if state is None:
+        raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found")
+
+    trust_agent_service = getattr(request.app.state, "trust_agent_service", None)
+    jobs = []
+    if trust_agent_service:
+        try:
+            jobs = trust_agent_service.list_case_jobs(case_id, organization_id=organization_id)
+        except Exception:
+            jobs = []
+
+    latest_job = jobs[-1] if jobs else None
+
+    conflicts = []
+    for finding in state.findings:
+        if finding.truth_state == TruthState.CONTRADICTED:
+            conflicts.append({
+                "name": finding.name,
+                "truth_state": finding.truth_state.value,
+                "detail": finding.detail,
+                "evidence_ref": finding.evidence_ref,
+            })
+        elif finding.name == FindingName.INSTRUCTION_CONSISTENCY.value and finding.truth_state != TruthState.SUPPORTED:
+            conflicts.append({
+                "name": finding.name,
+                "truth_state": finding.truth_state.value,
+                "detail": finding.detail,
+                "evidence_ref": finding.evidence_ref,
+            })
+
+    intent = state.intent
+    material_fields = {
+        "counterparty": intent.counterparty,
+        "destination": intent.destination,
+        "destination_status": intent.destination_status.value if hasattr(intent.destination_status, "value") else intent.destination_status,
+        "amount": intent.amount,
+        "currency": intent.currency,
+        "purpose": intent.purpose,
+        "instruction_reference": intent.instruction_reference,
+    }
+
+    confidence = None
+    provider_id = None
+    model_version = None
+    if latest_job:
+        confidence = latest_job.confidence
+        provider_id = latest_job.provider_id
+        model_version = latest_job.model_version
+    elif state.investigation and state.investigation.asr_confidence is not None:
+        confidence = state.investigation.asr_confidence
+        model_version = "v1-default"
+
+    can_confirm = (
+        intent.status in (IntentStatus.EXTRACTED, IntentStatus.INVALIDATED) and
+        bool(intent.counterparty) and
+        bool(intent.destination) and
+        bool(intent.amount) and
+        len(conflicts) == 0
+    )
+
+    return {
+        "case_id": case_id,
+        "status": intent.status.value,
+        "intent_hash": intent.intent_hash,
+        "material_fields": material_fields,
+        "provenance": intent.provenance,
+        "confidence": confidence,
+        "provider_id": provider_id,
+        "model_version": model_version,
+        "conflicts": conflicts,
+        "unresolved": intent.status != IntentStatus.CONFIRMED,
+        "can_confirm": can_confirm,
+        "diagnostics": state.investigation.model_dump() if state.investigation else {},
+    }
+
+
+@protected_router.post("/api/cases/{case_id}/intent/correct")
+def correct_case_intent(
+    case_id: str,
+    payload: CorrectIntentPayload,
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> RiskCaseState:
+    """Correct Payment Intent fields before or after confirmation."""
+    data = payload.model_dump(exclude_none=True)
+    req = ActionRequest(type="CORRECT_INTENT", payload=data)
+    return dispatch_action(case_id, req, request, session)
+
+
+@protected_router.post("/api/cases/{case_id}/intent/confirm")
+def confirm_case_intent(
+    case_id: str,
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> RiskCaseState:
+    """Explicitly confirm extracted Payment Intent into a stable identity."""
+    req = ActionRequest(type="CONFIRM_INTENT", payload={})
+    return dispatch_action(case_id, req, request, session)
+
+
+@protected_router.post("/api/cases/{case_id}/intent/invalidate")
+def invalidate_case_intent(
+    case_id: str,
+    payload: InvalidateIntentPayload,
+    request: Request,
+    session: SessionRecord = Depends(require_session),
+) -> RiskCaseState:
+    """Explicitly invalidate Payment Intent and revoke associated grants/evaluations."""
+    req = ActionRequest(type="INVALIDATE_INTENT", payload=payload.model_dump(exclude_none=True))
+    return dispatch_action(case_id, req, request, session)
 
 
 def _now_iso(request: Request) -> str:

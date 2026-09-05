@@ -110,6 +110,8 @@ ACTION_ROLE_MATRIX: Dict[str, FrozenSet[str]] = {
     "EXTRACT_INTENT": frozenset({Role.PAYMENT_OPERATOR.value}),
     "EDIT_AMOUNT": frozenset({Role.PAYMENT_OPERATOR.value}),
     "MODIFY_INTENT": frozenset({Role.PAYMENT_OPERATOR.value}),
+    "CORRECT_INTENT": frozenset({Role.PAYMENT_OPERATOR.value}),
+    "INVALIDATE_INTENT": frozenset({Role.PAYMENT_OPERATOR.value, Role.FINANCE_CONTROL_OWNER.value}),
     "CONFIRM_INTENT": frozenset({Role.PAYMENT_OPERATOR.value}),
     "ADD_DESTINATION_APPROVAL": frozenset({Role.FINANCE_CONTROL_OWNER.value}),
     "EVALUATE_POLICY": frozenset({Role.FINANCE_CONTROL_OWNER.value}),

@@ -5,6 +5,8 @@ from payoutproof.intent.extractor import (
     extract_intent_from_structured_data,
     confirm_intent,
     modify_intent,
+    correct_intent,
+    invalidate_intent,
 )
 
 __all__ = [
@@ -12,4 +14,6 @@ __all__ = [
     "extract_intent_from_structured_data",
     "confirm_intent",
     "modify_intent",
+    "correct_intent",
+    "invalidate_intent",
 ]
