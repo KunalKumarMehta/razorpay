@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "project": "PayoutProof",
+  "project": "IntentLock",
   "version": "0.1.0",
   "policy_version": "PP-POLICY-V1",
   "status": "IN_DEVELOPMENT",

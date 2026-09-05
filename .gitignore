@@ -18,3 +18,7 @@ build/
 .scratch/
 *.md
 !README.md
+docs
+.obsidian
+scripts
+handoff_ledger.json
