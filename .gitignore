@@ -15,3 +15,5 @@ dist/
 build/
 .ruff_cache/
 .env
+.scratch/
+codex conversation.md

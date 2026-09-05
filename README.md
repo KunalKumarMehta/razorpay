@@ -222,5 +222,12 @@ docker build -t payoutproof:pilot .
 ### 5. Branch Protection & Promotion Discipline
 
 - The protected `main` branch remains untouched (`aa3bd57`).
-- All development and evaluation baseline work proceeds on dedicated feature branches (`codex/issue-2-pilot-baseline`) and integration branches (`antigravity/mvp-implementation`).
+- Branch protection discipline ensures all development proceeds through dedicated review.
 - Evaluation results honestly declare synthetic scope; no held-out claims or unverified pilot certifications are published.
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
