@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "common": {
+    "language": "zh-CN",
+    "defaultZoomPercent": 100,
+    "largeFileWarningMb": 25
+  },
+  "docx": {
+    "defaultFitWidth": false,
+    "showOutlineByDefault": true,
+    "enableImagePreview": true
+  },
+  "pptx": {
+    "defaultFitWindow": true,
+    "showNavigationByDefault": true,
+    "showNotesByDefault": false
+  },
+  "xlsx": {
+    "defaultFitWidth": true
+  },
+  "readingStates": [
+    {
+      "path": "build/IntentLock_Pitch_Deck.pptx",
+      "mtime": 1788626238078,
+      "format": "pptx",
+      "lastAccessed": 125,
+      "position": {
+        "scrollLeft": 0,
+        "scrollTop": 0,
+        "page": 1
+      },
+      "zoom": {
+        "scale": 2,
+        "fit": true
+      },
+      "navigation": {
+        "panelVisible": false,
+        "collapsedIds": [],
+        "notesVisible": false
+      }
+    }
+  ]
+}

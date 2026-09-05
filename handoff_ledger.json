@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "project": "PayoutProof",
+  "version": "0.1.0",
+  "policy_version": "PP-POLICY-V1",
+  "status": "IN_DEVELOPMENT",
+  "timestamp": "2026-09-02T08:58:00Z",
+  "owner": "Integration Agent",
+  "branch": "antigravity/mvp-implementation",
+  "notes": "Development ledger reflecting current repository reality: deterministic policy plumbing and invariant unit tests on synthetic cases with known gaps. Real multilingual voice models (ASR), anti-spoof diagnostics (AASIST), separated sealed media, immutable Evaluation Version, and human validation have not been executed.",
+  "modules": {
+    "core_schemas": {
+      "status": "UNIT_TESTED",
+      "path": "src/payoutproof/core/",
+      "contracts": [
+        "ProcessingAuthorityRecord",
+        "PaymentIntent",
+        "EvidenceItem",
+        "Finding",
+        "PolicyEvaluationResult",
+        "HandoffGrant",
+        "HandoffRecord",
+        "AuditEvent",
+        "CaseAuditCheckpoint",
+        "AuditTrustState",
+        "RiskCaseState"
+      ]
+    },
+    "admission": {
+      "status": "IN_DEVELOPMENT",
+      "path": "src/payoutproof/admission/",
+      "rules": "Enforces complete Processing Authority Record (permitted uses, route, redaction, bounded retention) and allowlisted non-empty evidence payload before opening a Risk Case. Persists only hashes and safe metadata.",
+      "known_gap": "Automated MIME detection is client-declared in MVP; media parsing and anti-spoofing diagnostics deferred to P0-2."
+    },
+    "intent_extraction_and_confirmation": {
+      "status": "UNIT_TESTED",
+      "path": "src/payoutproof/intent/",
+      "features": "INR normalization, candidate extraction, operator confirmation, material edit invalidation."
+    },
+    "deterministic_policy_gate": {
+      "status": "IN_DEVELOPMENT",
+      "path": "src/payoutproof/policy/",
+      "outcomes": [
+        "BLOCKED",
+        "HOLD",
+        "STEP_UP_REQUIRED",
+        "ELIGIBLE_FOR_HANDOFF"
+      ],
+      "evaluator": "Pure total deterministic Python evaluator over frozen snapshots.",
+      "known_gap": "Direct evaluation of unadmitted or rejected input preserves Admission Rejection semantics; snapshot hash re-verification across storage restarts remains in development."
+    },
+    "grants_and_hmac": {
+      "status": "IN_DEVELOPMENT",
+      "path": "src/payoutproof/grants/",
+      "security": "Single-use expiring HMAC-SHA256 grants with unique nonces and case/intent/snapshot hash binding.",
+      "known_gap": "Replay tracking relies on volatile memory and snapshot hash is not reverified on evaluation; partial unit coverage only."
+    },
+    "audit_hash_chain": {
+      "status": "IN_DEVELOPMENT",
+      "path": "src/payoutproof/audit/",
+      "properties": "Authoritative append-only SHA-256 audit_events ledger with authenticated case_audit_checkpoints HMAC-SHA256 MACs (PAYOUTPROOF_AUDIT_CHECKPOINT_V1) verifying tip hash, event count, and sequential integrity fail-closed.",
+      "known_gap": "Single-node SQLite checkpointing; distributed multi-node consensus remains a known gap deferred to later tickets."
+    },
+    "fake_action_adapter": {
+      "status": "IN_DEVELOPMENT",
+      "path": "src/payoutproof/adapters/",
+      "boundary": "Creates exactly one pending item in maker-checker approval rail; enforces replay rejection and ambiguity reconciliation. External payment adapters (RazorpayX) are explicitly deferred.",
+      "known_gap": "Server-owned handoff boundary is component-tested with atomic SQLite BEGIN IMMEDIATE transactions and durable replay records; production integration with live payment rails remains a known gap deferred to later tickets."
+    },
+    "persistence": {
+      "status": "IN_DEVELOPMENT",
+      "path": "src/payoutproof/storage/",
+      "engine": "SQLite WAL persistence for cases, grants, adapter attempts, and audit events.",
+      "known_gap": "adapter_attempts and pending_approval_items are written durably within atomic transactions; distributed multi-node consensus remains a known gap deferred to later tickets."
+    },
+    "simulator_oracle_scorer": {
+      "status": "IN_DEVELOPMENT",
+      "path": "src/payoutproof/simulator/, src/payoutproof/oracle/, src/payoutproof/scorer/",
+      "description": "Centralized EvaluationExecutionService running dev (45), sealed (90), and safety (81 repeated: 27 base cases x 3 repetitions) synthetic policy harnesses with zero mismatches and zero unsafe handoffs within the synthetic harness only. Held-out evaluation, real models, and human validation remain not executed."
+    },
+    "api_control_plane": {
+      "status": "IN_DEVELOPMENT",
+      "path": "src/payoutproof/api/",
+      "framework": "FastAPI with OpenAPI specification and CORS.",
+      "known_gap": "Admission authority bypass and mutable case transitions exposed via API endpoints; partial unit coverage only."
+    },
+    "web_presentation": {
+      "status": "IN_DEVELOPMENT",
+      "path": "web/",
+      "framework": "Vite + React + TypeScript with operator console, guided walkthroughs, and development policy harness runner.",
+      "known_gap": "Interactive review features in active development; paired human interaction reduction not yet evidenced."
+    }
+  },
+  "acceptance_gates": {
+    "zero_tolerance_safety_gate": {
+      "target": "0 Unsafe Handoffs across all cases and repeated runs",
+      "status": "NOT_RUN",
+      "notes": "Held-out target is NOT_RUN; only the 81 repeated synthetic safety executions (27 base cases × 3 repetitions) were verified."
+    },
+    "three_action_accuracy": {
+      "target": ">= 90.0%",
+      "status": "NOT_RUN",
+      "notes": "Target gate for held-out evaluation; not yet evidenced on real held-out corpus."
+    },
+    "protective_intervention_recall": {
+      "target": ">= 95.0%",
+      "status": "NOT_RUN",
+      "notes": "Target gate for held-out evaluation; not yet evidenced on real held-out corpus."
+    },
+    "intent_binding_correctness": {
+      "target": ">= 95.0%",
+      "status": "NOT_RUN",
+      "notes": "Target gate for held-out evaluation; not yet evidenced on real held-out corpus."
+    },
+    "operator_interaction_reduction": {
+      "target": ">= 30.0%",
+      "status": "NOT_RUN",
+      "notes": "Target gate for paired workflow comparison; not yet evidenced with human reviewers."
+    },
+    "tamper_detection_gate": {
+      "target": "Corrupted audit sequences detected and flagged as invalid",
+      "status": "IN_DEVELOPMENT",
+      "notes": "Verified in unit suite: authenticated case_audit_checkpoints HMAC-SHA256 fail-closed on tail truncation, interior deletion, row tampering, sequence reordering, and cross-case events; distributed multi-node consensus remains a known gap."
+    },
+    "replay_prevention_gate": {
+      "target": "Replay of consumed grant or duplicate idempotency key rejected",
+      "status": "IN_DEVELOPMENT",
+      "notes": "Partial unit checks with known gaps: durable SQLite replay prevention, restart safety, and multi-instance concurrency verified in unit tests; distributed multi-node consensus remains a known gap."
+    }
+  },
+
+  "verified_commands": [
+    "UV_CACHE_DIR=/private/tmp/payoutproof-uv-cache PYTHONDONTWRITEBYTECODE=1 uv run pytest -q -p no:cacheprovider",
+    "npm run build"
+  ],
+  "planned_acceptance_commands": [
+    "uv run payoutproof eval --suite dev",
+    "uv run payoutproof eval --suite sealed",
+    "uv run payoutproof eval --suite safety"
+  ]
+}

@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches-ignore:
+      - main
+  pull_request:
+
+jobs:
+  backend-and-eval:
+    name: Backend, Lints & Synthetic Evaluation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Verify Python lockfile integrity
+        run: uv lock --check
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+
+      - name: Run static analysis with ruff
+        run: uv run ruff check src tests scripts
+
+      - name: Run unit and integration tests
+        run: uv run pytest -q -p no:cacheprovider
+
+      - name: Run synthetic evaluation suite (dev)
+        run: uv run payoutproof eval --suite dev
+
+      - name: Run synthetic evaluation suite (sealed)
+        run: uv run payoutproof eval --suite sealed
+
+      - name: Run synthetic evaluation suite (safety)
+        run: uv run payoutproof eval --suite safety
+
+      - name: Generate and verify Software Bill of Materials (SBOM)
+        run: |
+          mkdir -p build
+          uv run python scripts/generate_sbom.py --format cyclonedx --output build/sbom.cdx.json
+          uv run python scripts/generate_sbom.py --format spdx --output build/sbom.spdx.json
+
+  frontend:
+    name: Frontend Types & Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Verify npm package-lock integrity
+        run: npm --prefix web ci --dry-run
+
+      - name: Install frontend dependencies
+        run: npm --prefix web ci
+
+      - name: Run TypeScript type-check and Vite production build
+        run: npm --prefix web run build
+
+  container:
+    name: Container Build Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker container image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: payoutproof:pilot
