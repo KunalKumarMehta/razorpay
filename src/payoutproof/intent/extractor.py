@@ -99,47 +99,104 @@ def confirm_intent(intent: PaymentIntent) -> PaymentIntent:
     )
 
 
-def modify_intent(
+def correct_intent(
     intent: PaymentIntent,
     counterparty: Optional[str] = None,
     destination: Optional[str] = None,
     amount: Optional[str] = None,
+    currency: Optional[str] = None,
     purpose: Optional[str] = None,
+    instruction_reference: Optional[str] = None,
+    reason: Optional[str] = None,
 ) -> Tuple[PaymentIntent, bool]:
-    """Apply an edit to a Payment Intent.
+    """Correct extracted fields on a Payment Intent.
 
-    If any material field changed, marks status as INVALIDATED and clears intent_hash.
+    If intent was already CONFIRMED and a material field changed, its status transitions
+    to INVALIDATED and intent_hash is cleared.
+    If intent was EXTRACTED or INVALIDATED, it updates fields and keeps status as EXTRACTED,
+    ready for review and explicit confirmation.
     Returns (new_intent, was_material_change).
     """
     new_counterparty = counterparty if counterparty is not None else intent.counterparty
     new_destination = destination if destination is not None else intent.destination
     new_amount = normalize_inr_amount(amount) if amount is not None else intent.amount
+    new_currency = currency if currency is not None else intent.currency
     new_purpose = purpose if purpose is not None else intent.purpose
+    new_ref = instruction_reference if instruction_reference is not None else intent.instruction_reference
 
     is_material = (
         new_counterparty != intent.counterparty or
         new_destination != intent.destination or
         new_amount != intent.amount or
-        new_purpose != intent.purpose
+        new_currency != intent.currency or
+        new_purpose != intent.purpose or
+        new_ref != intent.instruction_reference
     )
 
-    if is_material:
-        new_status = IntentStatus.INVALIDATED
-        new_hash = None
+    new_provenance = list(intent.provenance)
+    if reason:
+        new_provenance.append(f"operator_correction:{reason}")
+
+    if intent.status == IntentStatus.CONFIRMED:
+        new_status = IntentStatus.INVALIDATED if is_material else intent.status
+        new_hash = None if is_material else intent.intent_hash
     else:
-        new_status = intent.status
-        new_hash = intent.intent_hash
+        new_status = IntentStatus.EXTRACTED
+        new_hash = None
 
     new_intent = PaymentIntent(
         counterparty=new_counterparty,
         destination=new_destination,
         destination_status=intent.destination_status,
         amount=new_amount,
-        currency=intent.currency,
+        currency=new_currency,
         purpose=new_purpose,
-        instruction_reference=intent.instruction_reference,
-        provenance=intent.provenance,
+        instruction_reference=new_ref,
+        provenance=new_provenance,
         status=new_status,
         intent_hash=new_hash,
     )
     return new_intent, is_material
+
+
+def modify_intent(
+    intent: PaymentIntent,
+    counterparty: Optional[str] = None,
+    destination: Optional[str] = None,
+    amount: Optional[str] = None,
+    purpose: Optional[str] = None,
+    currency: Optional[str] = None,
+    instruction_reference: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> Tuple[PaymentIntent, bool]:
+    """Apply an edit to a Payment Intent (backwards-compatible alias)."""
+    return correct_intent(
+        intent=intent,
+        counterparty=counterparty,
+        destination=destination,
+        amount=amount,
+        currency=currency,
+        purpose=purpose,
+        instruction_reference=instruction_reference,
+        reason=reason,
+    )
+
+
+def invalidate_intent(
+    intent: PaymentIntent,
+    reason: str = "Operator manual invalidation",
+) -> PaymentIntent:
+    """Explicitly invalidate a Payment Intent and revoke frozen hash identity."""
+    new_provenance = list(intent.provenance) + [f"invalidation:{reason}"]
+    return PaymentIntent(
+        counterparty=intent.counterparty,
+        destination=intent.destination,
+        destination_status=intent.destination_status,
+        amount=intent.amount,
+        currency=intent.currency,
+        purpose=intent.purpose,
+        instruction_reference=intent.instruction_reference,
+        provenance=new_provenance,
+        status=IntentStatus.INVALIDATED,
+        intent_hash=None,
+    )
