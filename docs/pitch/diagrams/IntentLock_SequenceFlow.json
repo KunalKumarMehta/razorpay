@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "IntentLock: Operational Flow & Fault-Tolerant Replay Prevention",
+    "output": "build/diagrams/IntentLock_SequenceFlow.html",
+    "viewBox": [820, 840],
+    "animation": "trace",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "intent-grounding",
+        "label": "Evidence Grounding & Freeze",
+        "focus": ["operator", "trust_agent", "policy_gate"],
+        "note": "Operator reviews grounded spans and freezes the immutable SHA-256 Intent Hash."
+      },
+      {
+        "id": "step-up-approval",
+        "label": "Step-Up & Controller Approval",
+        "focus": ["policy_gate", "controller", "operator"],
+        "note": "Unapproved destinations require independent callback and controller sign-off."
+      },
+      {
+        "id": "safe-failure",
+        "label": "Handoff & Fault-Tolerant Replay Prevention",
+        "focus": ["operator", "hmac_rail", "razorpayx"],
+        "note": "Timeouts transition to Reconciliation Required, burning the grant and blocking duplicate payouts."
+      }
+    ]
+  },
+  "participants": [
+    { "id": "operator", "type": "external", "label": "Operator", "sublabel": "Accounts Desk" },
+    { "id": "trust_agent", "type": "backend", "label": "Trust Agent", "sublabel": "Lane 1: Read-Only" },
+    { "id": "policy_gate", "type": "security", "label": "Policy Gate", "sublabel": "Lane 2: Rule Core" },
+    { "id": "controller", "type": "external", "label": "Controller", "sublabel": "Finance Approver" },
+    { "id": "hmac_rail", "type": "security", "label": "HMAC Rail", "sublabel": "Lane 3: 15m Grant" },
+    { "id": "razorpayx", "type": "cloud", "label": "RazorpayX", "sublabel": "Payout Rail" }
+  ],
+  "segments": [
+    { "from": 150, "to": 290, "label": "Intent Grounding" },
+    { "from": 310, "to": 510, "label": "Step-Up & Dual Sign-Off" },
+    { "from": 530, "to": 740, "label": "Handoff & Safe Failure" }
+  ],
+  "messages": [
+    { "from": "operator", "to": "trust_agent", "y": 180, "label": "upload audio note", "variant": "emphasis" },
+    { "from": "trust_agent", "to": "operator", "y": 224, "label": "extracted spans", "variant": "return" },
+    { "from": "operator", "to": "policy_gate", "y": 268, "label": "freeze intent hash", "variant": "security" },
+    { "from": "policy_gate", "to": "controller", "y": 332, "label": "STEP_UP_REQUIRED", "variant": "security" },
+    { "from": "controller", "to": "policy_gate", "y": 380, "label": "out-of-band verified", "variant": "default" },
+    { "from": "controller", "to": "policy_gate", "y": 428, "label": "approve destination", "variant": "emphasis" },
+    { "from": "policy_gate", "to": "operator", "y": 476, "label": "ELIGIBLE_FOR_HANDOFF", "variant": "return" },
+    { "from": "operator", "to": "hmac_rail", "y": 552, "label": "claim handoff grant", "variant": "security" },
+    { "from": "hmac_rail", "to": "razorpayx", "y": 604, "label": "dispatch maker payout", "variant": "emphasis" },
+    { "from": "razorpayx", "to": "hmac_rail", "y": 652, "label": "gateway timeout / drop", "variant": "return" },
+    { "from": "hmac_rail", "to": "operator", "y": 704, "label": "burn HMAC -> RECONCILIATION", "variant": "security" }
+  ],
+  "activations": [
+    { "participant": "operator", "from": 174, "to": 274, "type": "external" },
+    { "participant": "trust_agent", "from": 176, "to": 230, "type": "backend" },
+    { "participant": "policy_gate", "from": 264, "to": 482, "type": "security" },
+    { "participant": "controller", "from": 328, "to": 434, "type": "external" },
+    { "participant": "operator", "from": 546, "to": 712, "type": "external" },
+    { "participant": "hmac_rail", "from": 548, "to": 710, "type": "security" },
+    { "participant": "razorpayx", "from": 600, "to": 658, "type": "cloud" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "3 Human Gestures", "items": ["Gesture 1: Operator reviews evidence spans & freezes SHA-256 intent hash", "Gesture 2: Out-of-band phone verification recorded by Controller", "Gesture 3: Controller approves destination registry transition"] },
+    { "dot": "rose", "title": "Deterministic Escalation", "items": ["Unapproved vendors halt workflow at STEP_UP_REQUIRED", "AI agent cannot bypass policy rules or self-approve", "Full cryptographic event chain recorded in SQLite audit ledger"] },
+    { "dot": "emerald", "title": "Safe Failure Invariant", "items": ["Network or gateway timeout transitions to RECONCILIATION_REQUIRED", "Single-use HMAC grant is permanently burned to prevent duplicate dispatch", "Uncertainty never becomes permission: zero blind retries allowed"] }
+  ]
+}

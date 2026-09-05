@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "README.md",
+                "file": "Pitch_Script.md",
                 "mode": "preview",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "README"
+              "title": "Pitch_Script"
             }
           }
         ]
@@ -189,19 +189,27 @@
       "obsidian-git:Open Git source control": false
     }
   },
-  "active": "7adaca9c1b325e89",
+  "active": "5367de7c6451ad3b",
   "lastOpenFiles": [
-    "handoff_ledger.json",
-    ".obsidian/plugins/code-emitter/styles.css",
-    ".obsidian/plugins/code-emitter/main.js",
-    "web/dist/assets/index-CMiFkydn.js",
-    "web/dist/assets/index-C6sZygo7.css",
-    "web/dist/index.html",
-    "web/dist/assets",
-    "web/dist",
-    ".obsidian/plugins/code-emitter/manifest.json",
-    ".obsidian/plugins/code-emitter",
-    "web/src/main.tsx",
+    ".ruff_cache/0.16.5/10022017818786839567",
+    "web/dist/assets/index-ahaKn9Ze.js",
+    "build/assets/slide_bg_content.png",
+    "Pitch_Script.md",
+    "docs/pitch/IntentLock_Pitch_Voiceover.mp3",
+    "docs/pitch/IntentLock_Pitch_Deck.pptx",
+    "docs/pitch/index.html",
+    "docs/pitch/IntentLock_Interactive_Pitch.html",
+    "docs/pitch/diagrams/IntentLock_SequenceFlow.png",
+    "docs/pitch/diagrams/IntentLock_SequenceFlow.html",
+    "docs/pitch/diagrams/IntentLock_SequenceFlow_Dark.png",
+    "docs/pitch/diagrams/IntentLock_Architecture.json",
+    "docs/pitch/diagrams/IntentLock_SequenceFlow.json",
+    "docs/pitch/diagrams/IntentLock_Architecture_Dark.png",
+    "docs/pitch/diagrams/IntentLock_Architecture.png",
+    "docs/pitch/diagrams/IntentLock_Architecture.html",
+    "docs/pitch/diagrams",
+    "README.md",
+    "docs/pitch/PITCH_SCRIPT.md",
     "web/node_modules/@esbuild/darwin-arm64/README.md",
     "web/node_modules/typescript/SECURITY.md",
     "web/node_modules/typescript/README.md",
@@ -223,9 +231,6 @@
     "web/node_modules/escalade/readme.md",
     "web/node_modules/js-tokens/README.md",
     "web/node_modules/yallist/README.md",
-    "web/node_modules/@babel/parser/README.md",
-    "web/node_modules/picocolors/README.md",
-    "web/node_modules/@babel/core/README.md",
-    "web/node_modules/@types/prop-types/README.md"
+    "web/node_modules/@babel/parser/README.md"
   ]
 }

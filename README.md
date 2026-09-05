@@ -1,45 +1,58 @@
-# PayoutProof
+# IntentLock
 
-**Trust Agent & Deterministic Policy Gate for Payment Risk**  
-*Razorpay Buildathon MVP Implementation*
+**Zero-Trust Policy Gate for High-Risk Payouts**  
+*Razorpay AI Buildathon 2026 • Track 2: AI Risk Manager*
 
 ---
 
-## Architecture Overview
+## Executive Summary
 
-PayoutProof converts urgent, out-of-band payout instructions into auditable Risk Cases and submits the exact Payment Intent to a deterministic Policy Gate before it can enter an existing maker-checker approval rail.
+**IntentLock** intercepts deepfake voice notes, urgent social engineering, and unauthorized recipient tampering before payment instructions reach RazorpayX rails.
+
+Emerging autonomous AI agents are being granted raw financial execution credentials—a catastrophic design flaw in real-time settlement rails (IMPS/UPI) where there is no recall or "Ctrl-Z". IntentLock enforces our core design thesis:
+
+> **Never let an LLM touch the financial trigger.**
+
+IntentLock divides the entire payment lifecycle into three hard-bounded authority lanes:
+1. **Lane 1: Trust Agent (Read-Only LLM)**: Ingests multimodal voice notes, screenshots, and invoices under DPDP admission rules. Transcribes audio, extracts candidate entities, and grounds every field to verbatim evidence spans. Crucially, Lane 1 holds **zero financial execution permissions**.
+2. **Lane 2: Deterministic Policy Gate**: The operator reviews the extracted intent and clicks Confirm, freezing an immutable **SHA-256 Intent Hash**. A 100% deterministic Python rule engine verifies the counterparty against an approved bank registry. Unapproved beneficiaries immediately halt execution at `STEP_UP_REQUIRED`, mandating independent out-of-band callback and dual controller approval.
+3. **Lane 3: Maker-Checker Rail**: Once approved, IntentLock issues a single-use, 15-minute **HMAC-SHA256 Handoff Grant**. An idempotent action adapter submits exactly one pending item to RazorpayX's Maker-Checker queue. Final execution authority rests solely with RazorpayX.
+
+---
+
+## System Architecture
 
 ```
-[ Ingested Voice / Message / Evidence ]
+[ Ingested Voice / WhatsApp / Evidence ]
                    │
                    ▼
 ┌──────────────────────────────────────────────┐
-│  Admission Control (Processing Authority)    │ ─── (Invalid) ──► Admission Rejection (No Case)
+│  Lane 1: DPDP Admission & Privacy Gate       │ ─── (Invalid) ──► Admission Rejection (No Disk Leak)
 └──────────────────────────────────────────────┘
-                   │ (Valid)
+                   │ (Admitted)
                    ▼
 ┌──────────────────────────────────────────────┐
-│  Trust Agent (Extraction & Candidate Spans)  │
-└──────────────────────────────────────────────┘
-                   │
-                   ▼
-┌──────────────────────────────────────────────┐
-│  Human Confirmation & Intent Hash Freeze     │
+│  Lane 1: Trust Agent (Extraction & Grounding)│ ───► Verbatim Evidence Spans (Zero Money Authority)
 └──────────────────────────────────────────────┘
                    │
                    ▼
 ┌──────────────────────────────────────────────┐
-│  Deterministic Policy Gate Evaluator         │ ───► BLOCKED | HOLD | STEP_UP_REQUIRED
+│  Human Confirmation & Intent Hash Freeze     │ ───► Immutable SHA-256 Intent Hash
+└──────────────────────────────────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────────────┐
+│  Lane 2: Deterministic Policy Gate Core      │ ───► BLOCKED | HOLD | STEP_UP_REQUIRED
 └──────────────────────────────────────────────┘
                    │ (ELIGIBLE_FOR_HANDOFF)
                    ▼
 ┌──────────────────────────────────────────────┐
-│  Single-Use Expiring HMAC Handoff Grant      │
+│  Lane 3: Single-Use HMAC-SHA256 Grant        │ ───► 15-Minute TTL (Bound to Intent Hash)
 └──────────────────────────────────────────────┘
                    │
                    ▼
 ┌──────────────────────────────────────────────┐
-│  Action Adapter (Idempotent Rail Submission) │ ───► Pending Item in Maker-Checker Rail
+│  Lane 3: Idempotent Action Adapter           │ ───► Pending Item in RazorpayX Maker-Checker Queue
 └──────────────────────────────────────────────┘
 ```
 
@@ -47,13 +60,13 @@ PayoutProof converts urgent, out-of-band payout instructions into auditable Risk
 > **Durable Replay & Atomic Handoff Slice**: Handoff attempts execute within an explicit SQLite `BEGIN IMMEDIATE` transaction. Grants are conditionally claimed (`used = 0 AND status = 'ACTIVE'`). Server-owned idempotency keys are deterministically derived from tenant/case/version/grant data. Attempts and pending maker-checker approval items are durably recorded in SQLite, surviving restarts while refusing duplicate submissions and blind ambiguity retries.
 
 > [!NOTE]
-> **Authenticated Authoritative Audit Checkpoints (P0-3C)**: The `audit_events` table is the sole authoritative audit store. `risk_cases.state_json` never stores or trusts audit data (`state_json["audit"] = []`), and `load_case` hydrates strictly from verified `audit_events` rows against authenticated checkpoints in `case_audit_checkpoints`. Checkpoints verify tip hash, event count, and sequence continuity via HMAC-SHA256 (`PAYOUTPROOF_AUDIT_CHECKPOINT_V1`). Any tail deletion, event truncation, row tampering, sequence reordering, or cross-case event fails closed immediately with `AuditLedgerIntegrityError`. Legacy uncheckpointed cases are quarantined as `LEGACY_UNTRUSTED` on database migration.
+> **Authenticated Authoritative Audit Checkpoints**: The `audit_events` table is the sole authoritative audit store. `risk_cases.state_json` never stores or trusts audit data (`state_json["audit"] = []`), and `load_case` hydrates strictly from verified `audit_events` rows against authenticated checkpoints in `case_audit_checkpoints`. Checkpoints verify tip hash, event count, and sequence continuity via HMAC-SHA256 (`PAYOUTPROOF_AUDIT_CHECKPOINT_V1`). Any tail deletion, event truncation, row tampering, sequence reordering, or cross-case event fails closed immediately with `AuditLedgerIntegrityError`.
 
 ---
 
 ## Configuration & Secret Composition
 
-PayoutProof enforces strict secret composition with immutable, redacted configuration (`AppConfig`).
+IntentLock enforces strict secret composition with immutable, redacted configuration (`AppConfig`).
 
 ### Environment Variables
 
@@ -87,54 +100,51 @@ For local evaluation and interactive UI inspection, you can enable development m
 export PAYOUTPROOF_ENV="development"
 ```
 
-> [!WARNING]
-> In development mode, missing secrets are generated as process-ephemeral secure random strings. A one-time warning is printed to `stderr`:
-> `WARNING: PAYOUTPROOF_ENV=development generated process-ephemeral secrets; restarting the process will invalidate active grants and audit checkpoints.`
-> Because ephemeral secrets reside in memory, restarting the process invalidates all previously issued grants and audit checkpoints. Explicitly supplied secrets still validate strictly.
-
 ---
 
 ## Quick Start & Verification
 
-### 1. Run Automated Test Suite (Unit & Boundary Invariants)
+### 1. Run Automated Test Suite (403 Tests)
 
 ```bash
-UV_CACHE_DIR=/private/tmp/payoutproof-uv-cache PYTHONDONTWRITEBYTECODE=1 uv run pytest -q -p no:cacheprovider
+uv run pytest
 ```
 
-### 2. Run Development Policy Harness (Synthetic Structured Cases)
+### 2. Run Synthetic Policy Evaluation Harnesses
 
 > [!NOTE]
 > The evaluation harness runner exercises deterministic policy plumbing and boundary invariants against synthetic structured test cases (45 dev, 90 sealed, and 81 repeated safety executions: 27 synthetic base cases × 3 repetitions). All dev, sealed, and safety corpora are deterministic synthetic structured policy-plumbing harnesses—not held-out data, real media/models, human validation, real-world performance, or product proof. Real multilingual ASR and AASIST runs, separated sealed media, an immutable Evaluation Version, raw outputs, and a release manifest are not yet evidenced.
 
 ```bash
 # 45-case development policy harness (synthetic cases)
-uv run payoutproof eval --suite dev
+uv run intentlock eval --suite dev
 
 # 90-case synthetic policy plumbing harness
-uv run payoutproof eval --suite sealed
+uv run intentlock eval --suite sealed
 
 # 81-execution critical safety invariant harness (27 synthetic base cases × 3 repetitions)
-uv run payoutproof eval --suite safety
+uv run intentlock eval --suite safety
 ```
 
 ### 3. Start Local Control Plane & Web Presentation
 
 ```bash
 # In terminal 1: Start FastAPI control plane API
-uv run payoutproof serve --port 8000
+uv run intentlock serve --port 8000
 
-# In terminal 2: Start Vite React Frontend
+# In terminal 2: Start Vite React Frontend Operator Console
 cd web && npm run dev
 ```
 
-Visit `http://localhost:3000` to interact with the Operator Console and development policy harness runner.
+Visit `http://localhost:3000` to interact with the IntentLock Operator Console.
 
-### 4. Verify Authenticated Audit Chain Integrity
+### 4. Interactive Diagrams & Presentation Deck
 
-```bash
-uv run payoutproof verify-audit --case-id <case-id>
-```
+- **Interactive Pitch Presenter**: Open [`build/IntentLock_Interactive_Pitch.html`](build/IntentLock_Interactive_Pitch.html) in any web browser.
+- **3-Lane Architecture Diagram**: Open [`build/diagrams/IntentLock_Architecture.html`](build/diagrams/IntentLock_Architecture.html).
+- **Sequence & Safe Failure Flow**: Open [`build/diagrams/IntentLock_SequenceFlow.html`](build/diagrams/IntentLock_SequenceFlow.html).
+- **Pitch Deck (PowerPoint)**: [`build/IntentLock_Pitch_Deck.pptx`](build/IntentLock_Pitch_Deck.pptx).
+- **Spoken Teleprompter Script**: [`Pitch_Script.md`](Pitch_Script.md) (formatted for Obsidian).
 
 ---
 
@@ -158,11 +168,7 @@ See [handoff_ledger.json](./handoff_ledger.json) for the machine-readable develo
 
 ---
 
-## Reproducible Pilot Baseline & Supply Chain
-
-### 1. Clean-Checkout Verification Commands
-
-Every pilot baseline artifact is reproducible from a clean checkout without ad-hoc network access:
+## Reproducible Supply Chain & Build Verification
 
 ```bash
 # 1. Verify dependency lockfile integrity (both Python and Node)
@@ -172,62 +178,18 @@ npm --prefix web ci --dry-run
 # 2. Run static analysis and formatting checks
 uv run ruff check src tests scripts
 
-# 3. Execute unit and integration tests (281 tests)
-uv run pytest -q -p no:cacheprovider
-
-# 4. Run synthetic evaluation harnesses across all suites
-uv run payoutproof eval --suite dev
-uv run payoutproof eval --suite sealed
-uv run payoutproof eval --suite safety
-
-# 5. Build frontend production assets
-npm --prefix web run build
-```
-
-### 2. Secret-Free Release Metadata Endpoints
-
-PayoutProof exposes stable release and provenance identifiers across public boundaries without leaking secrets, credentials, or machine paths:
-
-- **`GET /api/health`**: Returns service liveness, capability status, database WAL status, and the `release` block.
-- **`GET /api/release`**: Returns the secret-free release identity payload:
-  - `application_version`: Mirrored from `pyproject.toml` (`0.1.0`).
-  - `policy_version`: Deterministic Policy Gate identifier (`PP-POLICY-V1`).
-  - `schema_version`: Authoritative persistence schema version (`PP-SCHEMA-V1`).
-  - `audit_checkpoint_version`: Audit checkpoint domain separator (`PAYOUTPROOF_AUDIT_CHECKPOINT_V1`).
-  - `model_configuration_version`: Bound model configuration (`PP-MODEL-CONFIG-V1-SYNTHETIC-STRUCTURED`).
-  - `evaluation_version`: Immutable Evaluation Version (`PP-EVAL-V1-SYNTHETIC-STRUCTURED`).
-  - `evidence_scope`: Scope declaration (`SYNTHETIC_INVARIANT_HARNESS_ONLY_NOT_HELD_OUT`).
-  - `maturity`: Pipeline maturity (`IN_DEVELOPMENT`).
-
-### 3. Automated Software Bill of Materials (SBOM)
-
-An offline, reproducible SBOM generator parses `uv.lock` and `web/package-lock.json` to produce CycloneDX 1.5 and SPDX 2.3 JSON documents:
-
-```bash
-# Generate CycloneDX 1.5 JSON SBOM
+# 3. Generate CycloneDX 1.5 JSON SBOM
 uv run python scripts/generate_sbom.py --format cyclonedx --output build/sbom.cdx.json
 
-# Generate SPDX 2.3 JSON SBOM
+# 4. Generate SPDX 2.3 JSON SBOM
 uv run python scripts/generate_sbom.py --format spdx --output build/sbom.spdx.json
+
+# 5. Build pinned production container
+docker build -t intentlock:pilot .
 ```
-
-### 4. Pinned Container Build
-
-The application container is defined in a multi-stage `Dockerfile` with pinned base images (`python:3.11.9-slim-bookworm` and `node:20.15.1-bookworm-slim`), unprivileged execution user (`appuser:10001`), and healthcheck probes:
-
-```bash
-docker build -t payoutproof:pilot .
-```
-
-### 5. Branch Protection & Promotion Discipline
-
-- The protected `main` branch remains untouched (`aa3bd57`).
-- Branch protection discipline ensures all development proceeds through dedicated review.
-- Evaluation results honestly declare synthetic scope; no held-out claims or unverified pilot certifications are published.
 
 ---
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
-
+This project is open source and licensed under the [MIT License](LICENSE).

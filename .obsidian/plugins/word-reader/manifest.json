@@ -1,0 +1,10 @@
+{
+  "id": "word-reader",
+  "name": "Office Reader",
+  "version": "3.5.0",
+  "minAppVersion": "1.12.7",
+  "description": "Open .docx, .pptx, and .xlsx files as safe, read-only documents.",
+  "author": "qianw",
+  "authorUrl": "https://github.com/qianwei4712",
+  "isDesktopOnly": true
+}

@@ -1,7 +1,7 @@
 [project]
 name = "payoutproof"
 version = "0.1.0"
-description = "PayoutProof: Trust Agent and Deterministic Policy Gate for Payment Risk"
+description = "IntentLock: Zero-Trust Policy Gate for High-Risk Payouts"
 readme = "README.md"
 authors = [
     { name = "KunalKumarMehta", email = "kunalkumarmehta.pro+github@gmail.com" }
@@ -26,6 +26,7 @@ dev = [
 ]
 
 [project.scripts]
+intentlock = "payoutproof.cli:main"
 payoutproof = "payoutproof.cli:main"
 
 [build-system]

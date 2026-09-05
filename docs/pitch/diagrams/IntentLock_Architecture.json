@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "IntentLock Architecture: 3 Hard Authority Lanes",
+    "output": "build/diagrams/IntentLock_Architecture.html",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "full-flow",
+        "label": "Full Authority Separation",
+        "focus": ["evidence", "privacy_gate", "trust_agent", "intent_freeze", "policy_gate", "step_up", "hmac_issuer", "action_adapter", "razorpayx"],
+        "note": "Untrusted inputs undergo privacy gating, deterministic policy rules, and single-use HMAC authorization before RazorpayX dispatch."
+      }
+    ]
+  },
+  "components": [
+    { "id": "evidence", "type": "external", "label": "Ingested Evidence", "sublabel": "Voice Notes • WhatsApp", "pos": [40, 280], "size": [140, 62] },
+    { "id": "privacy_gate", "type": "security", "label": "DPDP Privacy Gate", "sublabel": "Authority Admission", "pos": [250, 280], "size": [150, 62], "tag": "Gate" },
+    { "id": "trust_agent", "type": "backend", "label": "Lane 1: Trust Agent", "sublabel": "Span Extraction", "pos": [470, 280], "size": [160, 62], "tag": "Read-Only" },
+    { "id": "intent_freeze", "type": "security", "label": "Operator Freeze", "sublabel": "SHA-256 Intent Hash", "pos": [700, 280], "size": [160, 62], "tag": "Gesture 1" },
+    { "id": "policy_gate", "type": "backend", "label": "Lane 2: Policy Gate", "sublabel": "Deterministic Core", "pos": [930, 280], "size": [160, 62], "tag": "Registry" },
+    { "id": "step_up", "type": "security", "label": "Step-Up Verification", "sublabel": "Dual Approval", "pos": [930, 120], "size": [160, 62], "tag": "Gestures 2 & 3" },
+    { "id": "hmac_issuer", "type": "security", "label": "Lane 3: HMAC Issuer", "sublabel": "Single-Use 15m Token", "pos": [1160, 280], "size": [150, 62], "tag": "Crypto Grant" },
+    { "id": "action_adapter", "type": "backend", "label": "Action Adapter", "sublabel": "Idempotent Adapter", "pos": [1160, 440], "size": [150, 62], "tag": "Anti-Replay" },
+    { "id": "razorpayx", "type": "cloud", "label": "RazorpayX Rails", "sublabel": "Maker-Checker Queue", "pos": [1380, 280], "size": [150, 62], "tag": "Execution" }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "Lane 1: Untrusted Ingestion & LLM Inference", "wraps": ["evidence", "privacy_gate", "trust_agent"] },
+    { "kind": "security-group", "label": "Lane 2: Deterministic Policy & Registry Verification", "wraps": ["intent_freeze", "policy_gate", "step_up"] },
+    { "kind": "region", "label": "Lane 3: Idempotent Execution & RazorpayX Rails", "wraps": ["hmac_issuer", "action_adapter", "razorpayx"] }
+  ],
+  "connections": [
+    { "from": "evidence", "to": "privacy_gate", "label": "intake", "variant": "emphasis" },
+    { "from": "privacy_gate", "to": "trust_agent", "label": "admit", "variant": "security" },
+    { "from": "trust_agent", "to": "intent_freeze", "label": "spans", "variant": "default" },
+    { "from": "intent_freeze", "to": "policy_gate", "label": "hash", "variant": "security" },
+    { "from": "policy_gate", "to": "step_up", "label": "step-up", "variant": "security", "fromSide": "top", "toSide": "bottom" },
+    { "from": "step_up", "to": "hmac_issuer", "label": "verified", "variant": "emphasis", "fromSide": "right", "toSide": "top" },
+    { "from": "policy_gate", "to": "hmac_issuer", "label": "eligible", "variant": "emphasis" },
+    { "from": "hmac_issuer", "to": "action_adapter", "label": "grant", "variant": "security", "fromSide": "bottom", "toSide": "top", "labelDy": 24 },
+    { "from": "action_adapter", "to": "razorpayx", "label": "dispatch", "variant": "emphasis", "fromSide": "right", "toSide": "bottom" }
+  ],
+  "cards": [
+    { "dot": "rose", "title": "Lane 1: Trust Agent", "items": ["Extracts payment intent under DPDP admission", "Grounds entities to verbatim evidence spans", "Zero financial authority: cannot call payout APIs"] },
+    { "dot": "cyan", "title": "Lane 2: Policy Gate", "items": ["Operator locks immutable SHA-256 intent hash", "Pure Python rules evaluate approved beneficiaries", "Unapproved accounts require dual human sign-off"] },
+    { "dot": "emerald", "title": "Lane 3: Maker-Checker Rail", "items": ["Single-use HMAC token valid for 15 minutes", "One-shot handoff to RazorpayX approval queue", "Network timeout triggers reconciliation lock"] }
+  ]
+}

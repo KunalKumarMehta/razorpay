@@ -1,0 +1,875 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IntentLock — Interactive Pitch & Live Demo Presenter</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-canvas: #050811;
+      --card-bg: #0C1427;
+      --card-border: #1E3050;
+      --text-main: #F8FAFC;
+      --text-muted: #94A3B8;
+      --accent-blue: #388CFF;
+      --accent-cyan: #00D2FF;
+      --accent-green: #10D990;
+      --accent-amber: #FFB300;
+      --accent-red: #FF5757;
+      --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg-canvas);
+      color: var(--text-main);
+      font-family: var(--font-sans);
+      overflow: hidden;
+      height: 100vh;
+      width: 100vw;
+      display: flex;
+      flex-direction: column;
+      user-select: none;
+    }
+
+    /* Top Bar */
+    .topbar {
+      height: 48px;
+      background: #080D1A;
+      border-bottom: 1px solid #16243D;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 20px;
+      z-index: 100;
+      flex-shrink: 0;
+    }
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .badge-track {
+      background: rgba(0, 210, 255, 0.12);
+      border: 1px solid rgba(0, 210, 255, 0.35);
+      color: var(--accent-cyan);
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 10px;
+      border-radius: 6px;
+      letter-spacing: 0.04em;
+    }
+    .brand-title {
+      font-weight: 800;
+      font-size: 17px;
+      letter-spacing: -0.02em;
+      color: #fff;
+    }
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      font-size: 13px;
+    }
+    .mode-indicator {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+    .mode-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent-green);
+      box-shadow: 0 0 8px var(--accent-green);
+    }
+
+    /* Slide Deck Viewport */
+    .slide-viewport {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: radial-gradient(circle at 50% 25%, #0B1630 0%, #050811 75%);
+    }
+    .slide {
+      position: absolute;
+      inset: 0;
+      padding: 28px 48px 96px;
+      display: none;
+      flex-direction: column;
+      opacity: 0;
+      transform: scale(0.985);
+      transition: opacity 0.28s ease, transform 0.28s ease;
+    }
+    .slide.active {
+      display: flex;
+      opacity: 1;
+      transform: scale(1);
+    }
+
+    /* Slide Content Typography */
+    .slide-header {
+      margin-bottom: 24px;
+      flex-shrink: 0;
+    }
+    .slide-category {
+      color: var(--accent-cyan);
+      font-size: 11.5px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      margin-bottom: 6px;
+    }
+    .slide-title {
+      font-size: 32px;
+      font-weight: 800;
+      color: #fff;
+      letter-spacing: -0.02em;
+      line-height: 1.2;
+    }
+    .slide-subtitle {
+      font-size: 15px;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+
+    /* Card Layouts */
+    .card-grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 20px;
+      flex: 1;
+    }
+    .card-grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 24px;
+      flex: 1;
+    }
+    .split-view {
+      display: grid;
+      grid-template-columns: 1.6fr 1fr;
+      gap: 24px;
+      flex: 1;
+      height: calc(100% - 75px);
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
+    }
+    .card-title {
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .card-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .card-list li strong {
+      color: #fff;
+      display: block;
+      margin-bottom: 2px;
+    }
+    .card-list li span {
+      color: var(--text-muted);
+    }
+
+    /* Live Interactive Diagram Frame */
+    .diagram-frame-wrapper {
+      background: #080D1A;
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      overflow: hidden;
+      position: relative;
+      height: 100%;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    }
+    .diagram-iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+    }
+    .diagram-toolbar-badge {
+      position: absolute;
+      top: 10px;
+      right: 14px;
+      background: rgba(12, 20, 39, 0.85);
+      backdrop-filter: blur(8px);
+      border: 1px solid #1E3050;
+      color: var(--accent-cyan);
+      font-size: 11px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 6px;
+      pointer-events: none;
+      z-index: 10;
+    }
+
+    /* Hero Slide Layout */
+    .hero-center {
+      margin: auto;
+      max-width: 960px;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 20px;
+    }
+    .hero-title {
+      font-size: 68px;
+      font-weight: 900;
+      letter-spacing: -0.04em;
+      background: linear-gradient(180deg, #FFFFFF 0%, #D0E0FF 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      line-height: 1.05;
+    }
+    .hero-tagline {
+      font-size: 26px;
+      font-weight: 700;
+      color: var(--accent-blue);
+      letter-spacing: -0.02em;
+    }
+    .hero-description {
+      font-size: 17px;
+      color: var(--text-muted);
+      max-width: 800px;
+      line-height: 1.6;
+    }
+    .hero-metrics {
+      display: flex;
+      gap: 14px;
+      margin-top: 10px;
+    }
+    .metric-pill {
+      background: rgba(16, 217, 144, 0.1);
+      border: 1px solid rgba(16, 217, 144, 0.3);
+      color: var(--accent-green);
+      font-weight: 700;
+      font-size: 13px;
+      padding: 6px 14px;
+      border-radius: 20px;
+    }
+
+    /* Floating Controller Bar (Bottom) */
+    .controller-bar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 64px;
+      background: rgba(8, 13, 26, 0.94);
+      backdrop-filter: blur(14px);
+      border-top: 1px solid #1A2A47;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      z-index: 200;
+    }
+    .ctrl-group {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .ctrl-btn {
+      background: #111C33;
+      border: 1px solid #233758;
+      color: #fff;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 7px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .ctrl-btn:hover {
+      background: #1A2B4D;
+      border-color: var(--accent-blue);
+    }
+    .ctrl-btn.active {
+      background: var(--accent-blue);
+      border-color: var(--accent-blue);
+      color: #fff;
+    }
+    .slide-dots {
+      display: flex;
+      gap: 8px;
+    }
+    .slide-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #1E3050;
+      cursor: pointer;
+      transition: background 0.2s, transform 0.2s;
+    }
+    .slide-dot.active {
+      background: var(--accent-cyan);
+      transform: scale(1.25);
+    }
+    .speed-btn {
+      padding: 4px 8px;
+      font-size: 11px;
+      font-family: var(--font-mono);
+      font-weight: 700;
+      border-radius: 5px;
+      background: #0E182D;
+      border: 1px solid #1F3354;
+      color: var(--text-muted);
+      cursor: pointer;
+    }
+    .speed-btn.active {
+      color: #fff;
+      border-color: var(--accent-cyan);
+      background: rgba(0, 210, 255, 0.15);
+    }
+
+    /* Teleprompter Drawer */
+    .teleprompter-drawer {
+      position: fixed;
+      right: 20px;
+      bottom: 74px;
+      width: 440px;
+      max-height: 280px;
+      background: rgba(10, 16, 32, 0.96);
+      backdrop-filter: blur(16px);
+      border: 1px solid #23395F;
+      border-radius: 12px;
+      padding: 18px 20px;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+      display: flex;
+      flex-direction: column;
+      z-index: 300;
+      transition: transform 0.25s ease, opacity 0.25s ease;
+    }
+    .teleprompter-drawer.hidden {
+      transform: translateY(20px);
+      opacity: 0;
+      pointer-events: none;
+    }
+    .prompt-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--accent-cyan);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .prompt-text {
+      font-size: 14px;
+      line-height: 1.6;
+      color: #E2E8F0;
+      overflow-y: auto;
+      max-height: 200px;
+      padding-right: 6px;
+    }
+    .prompt-text strong {
+      color: var(--accent-cyan);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Bar -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="badge-track">TRACK 2: AI RISK MANAGER</span>
+      <span class="brand-title">IntentLock Presenter</span>
+    </div>
+    <div class="topbar-right">
+      <div class="mode-indicator">
+        <div class="mode-dot"></div>
+        <span id="audio-mode-label">Presenter Mode (Self Recording)</span>
+      </div>
+      <button class="ctrl-btn" id="teleprompter-toggle" title="Toggle teleprompter script (Shortcut: T)">
+        📜 Teleprompter
+      </button>
+      <button class="ctrl-btn" id="fullscreen-btn" title="Toggle Fullscreen (Shortcut: F)">
+        ⛶ Fullscreen
+      </button>
+    </div>
+  </header>
+
+  <!-- Slide Viewport -->
+  <main class="slide-viewport">
+
+    <!-- SLIDE 1: Hero -->
+    <section class="slide active" data-slide="1" data-cue="0">
+      <div class="hero-center">
+        <span class="badge-track" style="font-size: 13px;">RAZORPAY AI BUILDATHON 2026</span>
+        <h1 class="hero-title">IntentLock</h1>
+        <h2 class="hero-tagline">Zero-Trust Policy Gate for High-Risk Payouts</h2>
+        <p class="hero-description">
+          A defense-grade policy gate intercepting deepfake voice notes, urgent social engineering, and unauthorized recipient tampering before instructions reach RazorpayX rails.
+        </p>
+        <div class="hero-metrics">
+          <span class="metric-pill">403 Tests Passing</span>
+          <span class="metric-pill">0 Unsafe Handoffs</span>
+          <span class="metric-pill">3 Hard Authority Lanes</span>
+          <span class="metric-pill">MIT Open Source</span>
+        </div>
+        <p style="font-size: 13px; color: var(--text-muted); margin-top: 10px;">
+          Builder: Kunal Kumar Mehta • Repository: github.com/KunalKumarMehta/razorpay
+        </p>
+      </div>
+    </section>
+
+    <!-- SLIDE 2: Threat Landscape -->
+    <section class="slide" data-slide="2" data-cue="25">
+      <div class="slide-header">
+        <div class="slide-category">PROBLEM ANALYSIS</div>
+        <h2 class="slide-title">The Threat Landscape: Deepfakes, Urgency & LLM Execution Risk</h2>
+        <p class="slide-subtitle">Why autonomous AI agents cannot be trusted with raw financial credentials.</p>
+      </div>
+      <div class="card-grid-3">
+        <div class="card">
+          <h3 class="card-title" style="color: var(--accent-red);">1. Weaponized Voice Clones</h3>
+          <ul class="card-list">
+            <li><strong>Rapid Voice Cloning</strong><span>Executive voices cloned in 30 seconds via generative speech tools.</span></li>
+            <li><strong>Urgent WhatsApp Voice Notes</strong><span>'Clear ₹4.25L tooling deposit to vendor account before 5 PM.'</span></li>
+            <li><strong>Psychological Pressure</strong><span>Urgency induces operators to bypass slow bank registry verification.</span></li>
+            <li><strong>Irreversible Rails</strong><span>IMPS and UPI transfers have zero recall: no Ctrl+Z once money leaves.</span></li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3 class="card-title" style="color: var(--accent-amber);">2. Autonomous Agent Fallacy</h3>
+          <ul class="card-list">
+            <li><strong>The Industry Hype</strong><span>Startups giving LLMs direct API access to corporate treasury rails.</span></li>
+            <li><strong>The Fatal Flaw</strong><span>LLMs hallucinate, suffer prompt injection, and stumble on edge cases.</span></li>
+            <li><strong>Zero Margin for Error</strong><span>In financial settlement, even a 1% failure rate causes catastrophic enterprise loss.</span></li>
+            <li><strong>Core IntentLock Thesis</strong><span>Never let an LLM touch the financial trigger.</span></li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3 class="card-title" style="color: var(--accent-blue);">3. Maker-Checker Blind Spot</h3>
+          <ul class="card-list">
+            <li><strong>Existing Protection</strong><span>RazorpayX provides solid internal maker-checker review workflows.</span></li>
+            <li><strong>The Upstream Hole</strong><span>Spoofed instructions enter the queue as 'Maker Drafts' without origin validation.</span></li>
+            <li><strong>Fatigued Reviewers</strong><span>Approvers click 'Confirm' assuming the accounts desk verified the counterparty.</span></li>
+            <li><strong>The Defense Solution</strong><span>A zero-trust cryptographic gate BEFORE instructions reach RazorpayX.</span></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- SLIDE 3: Architecture & 3 Authority Lanes (LIVE ARCHIFY DIAGRAM) -->
+    <section class="slide" data-slide="3" data-cue="52">
+      <div class="slide-header">
+        <div class="slide-category">SYSTEM ARCHITECTURE</div>
+        <h2 class="slide-title">Three Hard-Bounded Authority Lanes</h2>
+        <p class="slide-subtitle">Strict boundary separation: read-only AI investigation vs deterministic policy execution.</p>
+      </div>
+      <div class="split-view">
+        <div class="diagram-frame-wrapper">
+          <span class="diagram-toolbar-badge">Interactive Archify Diagram</span>
+          <iframe id="iframe-arch" class="diagram-iframe" src="diagrams/IntentLock_Architecture.html?embed=1"></iframe>
+        </div>
+        <div class="card">
+          <h3 class="card-title" style="color: var(--accent-cyan);">Lane Authority Separation</h3>
+          <ul class="card-list">
+            <li><strong>Lane 1: Trust Agent (Read-Only LLM)</strong><span>Multimodal ingestion under DPDP privacy admission. Grounding to exact evidence spans. Zero money authority.</span></li>
+            <li><strong>Lane 2: Deterministic Policy Gate</strong><span>Operator verifies and freezes immutable SHA-256 intent hash. Deterministic Python engine evaluates limits & approved registries.</span></li>
+            <li><strong>Lane 3: Maker-Checker Rail</strong><span>Issues single-use 15-minute HMAC-SHA256 grant. Dispatches 1 pending item into RazorpayX queue.</span></li>
+            <li><strong>Cryptographic Invariant</strong><span>Any edit to amount or account breaks hash and cancels grant instantly.</span></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- SLIDE 4: Operational Flow & Safe Failure (LIVE SEQUENCE DIAGRAM) -->
+    <section class="slide" data-slide="4" data-cue="100">
+      <div class="slide-header">
+        <div class="slide-category">OPERATIONAL WORKFLOW</div>
+        <h2 class="slide-title">3 Human Gestures & Fault-Tolerant Replay Prevention</h2>
+        <p class="slide-subtitle">Uncertainty never becomes permission: timeouts permanently burn grants.</p>
+      </div>
+      <div class="split-view">
+        <div class="diagram-frame-wrapper">
+          <span class="diagram-toolbar-badge">Interactive Sequence Flow</span>
+          <iframe id="iframe-seq" class="diagram-iframe" src="diagrams/IntentLock_SequenceFlow.html?embed=1"></iframe>
+        </div>
+        <div class="card">
+          <h3 class="card-title" style="color: var(--accent-blue);">Gating & Fault Tolerance</h3>
+          <ul class="card-list">
+            <li><strong>Gesture 1: Freeze Intent</strong><span>Operator verifies extracted spans. Freezes immutable SHA-256 Intent Hash.</span></li>
+            <li><strong>Policy Step-Up: STEP_UP_REQUIRED</strong><span>Unapproved destination! Gate halts execution; demands out-of-band callback + controller sign-off.</span></li>
+            <li><strong>Gestures 2 & 3: Dual Verification</strong><span>Controller signs off -> Case becomes ELIGIBLE. Operator freshly initiates handoff to RazorpayX.</span></li>
+            <li><strong>Safe Failure Invariant</strong><span>Gateway timeouts enter RECONCILIATION_REQUIRED. Single-use HMAC burned; blind retries rejected!</span></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- SLIDE 5: Cryptographic Audit Ledger -->
+    <section class="slide" data-slide="5" data-cue="135">
+      <div class="slide-header">
+        <div class="slide-category">SECURITY & INTEGRITY</div>
+        <h2 class="slide-title">Zero-Trust Cryptographic Ledger & Data Privacy Gates</h2>
+        <p class="slide-subtitle">Tamper-evident audit chain with mathematical non-repudiation.</p>
+      </div>
+      <div class="card-grid-3">
+        <div class="card">
+          <h3 class="card-title" style="color: var(--accent-cyan);">Authoritative Hash Chain</h3>
+          <ul class="card-list">
+            <li><strong>Dedicated Audit Store</strong><span>audit_events table is the sole authoritative store; chained via SHA-256.</span></li>
+            <li><strong>Tip Integrity Verification</strong><span>Verified checkpoints signed with HMAC-SHA256 secret keys.</span></li>
+            <li><strong>Tamper Detection</strong><span>Any row modification, deletion, or reordering raises AuditLedgerIntegrityError.</span></li>
+            <li><strong>Zero Mutable Leakage</strong><span>State mutations never bypass cryptographic chain.</span></li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3 class="card-title" style="color: var(--accent-green);">DPDP Privacy & Admission</h3>
+          <ul class="card-list">
+            <li><strong>Processing Authority Records</strong><span>Mandatory admission record required before case creation.</span></li>
+            <li><strong>Data Classification</strong><span>Validates classification, submitter role, and retention schedules.</span></li>
+            <li><strong>Admission Rejection</strong><span>Unauthorized evidence is rejected before touching models or disk.</span></li>
+            <li><strong>Defense-Only Architecture</strong><span>Strictly zero offensive tooling; strictly zero PII leaks.</span></li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3 class="card-title" style="color: var(--accent-blue);">Single-Use HMAC Grants</h3>
+          <ul class="card-list">
+            <li><strong>Single-Use HMAC Tokens</strong><span>HMAC-SHA256 handoff grants valid for exactly 15 minutes.</span></li>
+            <li><strong>Cryptographic Pinning</strong><span>Bound strictly to case_id, version, and exact intent_hash.</span></li>
+            <li><strong>Atomic Claiming</strong><span>Executed with SQLite BEGIN IMMEDIATE to eliminate race conditions.</span></li>
+            <li><strong>Anti-Replay Guarantee</strong><span>Tokens cannot be replayed across sessions or duplicate clicks.</span></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- SLIDE 6: Engineering Rigor & Disclosure -->
+    <section class="slide" data-slide="6" data-cue="158">
+      <div class="slide-header">
+        <div class="slide-category">VERIFICATION RIGOR</div>
+        <h2 class="slide-title">Engineering Rigor: 403 Tests & Disclosed Invariants</h2>
+        <p class="slide-subtitle">Honest engineering metrics: proving safety boundaries without faking production claims.</p>
+      </div>
+      <div class="card-grid-2">
+        <div class="card">
+          <h3 class="card-title" style="color: var(--accent-blue);">Evaluation Harness & Safety Suites</h3>
+          <ul class="card-list">
+            <li><strong>45-Case Development Policy Harness</strong><span>Validates span extraction, intent freezing, and basic registry checks.</span></li>
+            <li><strong>90-Case Sealed Policy Plumbing Suite</strong><span>Covers multi-currency, unapproved vendors, split amounts, and timeout forks.</span></li>
+            <li><strong>81-Execution Critical Safety Harness</strong><span>27 base cases × 3 repetitions verifying zero Unsafe Handoffs and replay rejections.</span></li>
+            <li><strong>403 Automated Tests</strong><span>100% passing automated unit & integration test suite in GitHub Actions CI.</span></li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3 class="card-title" style="color: var(--accent-green);">Honest Engineering Disclosure</h3>
+          <ul class="card-list">
+            <li><strong>The Golden Rule of Hackathons</strong><span>Never fake production metrics on synthetic test harnesses.</span></li>
+            <li><strong>Explicit Boundary Declaration</strong><span>Current benchmarks verify deterministic policy plumbing and safety boundaries.</span></li>
+            <li><strong>Predeclared Production Targets</strong>
+              <span>• Unsafe Handoffs: 0 (Zero Tolerance - Verified in Invariant Suite)<br>
+              • 3-Action Correctness: ≥ 90.0%<br>
+              • Protective Intervention Recall: ≥ 95.0%<br>
+              • Operator Interaction Reduction: ≥ 30.0%</span>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- SLIDE 7: Startup Strategy & Defensible Moat -->
+    <section class="slide" data-slide="7" data-cue="180">
+      <div class="slide-header">
+        <div class="slide-category">BUSINESS MODEL & GO-TO-MARKET</div>
+        <h2 class="slide-title">Startup Thesis: Defensible Wedge for RazorpayX Payouts</h2>
+        <p class="slide-subtitle">High-urgency exception gating for Indian growth & mid-market treasury teams.</p>
+      </div>
+      <div class="card-grid-3">
+        <div class="card">
+          <h3 class="card-title" style="color: var(--accent-cyan);">1. Beachhead & Buyer</h3>
+          <ul class="card-list">
+            <li><strong>Target Buyer</strong><span>Finance Control Owners, CFOs, & Heads of Treasury.</span></li>
+            <li><strong>Target Segment</strong><span>Indian mid-market enterprises running high-volume RazorpayX Payouts.</span></li>
+            <li><strong>Urgent Wedge</strong><span>Gating high-urgency, out-of-band payout exceptions.</span></li>
+            <li><strong>Solves the #1 Threat</strong><span>CEO deepfake voice notes inducing unauthorized wire transfers.</span></li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3 class="card-title" style="color: var(--accent-blue);">2. 90-Day Design Partner Pilot</h3>
+          <ul class="card-list">
+            <li><strong>Staged 3-Partner Pilot</strong><span>Validate in live shadowing with 3 Indian mid-market businesses.</span></li>
+            <li><strong>Measured Success Criteria</strong><span>0 Unsafe Handoffs during live shadowing.<br>≥ 30% reduction in manual operator triage time.<br>100% catch rate on modified destination bank details.</span></li>
+            <li><strong>Disciplined Expansion</strong><span>Only expand into vendor onboarding if 2 of 3 partners commit.</span></li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3 class="card-title" style="color: var(--accent-green);">3. Defensible Moat</h3>
+          <ul class="card-list">
+            <li><strong>Models are Commodities</strong><span>Foundation models (Whisper, Gemini, Llama) get swapped constantly.</span></li>
+            <li><strong>The True Moat</strong><span>• Counterparty trust graph & approved beneficiary registry.<br>• Tamper-evident cryptographic audit ledger.<br>• Deep integration into RazorpayX Maker-Checker rails.<br>• Provable safety invariant compliance.</span></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- SLIDE 8: Summary & The Ask -->
+    <section class="slide" data-slide="8" data-cue="198">
+      <div class="slide-header">
+        <div class="slide-category">SUMMARY & NEXT STEPS</div>
+        <h2 class="slide-title">Why IntentLock Wins Track 2: AI Risk Manager</h2>
+        <p class="slide-subtitle">Defense-grade architecture, complete code delivery, and strategic ecosystem fit.</p>
+      </div>
+      <div class="card-grid-3">
+        <div class="card">
+          <h3 class="card-title" style="color: var(--accent-green);">Production-Grade Delivery</h3>
+          <ul class="card-list">
+            <li><strong>403 Passing Tests</strong><span>Full pytest suite with 100% green GitHub Actions CI.</span></li>
+            <li><strong>Supply Chain Transparency</strong><span>CycloneDX & SPDX SBOM generator included.</span></li>
+            <li><strong>Reproducible Builds</strong><span>Pinned multi-stage Dockerfile with unprivileged user.</span></li>
+            <li><strong>Full Stack</strong><span>FastAPI backend + Vite React Operator Console.</span></li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3 class="card-title" style="color: var(--accent-cyan);">Strategic Razorpay Alignment</h3>
+          <ul class="card-list">
+            <li><strong>Native Payout Extension</strong><span>Seamless fit for RazorpayX Payouts & Vendor Payments.</span></li>
+            <li><strong>Protects Merchants</strong><span>Protects businesses from weaponized generative voice attacks.</span></li>
+            <li><strong>Embeds in Maker-Checker</strong><span>Submits pending approval drafts without altering banking rails.</span></li>
+            <li><strong>100% Defense-Only</strong><span>Complies strictly with Track 2 safety rules.</span></li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3 class="card-title" style="color: var(--accent-blue);">The Ask to Judges</h3>
+          <ul class="card-list">
+            <li><strong>Architectural Grilling</strong><span>Evaluate IntentLock on its disclosed safety invariants, code architecture, and honest metrics.</span></li>
+            <li><strong>Pilot Introductions</strong><span>Introductions to 3 RazorpayX design partners to validate in live shadowing.</span></li>
+            <li><strong>Open Source Repository</strong><span style="font-family: var(--font-mono); color: var(--accent-cyan);">github.com/KunalKumarMehta/razorpay</span></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Bottom Floating Controller Bar -->
+  <footer class="controller-bar">
+    <div class="ctrl-group">
+      <button class="ctrl-btn" id="prev-btn" title="Previous Slide (Shortcut: ←)">◀ Prev</button>
+      <button class="ctrl-btn" id="next-btn" title="Next Slide (Shortcut: →)">Next ▶</button>
+      <div class="slide-dots" id="slide-dots"></div>
+      <span id="slide-counter" style="font-size: 12px; font-weight: 700; color: var(--text-muted); margin-left: 8px;">1 / 8</span>
+    </div>
+
+    <!-- Playback Speed Controls -->
+    <div class="ctrl-group">
+      <span style="font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase;">Speed:</span>
+      <button class="speed-btn" data-speed="0.5">0.5x</button>
+      <button class="speed-btn" data-speed="0.75">0.75x</button>
+      <button class="speed-btn active" data-speed="1.0">1.0x</button>
+      <button class="speed-btn" data-speed="1.25">1.25x</button>
+      <button class="speed-btn" data-speed="1.5">1.5x</button>
+    </div>
+
+    <!-- Audio / Voiceover Sync Controls -->
+    <div class="ctrl-group">
+      <audio id="pitch-audio" src="IntentLock_Pitch_Voiceover.mp3" preload="auto"></audio>
+      <button class="ctrl-btn" id="audio-play-btn" title="Play / Pause synced voiceover">
+        ▶ Play Voiceover
+      </button>
+      <button class="ctrl-btn" id="audio-mode-toggle" title="Toggle between AI voiceover sync and manual recording">
+        🎙️ Self-Record Mode
+      </button>
+    </div>
+  </footer>
+
+  <!-- Teleprompter Drawer (Draggable / Toggleable) -->
+  <aside class="teleprompter-drawer hidden" id="teleprompter-drawer">
+    <div class="prompt-header">
+      <span>Obsidian Teleprompter • Stage <span id="prompt-stage-num">1</span></span>
+      <span style="font-size: 10px; color: var(--text-muted); font-family: var(--font-mono);">[T] close</span>
+    </div>
+    <div class="prompt-text" id="prompt-text">
+      <!-- Injected per slide -->
+    </div>
+  </aside>
+
+  <script>
+    const slides = Array.from(document.querySelectorAll('.slide'));
+    const dotsContainer = document.getElementById('slide-dots');
+    const counter = document.getElementById('slide-counter');
+    const prevBtn = document.getElementById('prev-btn');
+    const nextBtn = document.getElementById('next-btn');
+    const teleprompterDrawer = document.getElementById('teleprompter-drawer');
+    const teleprompterToggle = document.getElementById('teleprompter-toggle');
+    const promptStageNum = document.getElementById('prompt-stage-num');
+    const promptText = document.getElementById('prompt-text');
+    const audio = document.getElementById('pitch-audio');
+    const audioPlayBtn = document.getElementById('audio-play-btn');
+    const audioModeToggle = document.getElementById('audio-mode-toggle');
+    const audioModeLabel = document.getElementById('audio-mode-label');
+    const speedBtns = Array.from(document.querySelectorAll('.speed-btn'));
+    const iframeArch = document.getElementById('iframe-arch');
+    const iframeSeq = document.getElementById('iframe-seq');
+
+    let currentSlide = 0;
+    let playbackSpeed = 1.0;
+    let isSelfRecordMode = true;
+
+    // Script snippets mapped to slides for the teleprompter
+    const SCRIPTS = [
+      "Hey everyone! I'm Kunal, and this is **IntentLock**: a zero-trust policy gate intercepting deepfake voice notes, urgent social engineering, and unauthorized payouts before money moves on RazorpayX.",
+      "Over the last few months, everyone's been hyping up autonomous AI agents. But in real-time payments (IMPS/UPI), there is no *Ctrl-Z*. At the same time, generative voice cloning allows attackers to clone a CEO in 30 seconds and send urgent WhatsApp voice notes. Our thesis: **Never let an LLM touch the financial trigger!**",
+      "So we built IntentLock with three hard authority lanes:\n- **Lane 1: Trust Agent (Read-Only)** under DPDP admission rules. Zero money authority.\n- **Lane 2: Deterministic Policy Gate** freezes SHA-256 intent hash. Rule engine gates against approved registries.\n- **Lane 3: Maker-Checker Rail** issues single-use 15m HMAC grant and dispatches 1 pending item to RazorpayX.",
+      "Now, what happens when the real world fails? Timeouts or network drops! In IntentLock, **uncertainty never becomes permission.** The system enters **Reconciliation Required**, burns the single-use HMAC grant, and deterministically rejects blind retries to prevent duplicate payouts.",
+      "Our audit ledger uses an authoritative **SHA-256 chained event table** with HMAC-signed tip checkpoints. Any database tampering raises an immediate integrity error. DPDP admission records prevent unadmitted PII from ever touching models or disk.",
+      "In payments, honesty is everything. We built a verification spine with **403 passing tests** across 3 suites: 45 dev cases, 90 sealed policy cases, and an 81-execution critical safety suite. Over all 81 safety runs, IntentLock achieved **zero unsafe handoffs**.",
+      "Our startup beachhead is urgent payout exception gating for Indian mid-market CFOs running on RazorpayX. We're launching a staged 90-day pilot with 3 design partners. The true moat is the counterparty trust graph, cryptographic ledger, and RazorpayX maker-checker embedding.",
+      "IntentLock is 100% open source under MIT with clean Docker builds and passing GitHub Actions CI. We'd love the panel's architectural grilling and introductions to RazorpayX design partners. Thank you!"
+    ];
+
+    // Build dots
+    slides.forEach((_, idx) => {
+      const dot = document.createElement('div');
+      dot.className = `slide-dot ${idx === 0 ? 'active' : ''}`;
+      dot.addEventListener('click', () => goToSlide(idx));
+      dotsContainer.appendChild(dot);
+    });
+
+    function updateIframeSpeeds(speed) {
+      if (iframeArch && iframeArch.contentWindow) {
+        iframeArch.src = `diagrams/IntentLock_Architecture.html?embed=1&speed=${speed}`;
+      }
+      if (iframeSeq && iframeSeq.contentWindow) {
+        iframeSeq.src = `diagrams/IntentLock_SequenceFlow.html?embed=1&speed=${speed}`;
+      }
+    }
+
+    function goToSlide(idx) {
+      if (idx < 0 || idx >= slides.length) return;
+      slides[currentSlide].classList.remove('active');
+      dotsContainer.children[currentSlide].classList.remove('active');
+
+      currentSlide = idx;
+      slides[currentSlide].classList.add('active');
+      dotsContainer.children[currentSlide].classList.add('active');
+      counter.textContent = `${currentSlide + 1} / ${slides.length}`;
+
+      // Update teleprompter
+      promptStageNum.textContent = currentSlide + 1;
+      promptText.innerHTML = (SCRIPTS[currentSlide] || '').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>');
+    }
+
+    function nextSlide() { goToSlide(currentSlide + 1); }
+    function prevSlide() { goToSlide(currentSlide - 1); }
+
+    prevBtn.addEventListener('click', prevSlide);
+    nextBtn.addEventListener('click', nextSlide);
+
+    // Keyboard shortcuts
+    document.addEventListener('keydown', (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+      if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') {
+        e.preventDefault();
+        nextSlide();
+      } else if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
+        e.preventDefault();
+        prevSlide();
+      } else if (e.key.toLowerCase() === 't') {
+        teleprompterDrawer.classList.toggle('hidden');
+      } else if (e.key.toLowerCase() === 'f') {
+        toggleFullscreen();
+      }
+    });
+
+    teleprompterToggle.addEventListener('click', () => {
+      teleprompterDrawer.classList.toggle('hidden');
+    });
+
+    function toggleFullscreen() {
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen().catch(() => {});
+      } else {
+        document.exitFullscreen().catch(() => {});
+      }
+    }
+    document.getElementById('fullscreen-btn').addEventListener('click', toggleFullscreen);
+
+    // Speed button handling
+    speedBtns.forEach(btn => {
+      btn.addEventListener('click', () => {
+        speedBtns.forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        playbackSpeed = parseFloat(btn.getAttribute('data-speed')) || 1.0;
+        audio.playbackRate = playbackSpeed;
+        updateIframeSpeeds(playbackSpeed);
+      });
+    });
+
+    // Audio Play / Sync
+    audioPlayBtn.addEventListener('click', () => {
+      if (audio.paused) {
+        audio.play();
+        audioPlayBtn.textContent = '⏸ Pause Voiceover';
+        audioModeLabel.textContent = 'AI Voiceover Playing (Synced)';
+      } else {
+        audio.pause();
+        audioPlayBtn.textContent = '▶ Play Voiceover';
+        audioModeLabel.textContent = isSelfRecordMode ? 'Presenter Mode (Self Recording)' : 'AI Voiceover Paused';
+      }
+    });
+
+    audio.addEventListener('timeupdate', () => {
+      if (isSelfRecordMode) return;
+      const t = audio.currentTime;
+      for (let i = slides.length - 1; i >= 0; i--) {
+        const cue = parseFloat(slides[i].getAttribute('data-cue')) || 0;
+        if (t >= cue) {
+          if (currentSlide !== i) goToSlide(i);
+          break;
+        }
+      }
+    });
+
+    audioModeToggle.addEventListener('click', () => {
+      isSelfRecordMode = !isSelfRecordMode;
+      if (isSelfRecordMode) {
+        audio.pause();
+        audioPlayBtn.textContent = '▶ Play Voiceover';
+        audioModeLabel.textContent = 'Presenter Mode (Self Recording)';
+        audioModeToggle.textContent = '🎙️ Self-Record Mode';
+        teleprompterDrawer.classList.remove('hidden');
+      } else {
+        audioModeLabel.textContent = 'AI Voiceover Mode';
+        audioModeToggle.textContent = '🤖 AI Sync Mode';
+      }
+    });
+
+    // Initialize teleprompter text
+    goToSlide(0);
+  </script>
+</body>
+</html>

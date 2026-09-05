@@ -116,7 +116,7 @@ const ACTION_CATALOG: [string, string][] = [
 const SCENARIOS = [
   {
     name: 'Happy path',
-    description: 'A legitimate urgent exception earns eligibility only after exact intent confirmation, independent callback, and separate policy-governed destination approval. PayoutProof creates a pending approval item—not payout approval or execution.',
+    description: 'A legitimate urgent exception earns eligibility only after exact intent confirmation, independent callback, and separate policy-governed destination approval. IntentLock creates a pending approval item—not payout approval or execution.',
     steps: [
       'ADMIT_AUTHORIZED_BUNDLE',
       'EXTRACT_INTENT',
@@ -393,7 +393,7 @@ export function App() {
             <div style={{ width: 34, height: 34, borderRadius: 8, background: 'var(--accent)', display: 'grid', placeItems: 'center', color: '#000' }}>
               <ShieldCheck size={22} strokeWidth={2.5} />
             </div>
-            <h1 style={{ fontSize: 24, fontWeight: 800, letterSpacing: '-0.03em' }}>PayoutProof</h1>
+            <h1 style={{ fontSize: 24, fontWeight: 800, letterSpacing: '-0.03em' }}>IntentLock</h1>
             <span style={{ fontSize: 12, fontWeight: 700, padding: '2px 8px', borderRadius: 6, background: 'var(--surface-raised)', border: '1px solid var(--surface-border)', color: 'var(--text-muted)' }}>
               LOCAL MODULAR MONOLITH
             </span>
