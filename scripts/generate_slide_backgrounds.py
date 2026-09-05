@@ -1,80 +1,70 @@
 import os
-import math
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 def create_backgrounds():
     os.makedirs("build/assets", exist_ok=True)
-    width, height = 2400, 1350  # 16:9 ultra-clean canvas
+    width, height = 2400, 1350  # 16:9 1080p/4K presentation canvas
 
-    # ==========================================
-    # 1. Content Slides Background: Deep Obsidian to Midnight Navy Gradient + Subtle Glow
-    # ==========================================
-    img_content = Image.new("RGB", (width, height), "#060A14")
-    draw_c = ImageDraw.Draw(img_content)
+    # =========================================================================
+    # 1. Content Slide Background: Deep Obsidian-Navy with Butter-Smooth Ambient Bloom
+    #    (ZERO concentric circles, ZERO divider lines, 100% clean reading canvas)
+    # =========================================================================
+    bg_content = Image.new("RGB", (width, height), (8, 13, 24))
+    draw_c = ImageDraw.Draw(bg_content)
 
-    # Linear vertical gradient
+    # Ultra-smooth vertical gradient: #080D18 to #03060B
     for y in range(height):
-        # Progress 0.0 to 1.0
         p = y / height
-        # Blend from #070D1A to #0D1A33
-        r = int(7 + p * (13 - 7))
-        g = int(13 + p * (26 - 13))
-        b = int(26 + p * (51 - 26))
+        r = int(8 * (1 - p) + 3 * p)
+        g = int(13 * (1 - p) + 6 * p)
+        b = int(24 * (1 - p) + 11 * p)
         draw_c.line([(0, y), (width, y)], fill=(r, g, b))
 
-    # Add soft radial glow at top-right (Razorpay Blue aura)
-    cx, cy = int(width * 0.85), int(height * 0.15)
-    max_radius = 900
-    for rad in range(max_radius, 0, -10):
-        alpha = int((1.0 - (rad / max_radius) ** 0.8) * 32)
-        if alpha > 0:
-            glow_color = (26, 86, 230)
-            # Soft concentric circles
-            draw_c.ellipse(
-                [(cx - rad, cy - rad), (cx + rad, cy + rad)],
-                outline=glow_color,
-                width=8
-            )
-
-    # Subtle horizontal grid line near top header
-    header_y = int(height * 0.20)
-    draw_c.line([(80, header_y), (width - 80, header_y)], fill=(30, 50, 85), width=2)
+    # Soft ambient glow in top-right corner (diffuse Razorpay Blue bloom, no rings)
+    glow_c = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    glow_draw_c = ImageDraw.Draw(glow_c)
+    glow_draw_c.ellipse(
+        [(int(width * 0.70), -int(height * 0.25)), (int(width * 1.15), int(height * 0.55))],
+        fill=(0, 110, 255, 30)
+    )
+    glow_c = glow_c.filter(ImageFilter.GaussianBlur(radius=150))
+    bg_content.paste(glow_c, (0, 0), glow_c)
 
     content_path = "build/assets/slide_bg_content.png"
-    img_content.save(content_path, "PNG")
-    print(f"Generated: {content_path}")
+    bg_content.save(content_path, "PNG", quality=95)
+    print(f"Generated clean content background: {content_path}")
 
-    # ==========================================
-    # 2. Hero Slide Background: Dramatic Central Accent Aura
-    # ==========================================
-    img_hero = Image.new("RGB", (width, height), "#050811")
-    draw_h = ImageDraw.Draw(img_hero)
+    # =========================================================================
+    # 2. Hero Slide Background: Deep Midnight with Centered Subtle Radial Aura
+    # =========================================================================
+    bg_hero = Image.new("RGB", (width, height), (6, 10, 20))
+    draw_h = ImageDraw.Draw(bg_hero)
 
-    # Vertical gradient
     for y in range(height):
         p = y / height
-        r = int(5 + p * (15 - 5))
-        g = int(8 + p * (24 - 8))
-        b = int(17 + p * (54 - 17))
+        r = int(6 * (1 - p) + 2 * p)
+        g = int(10 * (1 - p) + 4 * p)
+        b = int(20 * (1 - p) + 8 * p)
         draw_h.line([(0, y), (width, y)], fill=(r, g, b))
 
-    # Central Blue / Cyan Aura
-    hcx, hcy = int(width * 0.5), int(height * 0.45)
-    h_radius = 1100
-    for rad in range(h_radius, 0, -8):
-        alpha = (1.0 - (rad / h_radius) ** 0.6)
-        r = int(10 + alpha * 30)
-        g = int(40 + alpha * 90)
-        b = int(120 + alpha * 135)
-        draw_h.ellipse(
-            [(hcx - rad, hcy - rad), (hcx + rad, hcy + rad)],
-            outline=(r, g, b),
-            width=6
-        )
+    # Gentle center-top ambient diffuse bloom
+    glow_h = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    glow_draw_h = ImageDraw.Draw(glow_h)
+    glow_draw_h.ellipse(
+        [(int(width * 0.25), int(height * 0.05)), (int(width * 0.75), int(height * 0.75))],
+        fill=(0, 140, 255, 28)
+    )
+    # Subtle secondary cyan touch
+    glow_draw_h.ellipse(
+        [(int(width * 0.35), int(height * 0.15)), (int(width * 0.65), int(height * 0.60))],
+        fill=(0, 220, 255, 18)
+    )
+    glow_h = glow_h.filter(ImageFilter.GaussianBlur(radius=160))
+    bg_hero.paste(glow_h, (0, 0), glow_h)
 
     hero_path = "build/assets/slide_bg_hero.png"
-    img_hero.save(hero_path, "PNG")
-    print(f"Generated: {hero_path}")
+    bg_hero.save(hero_path, "PNG", quality=95)
+    print(f"Generated clean hero background: {hero_path}")
 
 if __name__ == "__main__":
     create_backgrounds()
